@@ -123,27 +123,10 @@ pub(super) fn host_name_convention() -> &'static str {
         match probed {
             Some(name) if name.starts_with(r"\??\") => r"\??\",
             Some(name) if name.starts_with(r"\Device\") => r"\Device\",
-            _ if host_is_wine() => r"\??\",
+            _ if crate::ntbuf::host_is_wine() => r"\??\",
             _ => r"\Device\",
         }
     })
-}
-
-/// Whether ntdll is Wine's: it exports `wine_get_version`.
-fn host_is_wine() -> bool {
-    // SAFETY: both names are NUL-terminated; a missing module or export is a
-    // null return, not a fault.
-    unsafe {
-        let ntdll = windows_sys::Win32::System::LibraryLoader::GetModuleHandleA(
-            c"ntdll.dll".as_ptr().cast(),
-        );
-        !ntdll.is_null()
-            && windows_sys::Win32::System::LibraryLoader::GetProcAddress(
-                ntdll,
-                c"wine_get_version".as_ptr().cast(),
-            )
-            .is_some()
-    }
 }
 
 /// Answer handle-based information queries for director FUSE synth handles.
