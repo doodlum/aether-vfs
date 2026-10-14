@@ -397,6 +397,37 @@ fn check_image(opts: &LaunchOpts) -> Result<(), String> {
     Ok(())
 }
 
+/// The working directory a launch starts `target` in, on every host (`target`
+/// and `root0` as the program sees them: `C:\…` under Wine, host paths on
+/// Windows): `requested` as
+/// given when it is a Windows absolute path, joined onto root 0's location
+/// when it is relative, and `target`'s own directory when it is `None`.
+pub(super) fn launch_cwd(
+    requested: Option<&str>,
+    root0: &str,
+    target: &str,
+) -> Result<String, String> {
+    match requested {
+        Some(c) if c.trim().is_empty() => Err(
+            "launch: LaunchOpts.cwd is empty — leave it None for the image's own directory"
+                .to_string(),
+        ),
+        Some(c) if c.split(['\\', '/']).any(|part| part == "..") => Err(format!(
+            "launch: LaunchOpts.cwd {c:?} contains '..'; name the directory directly"
+        )),
+        Some(c) if crate::image::is_windows_absolute(c) => Ok(c.to_string()),
+        Some(c) => Ok(crate::image::join_location(
+            root0,
+            c.trim_matches(['\\', '/']),
+        )),
+        None => Ok(match target.rfind(['\\', '/']) {
+            Some(i) if target[..i].ends_with(':') => format!("{}\\", &target[..i]),
+            Some(i) => target[..i].to_string(),
+            None => root0.to_string(),
+        }),
+    }
+}
+
 impl Default for Session {
     fn default() -> Self {
         Self::new()
@@ -466,6 +497,45 @@ pub enum LaunchExit {
 
 #[cfg(test)]
 mod tests {
+    use super::launch_cwd;
+
+    #[test]
+    fn launch_cwd_defaults_to_the_image_directory() {
+        assert_eq!(
+            launch_cwd(None, r"C:\G", r"C:\G\bin\x.exe").unwrap(),
+            r"C:\G\bin"
+        );
+        assert_eq!(launch_cwd(None, r"C:\G", r"C:\x.exe").unwrap(), r"C:\");
+        assert_eq!(
+            launch_cwd(None, r"C:\G", "C:/tools/probe.exe").unwrap(),
+            "C:/tools"
+        );
+    }
+
+    #[test]
+    fn launch_cwd_takes_absolute_paths_as_given_and_relative_ones_under_root_zero() {
+        assert_eq!(
+            launch_cwd(Some(r"D:\x"), r"C:\G", r"C:\G\a.exe").unwrap(),
+            r"D:\x"
+        );
+        assert_eq!(
+            launch_cwd(Some("Data/SKSE/"), r"C:\G", r"C:\G\a.exe").unwrap(),
+            r"C:\G\Data\SKSE"
+        );
+        assert_eq!(
+            launch_cwd(Some(r"\Data"), r"C:\G\", r"C:\G\a.exe").unwrap(),
+            r"C:\G\Data"
+        );
+    }
+
+    #[test]
+    fn launch_cwd_refuses_empty_and_dot_dot() {
+        for bad in ["", "  ", r"..\x", r"C:\G\..\Windows"] {
+            let e = launch_cwd(Some(bad), r"C:\G", r"C:\G\a.exe").unwrap_err();
+            assert!(e.contains("cwd"), "{bad:?}: {e}");
+        }
+    }
+
     #[cfg(unix)]
     use super::*;
 

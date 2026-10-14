@@ -218,25 +218,20 @@ impl Session {
     /// (`wait: false`) requires the session to outlive the child — which it
     /// already did for the ring.
     ///
-    /// ## Process-global environment
+    /// ## Working directory and environment
     ///
-    /// The child receives its ring coordinates by **inheriting** them:
-    /// `CreateProcessW` is called with a null environment block, so this
-    /// method and [`Session::serve`] set process-wide `VFS_*` variables and
-    /// `opts.env` entries, then restore them. [`LAUNCH_ENV_LOCK`] serializes
-    /// that, which is enough for two sessions in one host and **not** enough
-    /// for a host with unrelated threads: `std::env::set_var` races anything
-    /// else reading the environment, and a language binding always has such
-    /// threads.
+    /// The program starts in [`LaunchOpts::cwd`] — a path relative to root
+    /// 0's directory, or absolute — and by default in its image's own
+    /// directory when the image is in a root, as under Proton. A program
+    /// outside every root starts in root 0's directory by default, as before.
     ///
-    /// Removing the hazard means never writing process env: build the child's
-    /// environment block explicitly and pass it to `CreateProcessW`. That is a
-    /// change to `vfs_inject::RunConfig` (which owns the `CreateProcessW`
-    /// call) plus a caller-supplied set of variables instead of
-    /// `IpcServe::apply_env_roots`'s global writes; the shim side reads the
-    /// same names out of the child's own environment either way, so it does
-    /// not move. Worth doing before a second host depends on the current
-    /// shape.
+    /// It gets an environment block of its own (`CreateProcessW` with
+    /// `CREATE_UNICODE_ENVIRONMENT`): this process's environment, with this
+    /// session's ring coordinates and roots and [`LaunchOpts::env`] applied. A
+    /// launch writes nothing into this process's environment, so it races no
+    /// other thread of the host. [`Session::serve`] still publishes the ring
+    /// coordinates into it once, under [`LAUNCH_ENV_LOCK`], for an in-process
+    /// client that reads them from there.
     #[cfg(windows)]
     pub fn launch(&self, opts: &LaunchOpts) -> Result<i32, String> {
         let mut handle = self.launch_detached(opts)?;
@@ -275,9 +270,9 @@ impl Session {
         // managed root it had then; resolving (and staging) needs this one.
         std::fs::create_dir_all(&self.virtual_root)
             .map_err(|e| format!("launch: create root {}: {e}", self.virtual_root.display()))?;
-        let target = match self.resolve_launch_image(opts)? {
-            ResolvedImage::InRoot { host, .. } => host,
-            ResolvedImage::Outside(p) => PathBuf::from(p),
+        let (target, in_root) = match self.resolve_launch_image(opts)? {
+            ResolvedImage::InRoot { host, .. } => (host, true),
+            ResolvedImage::Outside(p) => (PathBuf::from(p), false),
         };
         // `serve` wrote the thin config from root 0's location as it was then;
         // root 0 may have been declared since. Write `shim.cfg` and rewrite the
@@ -308,33 +303,22 @@ impl Session {
         );
         let ready_path_s = ready_path.to_string_lossy().into_owned();
 
-        // Serialize env mutation: ring env + per-child fixture vars inherit via
-        // CreateProcessW(null environment).
-        let _guard = LAUNCH_ENV_LOCK
-            .lock()
-            .map_err(|_| "launch env lock poisoned".to_string())?;
-
-        // Re-published here, not only in `serve`: the launch env lock is held
-        // from this point, and a root declared after `serve` (or by another
-        // session sharing this process's environment) must reach this child.
-        ipc.apply_env_roots(
-            &root_s,
-            &self.extra_roots_env(),
-            &thin,
-            self.registry_attached(),
-        );
-
-        let mut saved: Vec<(String, Option<String>)> = Vec::with_capacity(opts.env.len() + 2);
-        // `spawn_target_with_shim` publishes these for the target to inherit;
-        // they must not outlive this launch in a host that launches again.
-        // Saved before `opts.env` and before the ready timeout is read below.
-        for k in [vfs_env::READY_TIMEOUT_SECS, vfs_env::CHILD_REFUSED_LOG] {
-            saved.push((k.to_string(), std::env::var(k).ok()));
-        }
-        for (k, v) in &opts.env {
-            saved.push((k.clone(), std::env::var(k).ok()));
-            std::env::set_var(k, v);
-        }
+        // The program's own environment block (`RunConfig::env`): this
+        // process's environment with the session's ring coordinates and roots
+        // (every transport name set or cleared, so another session's values
+        // cannot reach it) and `opts.env`. Nothing here writes this process's
+        // environment, so a host's other threads are never raced.
+        let mut env: Vec<(String, Option<String>)> = ipc
+            .env_roots(
+                &root_s,
+                &self.extra_roots_env(),
+                &thin,
+                self.registry_attached(),
+            )
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        env.extend(opts.env.iter().map(|(k, v)| (k.clone(), Some(v.clone()))));
 
         let ready_timeout = opts.ready_timeout.unwrap_or_else(|| {
             vfs_env::text(vfs_env::READY_TIMEOUT_SECS)
@@ -342,27 +326,30 @@ impl Session {
                 .map(Duration::from_secs)
                 .unwrap_or(DEFAULT_READY_TIMEOUT)
         });
+        // `opts.cwd`, else an in-root image's own directory, as under Proton
+        // (a launcher in `bin\x64` finds its files beside it). A program
+        // outside every root starts in root 0's directory, as it always has:
+        // its relative paths are the session's.
+        let cwd = match (opts.cwd.as_deref(), in_root) {
+            (None, false) => root_s.clone(),
+            (requested, _) => strip_verbatim(super::launch_cwd(
+                requested,
+                &root_s,
+                &target.to_string_lossy(),
+            )?),
+        };
 
         let spawned = vfs_inject::spawn_target_with_shim(vfs_inject::RunConfig {
             target_exe: target.to_string_lossy().into_owned(),
             args: opts.args.clone(),
-            current_dir: Some(root_s),
+            current_dir: Some(cwd),
             dll_path: dll,
             config_path: config_path_s,
             ready_path: ready_path_s.clone(),
             ready_timeout,
             detach: true,
+            env: Some(env),
         });
-
-        for (k, old) in saved {
-            match old {
-                Some(v) => std::env::set_var(&k, v),
-                None => std::env::remove_var(&k),
-            }
-        }
-        // The program has inherited its environment; nothing below touches
-        // process env, so another launch need not wait for this one to end.
-        drop(_guard);
 
         // Children the shim killed because it could not inject them, one
         // `<image> <reason>` line each, beside the ready file.

@@ -48,6 +48,7 @@ fn a_config_version_mismatch_kills_the_process_with_the_message() {
         ready_path: ready_path.to_str().unwrap().to_string(),
         ready_timeout: Duration::from_secs(30),
         detach: false,
+        env: None,
     });
 
     match result {

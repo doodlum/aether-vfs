@@ -4,7 +4,24 @@ Changes to the host-facing API of `vfs-embed`, `vfs-proton`, `vfs-provider`
 and `vfs-env` that a host (Haskill) has to adapt to or can start using. Newest
 first. Internal refactors are in the git history, not here.
 
-## Unreleased (host death, known folders, Steam and runtime re-exports)
+## Unreleased (host death, known folders, Windows cwd and environment, Steam re-exports)
+
+### Changed (Windows)
+
+- `LaunchOpts::cwd` is honoured on Windows, as under Proton: an absolute
+  path, or one relative to root 0's directory. Left `None`, an image in a root
+  starts in its own directory (before: always root 0's directory); a program
+  outside every root still starts in root 0's directory.
+- A Windows launch gives the program an environment block of its own
+  (`CreateProcessW` with `CREATE_UNICODE_ENVIRONMENT`): this process's
+  environment with the session's ring coordinates, roots and `LaunchOpts::env`
+  applied. `launch` and `launch_detached` no longer write this process's
+  environment (before: `opts.env`, the ring variables and the shim's own were
+  set, and restored after). `Session::serve` still publishes the ring
+  coordinates into it once. `vfs_inject::RunConfig` gains
+  `env: Option<Vec<(String, Option<String>)>>` (`None`: as before);
+  `IpcServe::env_roots` returns what `apply_env_roots` writes;
+  `vfs_env::child_environment` builds the block's contents.
 
 ### Added
 

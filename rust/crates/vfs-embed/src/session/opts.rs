@@ -90,22 +90,17 @@ pub struct LaunchOpts {
     /// `vfs_proton::launch::merge_dll_overrides`), `WINEDEBUG` replaces the
     /// default `-all`, and a name the launch's handshake uses is refused.
     ///
-    /// **Windows: not child-only.** `CreateProcessW` is called with a null environment
-    /// block — inheritance *is* the mechanism — so [`Session::launch`] writes
-    /// each one into **this process's** environment with `std::env::set_var`,
-    /// launches, and restores the previous value. `LAUNCH_ENV_LOCK` serializes
-    /// that against every other env write this crate performs, so two sessions
-    /// cannot interleave; it cannot serialize a host's *own* threads, and
-    /// `set_var` in a multi-threaded process races anything else reading the
-    /// environment. See [`Session::launch`]'s "Process-global environment"
-    /// section for the costed fix.
+    /// **Windows: child-only too.** They go into the environment block the
+    /// program is created with (this process's environment plus the
+    /// session's own variables and these); this process's environment is not
+    /// written.
     pub env: BTreeMap<String, String>,
-    /// **Proton path only**: the working directory the program starts in, as
-    /// it sees it — a `C:\…` path, or a path relative to root 0's location.
-    /// A `String`, not a `PathBuf`: it names a place in the Wine prefix, with
-    /// Windows spelling, not a host path.
-    /// `None` is the image's own directory. On Windows the child starts in
-    /// root 0's directory, as before, whatever this says.
+    /// The working directory the program starts in, as it sees it: an
+    /// absolute path (`C:\…` under Proton, a host path on Windows), or a path
+    /// relative to root 0's location. `None` is the image's own directory
+    /// (on Windows, for an image in a root; a program outside every root
+    /// starts in root 0's directory there). A `String`, not a `PathBuf`: under Proton it names a
+    /// place in the Wine prefix, with Windows spelling, not a host path.
     pub cwd: Option<String>,
     /// How long the injector waits for the shim to report ready. `None`:
     /// `VFS_READY_TIMEOUT_SECS` from this process's environment, else 180 s.

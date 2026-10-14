@@ -65,6 +65,7 @@ fn fuse_init_failure_aborts_the_launch() {
         ready_path: ready_path.to_str().unwrap().to_string(),
         ready_timeout: Duration::from_secs(10),
         detach: false,
+        env: None,
     });
     std::env::remove_var(vfs_env::TEST_FUSE_INIT_FAIL);
 

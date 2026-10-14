@@ -2,8 +2,6 @@
 //! declares roots under the user's Documents, Local AppData or Saved Games.
 #![allow(unsafe_code)]
 
-use std::ffi::OsString;
-use std::os::windows::ffi::OsStringExt;
 use std::path::PathBuf;
 
 use windows_sys::core::{GUID, PWSTR};
@@ -65,7 +63,8 @@ pub fn known_folder(folder: KnownFolderId) -> std::io::Result<PathBuf> {
             }
             std::slice::from_raw_parts(path, len)
         };
-        Ok(PathBuf::from(OsString::from_wide(wide)))
+        // Lossy only for an unpaired surrogate, which no shell folder has.
+        Ok(PathBuf::from(String::from_utf16_lossy(wide)))
     };
     // SAFETY: `path` is null or the shell's allocation, freed exactly once.
     unsafe { CoTaskMemFree(path as *const core::ffi::c_void) };

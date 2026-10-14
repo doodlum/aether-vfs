@@ -1035,6 +1035,35 @@ pub fn describe() -> String {
 /// some and not others). They now all read these tables, and a test ties the
 /// tables to [`ALL`]: a new [`Kind::Handshake`] name that is in no table fails
 /// the build of this crate's tests.
+/// A child's whole environment: `base` (normally this process's) with
+/// `changes` applied in order — `Some` sets a variable, `None` removes it —
+/// for a launch that hands the child an explicit environment block instead of
+/// writing this process's environment (`CreateProcessW` with
+/// `CREATE_UNICODE_ENVIRONMENT`). Names compare ASCII case-insensitively, as
+/// Windows' do: a change replaces a base variable spelled in another case,
+/// keeping the change's spelling. Sorted by upper-cased name, the order
+/// Windows keeps an environment block in.
+pub fn child_environment(
+    base: impl IntoIterator<Item = (String, String)>,
+    changes: &[(String, Option<String>)],
+) -> Vec<(String, String)> {
+    let mut env: std::collections::BTreeMap<String, (String, String)> = base
+        .into_iter()
+        .map(|(k, v)| (k.to_ascii_uppercase(), (k, v)))
+        .collect();
+    for (k, v) in changes {
+        match v {
+            Some(v) => {
+                env.insert(k.to_ascii_uppercase(), (k.clone(), v.clone()));
+            }
+            None => {
+                env.remove(&k.to_ascii_uppercase());
+            }
+        }
+    }
+    env.into_values().collect()
+}
+
 pub mod handshake {
     use super::*;
 
@@ -1167,6 +1196,28 @@ pub mod handshake {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_child_environment_is_the_base_with_the_changes_case_insensitively() {
+        let base = [
+            ("Path".to_string(), "C:\\bin".to_string()),
+            ("VFS_RING_PATH".to_string(), "stale".to_string()),
+            ("TEMP".to_string(), "C:\\t".to_string()),
+        ];
+        let changes = [
+            ("PATH".to_string(), Some("C:\\x".to_string())),
+            ("vfs_ring_path".to_string(), None),
+            ("SteamAppId".to_string(), Some("489830".to_string())),
+        ];
+        assert_eq!(
+            child_environment(base, &changes),
+            [
+                ("PATH".to_string(), "C:\\x".to_string()),
+                ("SteamAppId".to_string(), "489830".to_string()),
+                ("TEMP".to_string(), "C:\\t".to_string()),
+            ]
+        );
+    }
 
     #[test]
     fn every_name_is_unique_and_prefixed() {

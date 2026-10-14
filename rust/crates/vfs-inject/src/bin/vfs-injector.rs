@@ -74,6 +74,7 @@ fn main() {
         ready_path: ready,
         ready_timeout,
         detach: false,
+        env: None,
     })
     .unwrap_or_else(|e| {
         eprintln!("[vfs-injector] inject error: {e:?}");

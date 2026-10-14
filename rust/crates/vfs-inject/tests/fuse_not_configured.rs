@@ -66,6 +66,7 @@ fn no_ring_configured_aborts_the_launch() {
         ready_path: ready_path.to_str().unwrap().to_string(),
         ready_timeout: Duration::from_secs(10),
         detach: false,
+        env: None,
     });
 
     match result {

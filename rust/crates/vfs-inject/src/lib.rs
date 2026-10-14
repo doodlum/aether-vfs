@@ -32,6 +32,14 @@ pub struct RunConfig {
     /// When true, return as soon as the target is running (do not wait for exit).
     /// [`run_target_with_shim`] only; [`spawn_target_with_shim`] never waits.
     pub detach: bool,
+    /// The target's environment. `None`: it inherits this process's, into
+    /// which the launch writes its own variables first (`vfs-injector.exe`,
+    /// single-threaded under Wine). `Some(changes)`: an environment block of
+    /// its own — this process's environment with `changes` applied (`Some`
+    /// sets, `None` removes) and the launch's variables added — and this
+    /// process's environment is not written at all, which a multi-threaded
+    /// host needs (`std::env::set_var` is unsound there).
+    pub env: Option<Vec<(String, Option<String>)>>,
 }
 
 /// Failure points in launch + inject + run.
