@@ -35,6 +35,9 @@ vfs-provider.workspace = true
 # `compose_root` builds a root's writable upper out of it — and the rest are
 # re-exported so a host composes a graph without a second dependency.
 vfs-compose.workspace = true
+# `vfs_core::fold`, the engine's case fold, re-exposed (not copied) by
+# `fold_path`/`paths_equal` so a host compares paths the way the VFS does.
+vfs-core.workspace = true
 tracing.workspace = true
 vfs-env.workspace = true
 vfs-zip = { workspace = true, optional = true }

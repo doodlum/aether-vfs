@@ -23,7 +23,7 @@ doc has one row. Written for the 2026-10-07 cleanup pass (finding E12).
   host used it. Its two specs were archived; its e2e tests moved to `vfs-embed/tests/`. Older
   docs that mention it describe removed code.
 
-## Current (17)
+## Current (21)
 
 | Date | Doc | Kind | Status | Summary |
 |---|---|---|---|---|
@@ -44,6 +44,10 @@ doc has one row. Written for the 2026-10-07 cleanup pass (finding E12).
 | 2026-10-07 | [aether-vfs cleanup pass: implementation plan](plans/2026-10-07-cleanup.md) | plan | current | Task-by-task plan for the cleanup pass (in progress). |
 | 2026-10-07 | [Cleanup audit reports (director, embed, shim, storage)](specs/2026-10-07-cleanup-audit/) | audit | current | Four audit reports (director, embed, shim, storage) holding the detail behind every cleanup finding ID. |
 | 2026-10-07 | [aether-vfs: code cleanup pass](specs/2026-10-07-cleanup-design.md) | spec | current | The 2026-10 code cleanup pass: scope, streams, rules. |
+| 2026-10-13 | [Windows launches wait for the whole process tree](specs/2026-10-13-windows-process-tree-wait-design.md) | spec | current | Job Object per Windows launch: a launch ends when its whole process tree has exited; `launch_detached`/`LaunchHandle`/`stop_launch` on Windows, matching Proton. |
+| 2026-10-13 | [`aether-storage`: freezing layer files into immutable live keys](specs/2026-10-13-live-freeze-design.md) | spec | current | Live keys: zero-copy freeze of layer files (`BlockStore::clone_files`), reads by key, enumeration; for Mauvi's per-session scratch layers. |
+| 2026-10-13 | [aether-vfs — Write routes: paths a provider owns above the write layer](specs/2026-10-13-write-routes-design.md) | spec | current | `Session::route_at`: a writable synthesized file (a memory `plugins.txt`) takes the game's writes instead of being copied up; `RouterProvider` readdir union and cross-route rename. |
+| 2026-10-13 | [aether-vfs — exporting path identity from `vfs-embed`](specs/2026-10-13-export-case-fold-design.md) | spec | current | `fold_path`/`paths_equal`/`fold_segment` for hosts (Mauvi DEC-051): the engine's own normalise and fold, with a stability contract. |
 
 ## Historical (79 rows, in `archive/`)
 

@@ -4006,6 +4006,7 @@ version = "0.1.0"
 dependencies = [
  "tracing",
  "vfs-compose",
+ "vfs-core",
  "vfs-director",
  "vfs-env",
  "vfs-inject",

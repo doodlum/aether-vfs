@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 // Named only by the rustdoc links below.
-#[cfg(all(doc, unix))]
+#[cfg(doc)]
 use super::LaunchHandle;
 #[cfg(doc)]
 use super::Session;
@@ -26,10 +26,14 @@ pub struct LaunchOpts {
     /// than handed to `CreateProcess`.
     pub image: String,
     pub args: Vec<String>,
-    /// Wait for process exit (false = detach; session must stay alive).
+    /// Wait for the launch to end (false = detach; session must stay alive).
     ///
-    /// On the Proton path a detached launch is held by the session: stop it
-    /// with [`Session::stop_launch`] (dropping the session also stops it). A
+    /// A launch ends when the program **and everything it started** have
+    /// exited (a Wine prefix gone quiet on Proton, an empty Job Object on
+    /// Windows), and reports the program's own exit code.
+    ///
+    /// A detached launch is held by the session: stop it with
+    /// [`Session::stop_launch`] (dropping the session also stops it). A
     /// host that wants the handle itself calls [`Session::launch_detached`].
     pub wait: bool,
     /// How the shim gets into the program: see [`Activation`].

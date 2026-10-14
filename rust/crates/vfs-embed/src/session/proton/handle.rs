@@ -169,30 +169,6 @@ impl LaunchStopper {
     }
 }
 
-/// Resets [`ProtonState::starting`] to `false` when a
-/// [`Session::launch_detached`] call ends, on every path — success or an
-/// early `?` return alike. Clears [`ProtonState::stop_pending`] the same way:
-/// a `stop_launch` landing while this call is in flight but before it
-/// reaches the spawn checkpoint (an early error — a bad image, a prefix
-/// that won't `ensure`) would otherwise leave that flag set with nothing
-/// left to consume it, and the *next*, unrelated `launch_detached` would
-/// spawn its program only to stop it immediately.
-#[cfg(unix)]
-pub(super) struct StartingGuard<'a> {
-    pub(super) starting: &'a std::sync::atomic::AtomicBool,
-    pub(super) stop_pending: &'a std::sync::atomic::AtomicBool,
-}
-
-#[cfg(unix)]
-impl Drop for StartingGuard<'_> {
-    fn drop(&mut self) {
-        self.starting
-            .store(false, std::sync::atomic::Ordering::SeqCst);
-        self.stop_pending
-            .store(false, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
 #[cfg(unix)]
 impl LaunchHandle {
     /// The pid of the `wine` process running `vfs-injector.exe`, which lives

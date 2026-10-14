@@ -60,6 +60,11 @@
 //! getting that wrong produces a session that reads correctly and silently
 //! cannot be written to.
 //!
+//! [`compose_root_routed`] adds **write routes** above the write layer
+//! ([`Session::route_at`]): paths a provider owns outright, so a writable
+//! synthesized file (a memory `plugins.txt`) takes the game's writes instead
+//! of being copied up into the write layer.
+//!
 //! [`RootSources`] is the incremental form of the same rule, for a host that
 //! learns about its sources one at a time (a config being applied, an RPC
 //! stream, a UI) and must rebuild a root's mount list from scratch each time.
@@ -79,6 +84,16 @@
 //! A host does not have to know any of that: `launch("SkyrimSE.exe")` is
 //! enough. [`Session::stage_launch`] is the same sequence exposed, for seeding
 //! staging from something other than this session's graph.
+//!
+//! ## Path identity
+//!
+//! A host that keeps its own records of vpaths must decide "same file?" the
+//! way the graph does. [`fold_path`] and [`paths_equal`] are that decision,
+//! built from the Director's own normalisation and the engine's own fold
+//! rather than a copy of either; [`fold_segment`] is the fold of one name.
+//! Their docs state the contract, including the stability promise
+//! ([`FOLD_VERSION`], [`fold_unicode_version`]) a host storing folded keys
+//! depends on.
 //!
 //! ## What a host still has to build for itself
 //!
@@ -114,17 +129,24 @@
 
 #![deny(unsafe_code)]
 
+mod fold;
 pub mod image;
 mod session;
 mod sources;
 #[cfg(test)]
 mod test_scratch;
 
-pub use session::{
-    compose_root, Activation, LaunchExit, LaunchOpts, RegistrySync, Session, StageOpts,
-    STOPPED_EXIT_CODE,
+// Path identity — "are these two paths the same file?" — answered by the
+// engine's own normalise and fold, for a host that keeps its own records of
+// vpaths. See the module docs for the contract and its stability.
+pub use fold::{
+    fold_path, fold_segment, fold_unicode_version, paths_equal, PathEscapesRoot, FOLD_VERSION,
 };
-#[cfg(unix)]
+pub use session::{
+    compose_root, compose_root_routed, Activation, LaunchExit, LaunchOpts, RegistrySync, Session,
+    StageOpts, STOPPED_EXIT_CODE,
+};
+#[cfg(any(unix, windows))]
 pub use session::{LaunchHandle, LaunchStopper};
 /// How a Proton launch sets up its Wine prefix — see [`Session::set_prefix_init`].
 #[cfg(unix)]

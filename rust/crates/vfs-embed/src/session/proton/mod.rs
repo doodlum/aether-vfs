@@ -17,13 +17,13 @@ use vfs_proton::{
 };
 
 use super::stage::ResolvedImage;
-use super::{check_image, LaunchExit, LaunchOpts, Session, STOPPED_EXIT_CODE};
+use super::{check_image, LaunchExit, LaunchOpts, Session, StartingGuard, STOPPED_EXIT_CODE};
 use crate::image::{self, RootLocation};
 
 mod handle;
 mod ring;
 
-use handle::{AnonPrefix, StartingGuard, StopInner};
+use handle::{AnonPrefix, StopInner};
 pub use handle::{LaunchHandle, LaunchStopper};
 use ring::{remove_memory_ring, ring_in_memory};
 

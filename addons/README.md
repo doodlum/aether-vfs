@@ -7,7 +7,7 @@ own CI job.
 | Crate | What it is |
 |---|---|
 | `aether-block-store` | Deduplicating, compressing block store (redb index + zstd packs) |
-| `aether-storage` | The block store as pull-through cache and named write layers |
+| `aether-storage` | The block store as pull-through cache, named write layers, and immutable live keys frozen from them |
 | `aether-archive` | Random-access archive formats (seekable zstd, zip directories, 7z/zip extraction), `Xxh64`, `RangeRead` |
 | `aether-net` | Shared HTTP base: connection limits, retries, events, ranged and bulk downloads |
 | `aether-steam` | Steam login, depot manifests and random-access depot reads |

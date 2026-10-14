@@ -10,6 +10,11 @@
 //! order, what a crash leaves) are in the `durable` module's docs, which render
 //! `DURABILITY.md`.
 //!
+//! **Live keys.** [`Storage::freeze`] turns layer files into immutable live
+//! files, addressed by [`LiveKey`] and read through [`LiveFile`], sharing the
+//! layer files' blocks (no copy). See
+//! `docs/superpowers/specs/2026-10-13-live-freeze-design.md`.
+//!
 //! **Registry layers.** A `vfs_embed::Session`'s registry layer taken from
 //! [`Storage::layer`] is made durable at session end by the sync hook
 //! `registry_sync_for` returns (feature `embed`, on by default; without it
@@ -23,6 +28,7 @@ mod evict;
 mod ids;
 mod layer;
 mod layer_io;
+mod live;
 mod manage;
 mod ram;
 mod reconcile;
@@ -36,6 +42,7 @@ mod util;
 pub use cached::{CacheStats, SourceKey};
 pub use config::{Durability, ScratchDir, StorageConfig};
 pub use evict::ClearReport;
+pub use live::{EntryKind, FrozenFile, LayerEntry, LiveFile, LiveInfo, LiveKey};
 pub use manage::{LayerInfo, SpaceUsage, StorageStats};
 pub use reconcile::ReconcileReport;
 #[cfg(feature = "embed")]

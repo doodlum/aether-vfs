@@ -27,6 +27,9 @@ windows-sys = { workspace = true, features = [
   "Win32_System_ProcessStatus",
   "Win32_System_Registry",
   "Win32_System_Diagnostics_ToolHelp",
+  # `spawn_target_with_shim`: the launch's Job Object and its completion port.
+  "Win32_System_JobObjects",
+  "Win32_System_IO",
 ] }
 
 [dev-dependencies]

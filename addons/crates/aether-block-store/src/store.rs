@@ -25,6 +25,9 @@ use crate::{crash, files};
 /// own clean shutdown.
 const CLEAN_PLAIN: u64 = 1;
 
+/// A file's length and content digest, as [`BlockStore::content_digests`] returns them.
+pub type ContentDigest = (u64, [u8; 32]);
+
 /// Metadata of a stored file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileInfo {
@@ -412,6 +415,96 @@ impl BlockStore {
         self.maybe_auto_flush()
     }
 
+    /// Makes each `(src, dst)` pair's `dst` a new file with `src`'s length and content, sharing
+    /// its blocks: `dst`'s manifest names the same block ids, each with one more reference. No
+    /// block is read, compressed or appended, so the cost is index metadata only (a segment
+    /// per 4096 blocks and a `blocks` row per block).
+    ///
+    /// The two files are independent from then on: a write to either replaces only that
+    /// file's slots, and a delete of either drops only its references (copy-on-write at block
+    /// granularity, as for any two files that share blocks). A block of `src` the store has
+    /// healed away is missing in `dst` too.
+    ///
+    /// All pairs are copied in **one** non-durable index commit, or none is: a missing `src`
+    /// is [`Error::NotFound`], a `dst` that exists or is listed twice is
+    /// [`Error::AlreadyExists`]. Returns each `src`'s length, in order.
+    pub fn clone_files(&self, pairs: &[(&[u8], &[u8])]) -> Result<Vec<u64>> {
+        let mut dsts = HashSet::new();
+        for (src, dst) in pairs {
+            self.check_id(src)?;
+            self.check_id(dst)?;
+            if !dsts.insert(*dst) {
+                return Err(Error::AlreadyExists);
+            }
+        }
+        if pairs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let bs = self.cfg.block_size;
+        let lens = self.commit(|t| {
+            let mut lens = Vec::with_capacity(pairs.len());
+            for (src, dst) in pairs {
+                if files::len(t, dst)?.is_some() {
+                    return Err(Error::AlreadyExists);
+                }
+                lens.push(files::copy(t, src, dst, bs)?.ok_or(Error::NotFound)?);
+            }
+            Ok(lens)
+        })?;
+        self.maybe_auto_flush()?;
+        Ok(lens)
+    }
+
+    /// A digest of each file's length and content, in order, or `None` for a file that does
+    /// not exist: BLAKE3 over the length and, slot by slot, the block's content hash (the
+    /// 128-bit dedup hash its `blocks` row keeps), with a fixed marker for a missing slot
+    /// (never written, or healed away). So equal digests mean equal lengths and equal bytes,
+    /// and any change of a file's bytes or length changes its digest; moving blocks between
+    /// packs (compaction) does not.
+    ///
+    /// One index read transaction; a manifest segment per 4096 blocks and a `blocks` row per
+    /// block are read, no pack I/O.
+    pub fn content_digests(&self, file_ids: &[&[u8]]) -> Result<Vec<Option<ContentDigest>>> {
+        for id in file_ids {
+            self.check_id(id)?;
+        }
+        let bs = self.cfg.block_size;
+        let r = self.index.read()?;
+        let mut out = Vec::with_capacity(file_ids.len());
+        for id in file_ids {
+            let Some(seg0) = r.segment(id, 0)? else {
+                out.push(None);
+                continue;
+            };
+            let len = file_len(&seg0);
+            drop(seg0);
+            let mut h = blake3::Hasher::new_derive_key("aether-block-store content digest v1");
+            h.update(&len.to_le_bytes());
+            for s in 0..segment_count(block_count(len, bs)) {
+                let value = r
+                    .segment(id, s)?
+                    .ok_or_else(|| Error::Corrupt(format!("manifest segment {s} missing")))?;
+                for bid in decode_ids(&value, s) {
+                    match (bid != MISSING)
+                        .then(|| r.block(bid))
+                        .transpose()?
+                        .flatten()
+                    {
+                        Some(loc) => {
+                            h.update(&[1]);
+                            h.update(&loc.hash);
+                        }
+                        None => {
+                            h.update(&[0]);
+                        }
+                    }
+                }
+            }
+            out.push(Some((len, *h.finalize().as_bytes())));
+        }
+        Ok(out)
+    }
+
     /// Cached byte ranges of a file, merged and in order.
     pub fn cached_ranges(&self, file_id: &[u8]) -> Result<Vec<Range<u64>>> {
         self.check_id(file_id)?;
@@ -675,6 +768,151 @@ pub(crate) mod tests {
         let store = BlockStore::open(dir.path(), test_config()).unwrap();
         assert_eq!(read_all(&store, b"a"), a);
         assert_eq!(read_all(&store, b"c"), c);
+        assert!(store.verify().unwrap().is_ok());
+    }
+
+    fn live_bytes(store: &BlockStore) -> u64 {
+        store
+            .stats()
+            .unwrap()
+            .packs
+            .iter()
+            .map(|p| p.live_bytes)
+            .sum()
+    }
+
+    /// A clone shares every block (no new pack bytes), and the two files are independent
+    /// from then on: writes and deletes of one leave the other's bytes alone.
+    #[test]
+    fn clone_files_shares_blocks_and_stays_independent() {
+        let dir = vfs_testkit::tempdir().unwrap();
+        let store = BlockStore::open(dir.path(), test_config()).unwrap();
+        let a = random_bytes(1, 5 * BS + 17);
+        put(&store, b"a", &a).unwrap();
+        let live = live_bytes(&store);
+        assert_eq!(
+            store.clone_files(&[(b"a", b"a2")]).unwrap(),
+            vec![a.len() as u64]
+        );
+        assert_eq!(live_bytes(&store), live, "metadata only");
+        assert_eq!(read_all(&store, b"a2"), a);
+        assert!(store.verify().unwrap().is_ok(), "refcounts count both");
+
+        // Rewrite the source: the clone keeps the old bytes.
+        store.write_blocks(b"a", 0, &random_bytes(2, BS)).unwrap();
+        store.set_len(b"a", 2 * BS as u64).unwrap();
+        assert_eq!(read_all(&store, b"a2"), a);
+        // Write the clone: the source is unaffected.
+        let a_now = read_all(&store, b"a");
+        store.write_blocks(b"a2", 1, &random_bytes(3, BS)).unwrap();
+        assert_eq!(read_all(&store, b"a"), a_now);
+        assert!(store.verify().unwrap().is_ok());
+
+        // Delete the source: the clone still reads.
+        store.write_blocks(b"a2", 1, &a[BS..2 * BS]).unwrap();
+        store.delete(b"a").unwrap();
+        assert_eq!(read_all(&store, b"a2"), a);
+        store
+            .compact(crate::CompactOptions {
+                min_garbage_ratio: 0.0,
+                max_bytes: u64::MAX,
+            })
+            .unwrap();
+        assert_eq!(read_all(&store, b"a2"), a);
+        assert!(store.verify().unwrap().is_ok());
+        store.close().unwrap();
+        let store = BlockStore::open(dir.path(), test_config()).unwrap();
+        assert_eq!(read_all(&store, b"a2"), a);
+    }
+
+    /// Digests follow bytes and length, not file ids, block ids or packs.
+    #[test]
+    fn content_digests_follow_content() {
+        let dir = vfs_testkit::tempdir().unwrap();
+        let store = BlockStore::open(dir.path(), test_config()).unwrap();
+        let a = random_bytes(7, 3 * BS + 9);
+        put(&store, b"a", &a).unwrap();
+        store.clone_files(&[(b"a", b"a2")]).unwrap();
+        put(&store, b"b", &a).unwrap();
+        let d = |ids: &[&[u8]]| store.content_digests(ids).unwrap();
+        let first = d(&[b"a", b"a2", b"b", b"nope"]);
+        assert_eq!(first[0].unwrap().0, a.len() as u64);
+        assert_eq!(first[0], first[1], "a clone");
+        assert_eq!(first[0], first[2], "equal bytes written separately");
+        assert_eq!(first[3], None);
+        // A write in place, a shrink and a missing slot each change it.
+        store.write_blocks(b"b", 1, &random_bytes(8, BS)).unwrap();
+        let after_write = d(&[b"b"])[0];
+        assert_ne!(after_write, first[0]);
+        store.write_blocks(b"b", 1, &a[BS..2 * BS]).unwrap();
+        assert_eq!(d(&[b"b"])[0], first[0], "the old bytes back");
+        store.set_len(b"b", 2 * BS as u64).unwrap();
+        assert_ne!(d(&[b"b"])[0], first[0]);
+        store.set_len(b"c", 2 * BS as u64).unwrap();
+        assert_ne!(d(&[b"c"])[0], d(&[b"b"])[0], "missing is not data");
+        // Compaction moves blocks, not content.
+        store.delete(b"b").unwrap();
+        store
+            .compact(crate::CompactOptions {
+                min_garbage_ratio: 0.0,
+                max_bytes: u64::MAX,
+            })
+            .unwrap();
+        assert_eq!(d(&[b"a"])[0], first[0]);
+    }
+
+    /// A refused batch commits nothing.
+    #[test]
+    fn clone_files_is_all_or_nothing() {
+        let dir = vfs_testkit::tempdir().unwrap();
+        let store = BlockStore::open(dir.path(), test_config()).unwrap();
+        put(&store, b"a", &random_bytes(4, 2 * BS)).unwrap();
+        put(&store, b"b", &random_bytes(5, BS)).unwrap();
+        assert!(matches!(
+            store.clone_files(&[(b"a", b"x"), (b"nope", b"y")]),
+            Err(Error::NotFound)
+        ));
+        assert!(matches!(
+            store.clone_files(&[(b"a", b"x"), (b"a", b"b")]),
+            Err(Error::AlreadyExists)
+        ));
+        assert!(matches!(
+            store.clone_files(&[(b"a", b"x"), (b"b", b"x")]),
+            Err(Error::AlreadyExists)
+        ));
+        assert!(store.stat(b"x").unwrap().is_none() && store.stat(b"y").unwrap().is_none());
+        assert!(store.verify().unwrap().is_ok());
+        assert!(store.clone_files(&[]).unwrap().is_empty());
+        // Many pairs in one call, an empty file among them.
+        store.set_len(b"e", 0).unwrap();
+        let lens = store
+            .clone_files(&[(b"a", b"a1"), (b"b", b"b1"), (b"e", b"e1"), (b"a", b"a3")])
+            .unwrap();
+        assert_eq!(lens, vec![2 * BS as u64, BS as u64, 0, 2 * BS as u64]);
+        assert_eq!(read_all(&store, b"a3"), read_all(&store, b"a"));
+        assert_eq!(store.stat(b"e1").unwrap().unwrap().len, 0);
+        assert!(store.verify().unwrap().is_ok());
+    }
+
+    /// A clone of a file longer than one manifest segment copies every segment.
+    #[test]
+    fn clone_files_copies_every_segment() {
+        let dir = vfs_testkit::tempdir().unwrap();
+        let store = BlockStore::open(
+            dir.path(),
+            StoreConfig {
+                max_pack_size: 1 << 30,
+                write_txn_bytes: 1 << 20,
+                ..test_config()
+            },
+        )
+        .unwrap();
+        let n = crate::manifest::BLOCKS_PER_SEGMENT as usize + 3;
+        let data = random_bytes(6, n * BS - 5);
+        put(&store, b"big", &data).unwrap();
+        store.clone_files(&[(b"big", b"big2")]).unwrap();
+        store.delete(b"big").unwrap();
+        assert_eq!(read_all(&store, b"big2"), data);
         assert!(store.verify().unwrap().is_ok());
     }
 }

@@ -34,5 +34,5 @@ pub use error::{Error, Result};
 pub use gpu::{GPU_MAX_BLOCK, GpuConfig, GpuLevel, GpuStats};
 pub use index::IndexStats;
 pub use stats::{ClassWriteStats, IndexSize, PackStats, Stats, Usage, WriteStats};
-pub use store::{BlockStore, FileInfo, ReadResult};
+pub use store::{BlockStore, ContentDigest, FileInfo, ReadResult};
 pub use verify::VerifyReport;
