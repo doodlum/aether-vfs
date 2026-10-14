@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use vfs_proton::{
-    launch::WineLaunch,
+    launch::{HostWatch, WineLaunch},
     layout::Root as ProtonRoot,
     prefix::{Prefix, PrefixLock},
     steam::SteamSide,
@@ -59,6 +59,11 @@ pub struct LaunchHandle {
     pub(super) quiet: Option<std::process::Child>,
     /// How the launch ended, once the prefix is quiet.
     pub(super) outcome: Option<Result<LaunchExit, String>>,
+    /// Stops the launch if this process dies first; disarmed when the
+    /// launch ends. `None` when it could not be started (a note says so).
+    pub(super) watch: Option<HostWatch>,
+    /// Declared after `watch`: the prefix stays locked until the watch is
+    /// disarmed.
     pub(super) _prefix_lock: PrefixLock,
 }
 
@@ -272,7 +277,7 @@ impl LaunchHandle {
         }
         if self.wine_status.is_none() {
             match self.child.try_wait().map_err(|e| format!("launch: {e}"))? {
-                Some(status) => self.wine_status = Some(status),
+                Some(status) => self.reaped(status),
                 None => return Ok(None),
             }
         }
@@ -288,7 +293,8 @@ impl LaunchHandle {
             return outcome.clone();
         }
         if self.wine_status.is_none() {
-            self.wine_status = Some(self.child.wait().map_err(|e| format!("launch: {e}"))?);
+            let status = self.child.wait().map_err(|e| format!("launch: {e}"))?;
+            self.reaped(status);
         }
         self.prefix_quiet(true)?;
         self.conclude()
@@ -332,12 +338,23 @@ impl LaunchHandle {
             .is_some())
     }
 
+    /// `wine` has been reaped with `status`: its pid may be reused from now
+    /// on, so the host watch stops naming it.
+    fn reaped(&mut self, status: std::process::ExitStatus) {
+        self.wine_status = Some(status);
+        if let Some(w) = &self.watch {
+            w.wine_reaped();
+        }
+    }
+
     /// Kills and reaps whatever of the launch this handle still has a
     /// process for: `wine`, and the prefix watch.
     fn abandon(&mut self) {
         if self.wine_status.is_none() {
             let _ = self.child.kill();
-            self.wine_status = self.child.wait().ok();
+            if let Ok(status) = self.child.wait() {
+                self.reaped(status);
+            }
         }
         if let Some(watch) = &mut self.quiet {
             let _ = watch.kill();
@@ -353,6 +370,11 @@ impl LaunchHandle {
     /// [`StopInner::ended`] — before `self` (and so `_prefix_lock`) can drop.
     fn conclude(&mut self) -> Result<LaunchExit, String> {
         let was_stopped = self.stopper.was_stopped();
+        // Nothing of the launch is left to stop, and the prefix may be a
+        // later launch's once the lock goes.
+        if let Some(w) = &mut self.watch {
+            w.disarm();
+        }
         self.stopper.mark_ended();
         let outcome = if was_stopped {
             Ok(LaunchExit::Stopped)
@@ -380,6 +402,9 @@ impl Drop for LaunchHandle {
         if matches!(self.poll(), Ok(None)) {
             let _ = self.stopper.stop();
             self.abandon();
+        }
+        if let Some(w) = &mut self.watch {
+            w.disarm();
         }
         self.stopper.mark_ended();
     }

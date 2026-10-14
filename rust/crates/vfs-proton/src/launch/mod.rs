@@ -44,7 +44,11 @@ use crate::steam::SteamSide;
 mod env;
 mod injector;
 mod procs;
+#[cfg(unix)]
+mod watch;
 pub use procs::LaunchProcesses;
+#[cfg(unix)]
+pub use watch::{HostWatch, PID_REFRESH, WATCHER};
 
 use env::stale_env;
 pub use env::{

@@ -116,8 +116,17 @@ impl From<io::Error> for PrefixError {
 /// Held for one launch; the OS releases the lock when the file closes.
 #[derive(Debug)]
 pub struct PrefixLock {
-    // Held, never read: closing the file releases the lock.
-    _file: std::fs::File,
+    // Held, never read: closing the file releases the lock — every
+    // descriptor for it, including the one a launch's host watch holds
+    // (`crate::launch::HostWatch`).
+    file: std::fs::File,
+}
+
+impl PrefixLock {
+    /// The locked file, for a process that is to hold the lock too.
+    pub(crate) fn file(&self) -> &std::fs::File {
+        &self.file
+    }
 }
 
 /// How long [`Prefix::lock`] keeps retrying a lock that looks held before it
@@ -155,7 +164,7 @@ impl Prefix {
         let mut pause = std::time::Duration::from_millis(1);
         loop {
             match f.try_lock() {
-                Ok(()) => return Ok(PrefixLock { _file: f }),
+                Ok(()) => return Ok(PrefixLock { file: f }),
                 Err(std::fs::TryLockError::WouldBlock) => {
                     if std::time::Instant::now() >= deadline {
                         return Err(PrefixError::Busy(self.dir.clone()));

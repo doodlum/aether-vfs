@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, Weak};
 use vfs_director::ipc::IpcServe;
 use vfs_proton::{
     artifacts,
-    launch::{LaunchFiles, RingGeometry, WineLaunch},
+    launch::{HostWatch, LaunchFiles, RingGeometry, WineLaunch},
     layout::Root as ProtonRoot,
     prefix::{KnownFolder, Prefix, PrefixInit, PrefixLock},
     steam::SteamSide,
@@ -646,13 +646,30 @@ impl Session {
                 ),
                 None => format!("launch: {e}"),
             })?;
-        let wine = self.wine_launch(opts, ipc, &ring, resolved, &booted)?;
+        let mut wine = self.wine_launch(opts, ipc, &ring, resolved, &booted)?;
 
         let shared = self
             .proton
             .prefix_shared
             .then(|| self.launch_processes(&booted.prefix));
+        // If this process dies, the launch is stopped: see `HostWatch`. A
+        // launch with the prefix to itself is watched from before `wine`
+        // starts; a shared-prefix one needs `wine`'s pid, so from just after.
+        let mut watch = None;
+        if shared.is_none() {
+            match HostWatch::prefix(&booted.host, &booted.prefix, Some(&booted.lock)) {
+                Ok(w) => watch = Some(w),
+                Err(e) => wine.notes.push(unwatched_note(&e)),
+            }
+        }
         let child = vfs_proton::launch::spawn(&wine).map_err(|e| format!("launch: {e}"))?;
+        if let Some(procs) = &shared {
+            let pids = self.state_dir.join(LAUNCH_PIDS_FILE);
+            match HostWatch::processes(procs.clone(), child.id(), pids, Some(&booted.lock)) {
+                Ok(w) => watch = Some(w),
+                Err(e) => wine.notes.push(unwatched_note(&e)),
+            }
+        }
         let BootedPrefix { host, prefix, lock } = booted;
         let handle = LaunchHandle {
             stopper: LaunchStopper(Arc::new(StopInner {
@@ -668,6 +685,7 @@ impl Session {
             wine_status: None,
             quiet: None,
             outcome: None,
+            watch,
             _prefix_lock: lock,
         };
         // Before `starting` clears (the guard drops on return), so there is
@@ -1117,6 +1135,19 @@ fn wine_cwd(requested: Option<&str>, root0: &str, target: &str) -> Result<String
         }),
     }
 }
+
+/// The note a launch carries when its [`HostWatch`] could not be started.
+fn unwatched_note(e: &std::io::Error) -> String {
+    format!(
+        "aether-vfs: could not start the watch that stops this launch if this process dies \
+         ({e}); if it dies, the program keeps running"
+    )
+}
+
+/// Where a shared-prefix launch keeps the pids its [`HostWatch`] would
+/// signal, inside `state_dir`.
+#[cfg(unix)]
+const LAUNCH_PIDS_FILE: &str = "launch.pids";
 
 /// The ring file [`Session::serve`] creates inside `state_dir` on unix. Named
 /// as a constant because [`Session::launch`] has to render the same file as a

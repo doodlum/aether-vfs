@@ -1369,3 +1369,122 @@ fn a_known_folder_follows_the_prefixs_registry_while_a_launch_runs() {
     );
     h.stop().unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// A host that dies (AE-27): the test binary runs itself as the host, starts a
+// launch, and is SIGKILLed. The launch's watcher must stop the game.
+// ---------------------------------------------------------------------------
+
+/// Names the directory a re-executed test binary acts as a host in.
+const HOST_CHILD: &str = "AETHER_TEST_HOST_CHILD";
+
+/// Not a test of its own: the host process the `a_killed_host_*` tests start
+/// and kill. Does nothing unless [`HOST_CHILD`] is set. Starts the launch
+/// `<dir>/mode` names (`own`: a launcher that leaves its game running in a
+/// prefix of its own; `shared`: a game beside a fake Windows Steam), writes
+/// `<dir>/info` (the prefix, the game's pid, Steam's pid or 0) and waits to
+/// be killed.
+#[test]
+fn host_process_for_the_host_death_tests() {
+    let Some(out) = std::env::var_os(HOST_CHILD).map(PathBuf::from) else {
+        return;
+    };
+    let mode = std::fs::read_to_string(out.join("mode")).unwrap();
+    let tag = format!("host-{}", mode.trim());
+    let (s, pfx, game, steam) = match mode.trim() {
+        "own" => {
+            let home = fake_home(&tag);
+            let (s, pfx, shim) = session(&tag, &home);
+            let h = s.launch_detached(&opts(&shim, "game", false)).unwrap();
+            std::mem::forget(h);
+            let game = launcher_exited(&pfx);
+            (s, pfx, game, None)
+        }
+        "shared" => {
+            let (s, pfx, shim, steam) = shared_session(&tag);
+            let h = s.launch_detached(&opts(&shim, "shared", false)).unwrap();
+            std::mem::forget(h);
+            let game = game_pid(&pfx);
+            (s, pfx, game, Some(steam))
+        }
+        other => panic!("unknown mode {other:?}"),
+    };
+    let steam_pid = steam.as_ref().map_or(0, |s| s.0.id());
+    let tmp_info = out.join("info.tmp");
+    std::fs::write(
+        &tmp_info,
+        format!("{}\n{game}\n{steam_pid}\n", pfx.display()),
+    )
+    .unwrap();
+    std::fs::rename(&tmp_info, out.join("info")).unwrap();
+    // Until SIGKILL: neither the session nor the launch is ever dropped.
+    let _keep = (s, steam);
+    loop {
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// Runs [`host_process_for_the_host_death_tests`] in `mode` in a process of
+/// its own, waits for its launch to be running, and SIGKILLs it. Returns the
+/// prefix, the game's pid and the fake Steam's (0 for none).
+fn kill_a_host(mode: &str) -> (PathBuf, u32, u32) {
+    let out = tmp(&format!("host-death-{mode}"));
+    std::fs::write(out.join("mode"), mode).unwrap();
+    let mut host = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "host_process_for_the_host_death_tests",
+            "--nocapture",
+        ])
+        .env(HOST_CHILD, &out)
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !out.join("info").exists() {
+        if let Some(status) = host.try_wait().unwrap() {
+            panic!("the host exited before its launch was running: {status}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the host never started its launch"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let info = std::fs::read_to_string(out.join("info")).unwrap();
+    let mut lines = info.lines();
+    let pfx = PathBuf::from(lines.next().unwrap());
+    let game: u32 = lines.next().unwrap().parse().unwrap();
+    let steam: u32 = lines.next().unwrap().parse().unwrap();
+    assert!(alive(game), "the game runs while its host does");
+    host.kill().unwrap();
+    host.wait().unwrap();
+    (pfx, game, steam)
+}
+
+/// DEC-046 under Wine: a host killed outright (no destructor runs, nothing
+/// is told) does not leave its game running without the VFS server. The
+/// launch has its prefix to itself, so the prefix's `wineserver -k` stops it.
+#[test]
+fn a_killed_host_takes_its_game_with_it() {
+    let (pfx, game, _) = kill_a_host("own");
+    wait_gone(game);
+    assert!(
+        wineserver_was_killed(&pfx),
+        "the watcher stopped this prefix's own wineserver"
+    );
+}
+
+/// The same in a shared prefix: the launch's own processes are signalled,
+/// and the Steam client beside them, and its `wineserver`, are left alone.
+#[test]
+fn a_killed_host_takes_its_shared_prefix_game_and_leaves_steam() {
+    let (pfx, game, steam) = kill_a_host("shared");
+    wait_gone(game);
+    assert!(alive(steam), "Steam is not the launch's");
+    assert!(
+        !wineserver_was_killed(&pfx),
+        "a shared prefix's wineserver is not the launch's to stop"
+    );
+    vfs_unix::signal(steam, vfs_unix::Signal::Kill);
+}
