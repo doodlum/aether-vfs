@@ -13,6 +13,7 @@ use vfs_proton::{
     layout::Root as ProtonRoot,
     prefix::{Prefix, PrefixInit, PrefixLock},
     steam::SteamSide,
+    WineHost,
 };
 
 use super::stage::ResolvedImage;
@@ -56,6 +57,9 @@ pub(in crate::session) struct ProtonState {
     home: Option<PathBuf>,
     /// How `launch` sets up the prefix — see [`Session::set_prefix_init`].
     prefix_init: PrefixInit,
+    /// The Wine install [`Session::set_wine_host`] chose; `None` is this
+    /// platform's default, resolved at launch.
+    wine_host: Option<WineHost>,
     /// Whether `launch` starts Proton's Steam helper — see
     /// [`Session::set_steam_helper`].
     steam_helper: bool,
@@ -100,6 +104,7 @@ impl Default for ProtonState {
             prefix_links: Mutex::new(Vec::new()),
             home: None,
             prefix_init: PrefixInit::default(),
+            wine_host: None,
             steam_helper: true,
             steam_state_dir: None,
             waiting: Mutex::new(None),
@@ -172,6 +177,41 @@ impl Session {
     #[cfg(unix)]
     pub fn set_prefix_init(&mut self, init: PrefixInit) {
         self.proton.prefix_init = init;
+    }
+
+    /// Unix: the Wine install `launch` runs under, instead of this platform's
+    /// default — the newest verified GE-Proton under the home's `runtimes/`
+    /// on Linux, CrossOver on macOS (`VFS_CROSSOVER_APP`, else
+    /// `/Applications/CrossOver.app`, else `~/Applications/CrossOver.app`).
+    /// Verified at launch, like the default.
+    #[cfg(unix)]
+    pub fn set_wine_host(&mut self, host: WineHost) {
+        self.proton.wine_host = Some(host);
+    }
+
+    /// The Wine install a launch uses: [`Session::set_wine_host`]'s, else
+    /// this platform's default (see there).
+    #[cfg(unix)]
+    fn resolve_wine_host(&self, home: &ProtonRoot) -> Result<WineHost, String> {
+        if let Some(host) = &self.proton.wine_host {
+            host.verify()
+                .map_err(|e| format!("{}: {e}", host.describe()))?;
+            return Ok(host.clone());
+        }
+        if cfg!(target_os = "macos") {
+            return vfs_proton::crossover::installed()
+                .map(WineHost::CrossOver)
+                .map_err(|e| {
+                    format!(
+                        "{e} (install CrossOver, or name it with {})",
+                        vfs_proton::crossover::APP_ENV
+                    )
+                });
+        }
+        vfs_proton::runtime::newest_installed(home)
+            .map_err(|e| format!("reading {}: {e}", home.runtimes().display()))?
+            .map(WineHost::Proton)
+            .ok_or_else(|| format!("{NO_RUNTIME} {}", home.runtimes().display()))
     }
 
     /// Unix: whether a launch in a [`PrefixInit::Proton`] prefix starts
@@ -586,16 +626,12 @@ impl Session {
         let wine = self.wine_launch(opts, ipc, &ring, resolved, &booted)?;
 
         let child = vfs_proton::launch::spawn(&wine).map_err(|e| format!("launch: {e}"))?;
-        let BootedPrefix {
-            runtime,
-            prefix,
-            lock,
-        } = booted;
+        let BootedPrefix { host, prefix, lock } = booted;
         let handle = LaunchHandle {
             child,
             stopper: LaunchStopper(Arc::new(StopInner {
                 prefix,
-                runtime,
+                host,
                 requested: AtomicBool::new(false),
                 ended: Mutex::new(false),
             })),
@@ -699,9 +735,7 @@ impl Session {
     /// [`Session::prepare_prefix`] is not a launch.
     fn ensure_prefix(&self) -> Result<BootedPrefix, String> {
         let home = self.proton_home()?;
-        let runtime = vfs_proton::runtime::newest_installed(&home)
-            .map_err(|e| format!("reading {}: {e}", home.runtimes().display()))?
-            .ok_or_else(|| format!("{NO_RUNTIME} {}", home.runtimes().display()))?;
+        let host = self.resolve_wine_host(&home)?;
 
         let prefix_id = match &self.proton.prefix_name {
             Some(name) => name.clone(),
@@ -723,7 +757,7 @@ impl Session {
                 .map_err(|_| "anon prefix lock poisoned".to_string())? = Some(AnonPrefix {
                 id: prefix_id.clone(),
                 home: home.clone(),
-                runtime: runtime.clone(),
+                host: host.clone(),
                 prefix_dir: prefix_dir.clone(),
             });
         }
@@ -733,14 +767,14 @@ impl Session {
         let lock = Prefix { dir: prefix_dir }
             .lock()
             .map_err(|e| format!("wine prefix: {e}"))?;
-        let prefix =
-            vfs_proton::prefix::ensure_with(&home, &runtime, &prefix_id, &self.proton.prefix_init)
-                .map_err(|e| format!("wine prefix: {e}"))?;
-        Ok(BootedPrefix {
-            runtime,
-            prefix,
-            lock,
-        })
+        let prefix = vfs_proton::prefix::ensure_with(
+            &home,
+            host.clone(),
+            &prefix_id,
+            &self.proton.prefix_init,
+        )
+        .map_err(|e| format!("wine prefix ({}): {e}", host.describe()))?;
+        Ok(BootedPrefix { host, prefix, lock })
     }
 
     /// Everything the injector and the shim are told about this launch, under
@@ -755,9 +789,7 @@ impl Session {
         resolved: ResolvedImage,
         booted: &BootedPrefix,
     ) -> Result<WineLaunch, String> {
-        let BootedPrefix {
-            runtime, prefix, ..
-        } = booted;
+        let BootedPrefix { host, prefix, .. } = booted;
         let wine_state = self.link_into_prefix(prefix)?;
         let roots = self.root_locations();
         self.link_roots(prefix, &roots)?;
@@ -799,10 +831,14 @@ impl Session {
                  shim is injected into it instead"
             ));
         }
-        let nvapi = nvapi_for_launch(opts, runtime, prefix, &mut notes);
+        // NVAPI ships in GE-Proton; CrossOver brings its own graphics stack.
+        let nvapi = match host {
+            WineHost::Proton(runtime) => nvapi_for_launch(opts, runtime, prefix, &mut notes),
+            WineHost::CrossOver(_) => None,
+        };
 
         let mut launch = WineLaunch::new(
-            runtime.clone(),
+            host.clone(),
             prefix.dir.clone(),
             target,
             root0,
@@ -938,24 +974,24 @@ impl Session {
         if let Some(AnonPrefix {
             id,
             home,
-            runtime,
+            host,
             prefix_dir,
         }) = anon
         {
             // `wineserver` lingers after the child and rewrites the
             // registry into the prefix as it exits; stop it first (bounded)
             // or the deleted prefix comes back.
-            let _ = Prefix { dir: prefix_dir }.stop_wineserver(&runtime);
+            let _ = Prefix { dir: prefix_dir }.stop_wineserver(&host);
             let _ = vfs_proton::prefix::remove_session(&home, &id);
         }
     }
 }
 
-/// A prefix `ensure_prefix` set up: the runtime that serves it, and the lock
-/// that keeps every other launch out of it until the launch that holds this
-/// ends.
+/// A prefix `ensure_prefix` set up: the Wine host that serves it, and the
+/// lock that keeps every other launch out of it until the launch that holds
+/// this ends.
 struct BootedPrefix {
-    runtime: PathBuf,
+    host: WineHost,
     prefix: Prefix,
     lock: PrefixLock,
 }
@@ -1331,7 +1367,7 @@ mod tests {
                 id: "anon-x".into(),
                 home: root.clone(),
                 // No `wineserver` here: stopping it fails fast and is ignored.
-                runtime: home.join("no-runtime"),
+                host: home.join("no-runtime").into(),
                 prefix_dir: anon_dir.clone(),
             });
             let mut n = Session::new();

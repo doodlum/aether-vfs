@@ -9,6 +9,7 @@ use vfs_proton::{
     layout::Root as ProtonRoot,
     prefix::{Prefix, PrefixLock},
     steam::SteamSide,
+    WineHost,
 };
 
 #[cfg(doc)]
@@ -18,12 +19,12 @@ use crate::session::LaunchExit;
 use crate::session::{LaunchOpts, Session};
 
 /// An anonymous Wine prefix a session booted: its id under `home`'s
-/// `sessions/`, and the runtime whose `wineserver` serves it.
+/// `sessions/`, and the Wine host whose `wineserver` serves it.
 #[cfg(unix)]
 pub(super) struct AnonPrefix {
     pub(super) id: String,
     pub(super) home: ProtonRoot,
-    pub(super) runtime: PathBuf,
+    pub(super) host: WineHost,
     /// Where the prefix is under `home` for the session's `PrefixInit`.
     pub(super) prefix_dir: PathBuf,
 }
@@ -71,7 +72,7 @@ pub struct LaunchStopper(pub(super) Arc<StopInner>);
 #[derive(Debug)]
 pub(super) struct StopInner {
     pub(super) prefix: Prefix,
-    pub(super) runtime: PathBuf,
+    pub(super) host: WineHost,
     pub(super) requested: std::sync::atomic::AtomicBool,
     /// Set once this launch has been reaped — by [`LaunchHandle::conclude`]
     /// or its `Drop` — **before** `_prefix_lock` releases. A stopper kept
@@ -122,7 +123,7 @@ impl LaunchStopper {
         let result = self
             .0
             .prefix
-            .stop_wineserver(&self.0.runtime)
+            .stop_wineserver(&self.0.host)
             .map_err(|e| format!("stop: {e}"));
         drop(ended);
         result
@@ -301,7 +302,7 @@ impl LaunchHandle {
                 .stopper
                 .0
                 .prefix
-                .spawn_wineserver_wait(&self.stopper.0.runtime)
+                .spawn_wineserver_wait(&self.stopper.0.host)
             {
                 Ok(watch) => self.quiet = Some(watch),
                 Err(_) => return Ok(true),

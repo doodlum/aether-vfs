@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 
 use super::{absolute, path_string, LaunchError, WineLaunch};
+use crate::host::WineHost;
 use crate::runtime::runtime_lib_env;
 use crate::steam::{SteamSide, STEAM_HELPER, STEAM_HELPER_OVERRIDE};
 
@@ -53,42 +54,20 @@ pub const DEFAULT_WINEDEBUG: &str = "-all";
 /// drift `vfs-env` was created to stop.
 pub fn launch_env(l: &WineLaunch) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
-    env.insert("WINEPREFIX".to_string(), path_string(&l.prefix));
-    // Absolutized, not passed through: a relative `PROTONPATH` resolves to
-    // UMU-Proton (stock Valve Proton), and that downgrade produces no error.
-    let runtime_abs = absolute(&l.runtime);
-    env.insert("PROTONPATH".to_string(), path_string(&runtime_abs));
-    // What `proton`'s `init_wine` sets and a direct `files/bin/wine` run lacks:
-    // without Proton's lib dirs `winedmo.so` cannot load its FFmpeg and no mp4
-    // opens. An `extra_env` `LD_LIBRARY_PATH` goes after the runtime dirs, in
-    // front of the host's value, so it can never displace them.
-    // `WINEDLLPATH` the same way: an `extra_env` value goes after the
-    // runtime's (and wine-nvml's) directories, in front of the host's.
-    let ld_in = caller_then_host(l, "LD_LIBRARY_PATH");
-    let dll_in = caller_then_host(l, "WINEDLLPATH");
-    for (k, v) in runtime_lib_env(
-        &runtime_abs,
-        ld_in.as_deref(),
-        std::env::var_os("ORIG_LD_LIBRARY_PATH").as_deref(),
-        dll_in.as_deref(),
-    ) {
-        env.insert(k, v);
-    }
     // Mono and Gecko prompts would otherwise block a launch on a fresh prefix.
     let mut base_overrides = match &l.steam {
         SteamSide::Helper(_) => merge_dll_overrides(BASE_DLL_OVERRIDES, STEAM_HELPER_OVERRIDE),
         SteamSide::Untouched | SteamSide::Off => BASE_DLL_OVERRIDES.to_string(),
     };
-    // NVAPI's own: part of the base, so a caller's entry for one of these
-    // DLLs still wins, and `extra_env` can turn any of it back off.
-    if let Some(nv) = &l.nvapi {
-        base_overrides = merge_dll_overrides(&base_overrides, crate::nvapi::NVAPI_OVERRIDES);
-        let inherited_debug = std::env::var_os("DXVK_NVAPI_SET_NGX_DEBUG_OPTIONS").is_some();
-        for (k, v) in nv.env(inherited_debug) {
-            env.insert(k, v);
+    match &l.host {
+        WineHost::Proton(runtime) => {
+            proton_env(l, runtime, &mut env, &mut base_overrides);
         }
-        if let (Some(nvml), Some(dll)) = (&nv.nvml_dir, env.get_mut("WINEDLLPATH")) {
-            *dll = format!("{}:{dll}", nvml.to_string_lossy());
+        WineHost::CrossOver(dir) => {
+            // The front end finds its own Perl modules through this, and
+            // picks the prefix from `--bottle` (in the argv), overwriting any
+            // `WINEPREFIX`: so none is set, rather than one that is ignored.
+            env.insert("CX_ROOT".to_string(), path_string(&absolute(dir)));
         }
     }
     env.insert("WINEDLLOVERRIDES".to_string(), base_overrides.clone());
@@ -145,8 +124,8 @@ pub fn launch_env(l: &WineLaunch) -> BTreeMap<String, String> {
         if is_reserved_env(k) {
             continue; // refused by `check_extra_env` before any spawn
         }
-        if k == "LD_LIBRARY_PATH" || k == "WINEDLLPATH" {
-            continue; // merged after the runtime dirs above
+        if l.host.is_proton() && (k == "LD_LIBRARY_PATH" || k == "WINEDLLPATH") {
+            continue; // merged after the runtime dirs, in `proton_env`
         }
         let v = if k == "WINEDLLOVERRIDES" {
             merge_dll_overrides(&base_overrides, v)
@@ -165,6 +144,49 @@ pub fn launch_env(l: &WineLaunch) -> BTreeMap<String, String> {
         );
     }
     env
+}
+
+/// What a GE-Proton launch adds: the prefix as `WINEPREFIX`, the runtime as
+/// `PROTONPATH`, the runtime's library directories and NVAPI.
+fn proton_env(
+    l: &WineLaunch,
+    runtime: &std::path::Path,
+    env: &mut BTreeMap<String, String>,
+    base_overrides: &mut String,
+) {
+    env.insert("WINEPREFIX".to_string(), path_string(&l.prefix));
+    // Absolutized, not passed through: a relative `PROTONPATH` resolves to
+    // UMU-Proton (stock Valve Proton), and that downgrade produces no error.
+    let runtime_abs = absolute(runtime);
+    env.insert("PROTONPATH".to_string(), path_string(&runtime_abs));
+    // What `proton`'s `init_wine` sets and a direct `files/bin/wine` run lacks:
+    // without Proton's lib dirs `winedmo.so` cannot load its FFmpeg and no mp4
+    // opens. An `extra_env` `LD_LIBRARY_PATH` goes after the runtime dirs, in
+    // front of the host's value, so it can never displace them.
+    // `WINEDLLPATH` the same way: an `extra_env` value goes after the
+    // runtime's (and wine-nvml's) directories, in front of the host's.
+    let ld_in = caller_then_host(l, "LD_LIBRARY_PATH");
+    let dll_in = caller_then_host(l, "WINEDLLPATH");
+    for (k, v) in runtime_lib_env(
+        &runtime_abs,
+        ld_in.as_deref(),
+        std::env::var_os("ORIG_LD_LIBRARY_PATH").as_deref(),
+        dll_in.as_deref(),
+    ) {
+        env.insert(k, v);
+    }
+    // NVAPI's own: part of the base, so a caller's entry for one of these
+    // DLLs still wins, and `extra_env` can turn any of it back off.
+    if let Some(nv) = &l.nvapi {
+        *base_overrides = merge_dll_overrides(base_overrides, crate::nvapi::NVAPI_OVERRIDES);
+        let inherited_debug = std::env::var_os("DXVK_NVAPI_SET_NGX_DEBUG_OPTIONS").is_some();
+        for (k, v) in nv.env(inherited_debug) {
+            env.insert(k, v);
+        }
+        if let (Some(nvml), Some(dll)) = (&nv.nvml_dir, env.get_mut("WINEDLLPATH")) {
+            *dll = format!("{}:{dll}", nvml.to_string_lossy());
+        }
+    }
 }
 
 /// A search-path variable's inherited part: [`WineLaunch::extra_env`]'s value
@@ -189,7 +211,7 @@ fn caller_then_host(l: &WineLaunch, name: &str) -> Option<std::ffi::OsString> {
 /// names compare without case, so `vfs_virtual_dir` would reach the shim as
 /// the same variable.
 pub fn is_reserved_env(name: &str) -> bool {
-    ["WINEPREFIX", "PROTONPATH"]
+    ["WINEPREFIX", "PROTONPATH", "CX_ROOT"]
         .iter()
         .any(|r| r.eq_ignore_ascii_case(name))
         || vfs_env::handshake::is_handshake(name)
@@ -256,7 +278,7 @@ mod tests {
     fn launch_env_puts_the_runtime_libs_first_on_ld_library_path() {
         let l = sample();
         let env = launch_env(&l);
-        let rt = path_string(&l.runtime);
+        let rt = path_string(l.host.dir());
         assert!(
             env["LD_LIBRARY_PATH"].starts_with(&format!(
                 "{rt}/files/lib/x86_64-linux-gnu:{rt}/files/lib/i386-linux-gnu"
@@ -279,7 +301,7 @@ mod tests {
         l.extra_env
             .insert("LD_LIBRARY_PATH".to_string(), "/mine/lib".to_string());
         let ld = launch_env(&l).remove("LD_LIBRARY_PATH").unwrap();
-        let rt = path_string(&l.runtime);
+        let rt = path_string(l.host.dir());
         let rt_dirs = format!("{rt}/files/lib/x86_64-linux-gnu:{rt}/files/lib/i386-linux-gnu");
         assert!(ld.starts_with(&rt_dirs), "{ld}");
         let rest = &ld[rt_dirs.len()..];
@@ -368,7 +390,7 @@ mod tests {
         // relative runtime path would otherwise export a `PROTONPATH` that
         // resolves to stock Proton, with nothing to observe.
         let mut l = sample();
-        l.runtime = PathBuf::from("runtimes/GE-Proton11-6-x86_64");
+        l.host = PathBuf::from("runtimes/GE-Proton11-6-x86_64").into();
         let env = launch_env(&l);
         let p = env.get("PROTONPATH").expect("PROTONPATH");
         assert!(Path::new(p).is_absolute(), "{p}");

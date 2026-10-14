@@ -36,7 +36,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use vfs_embed::{
-    DiskProvider, HelperStatus, LaunchExit, LaunchOpts, PrefixInit, Session, STOPPED_EXIT_CODE,
+    DiskProvider, HelperStatus, LaunchExit, LaunchOpts, PrefixInit, Session, WineHost,
+    STOPPED_EXIT_CODE,
 };
 
 const ROOT0: &str = r"C:\Games\Fake";
@@ -67,6 +68,17 @@ fn script(path: &Path, body: &str) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Runs `s` under `home`'s fake GE-Proton. On Linux that is what the session
+/// finds by itself, and finding it is part of what these tests cover; on
+/// macOS the default Wine host is CrossOver, so the fake is named.
+fn use_fake_proton(s: &mut Session, home: &Path) {
+    if cfg!(target_os = "macos") {
+        s.set_wine_host(WineHost::Proton(
+            home.join("runtimes").join("GE-Proton99-1"),
+        ));
+    }
 }
 
 /// An aether home holding one fake runtime, `runtimes/GE-Proton99-1`.
@@ -143,6 +155,7 @@ fn wineserver_was_killed(pfx: &Path) -> bool {
 fn session(tag: &str, home: &Path) -> (Session, PathBuf, String) {
     let mut s = Session::new();
     s.set_home(home);
+    use_fake_proton(&mut s, home);
     s.set_root(tmp(&format!("{tag}-root")));
     s.set_state_dir(tmp(&format!("{tag}-state")));
     s.set_overlay(tmp(&format!("{tag}-overlay")));
@@ -640,6 +653,7 @@ fn a_second_launch_while_one_is_running_is_refused_before_staging_can_clobber_it
     let home = fake_home("second");
     let mut s = Session::new();
     s.set_home(&home);
+    use_fake_proton(&mut s, &home);
     s.set_root(tmp("second-root"));
     s.set_state_dir(tmp("second-state"));
     s.set_overlay(tmp("second-overlay"));
@@ -915,6 +929,7 @@ fn a_kept_detached_handle_blocks_a_second_launch_and_is_stopped_by_stop_launch()
     let home = fake_home("kept");
     let mut s = Session::new();
     s.set_home(&home);
+    use_fake_proton(&mut s, &home);
     s.set_root(tmp("kept-root"));
     s.set_state_dir(tmp("kept-state"));
     s.set_overlay(tmp("kept-overlay"));
@@ -992,6 +1007,7 @@ fn prepare_prefix_sets_the_prefix_up_as_a_launch_would_without_serving() {
     let home = fake_home("prepare");
     let mut s = Session::new();
     s.set_home(&home);
+    use_fake_proton(&mut s, &home);
     s.set_state_dir(tmp("prepare-state"));
     s.set_prefix_name("fake").unwrap();
     s.set_prefix_init(PrefixInit::Proton {
@@ -1014,6 +1030,9 @@ fn prepare_prefix_sets_the_prefix_up_as_a_launch_would_without_serving() {
     assert_eq!(s.prepare_prefix().unwrap(), pfx);
 }
 
+// Proton discovery is the default Wine host on Linux only; on macOS it is
+// CrossOver (`an_unusable_crossover_install_is_named`).
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn prepare_prefix_without_a_runtime_says_so_and_is_not_a_launch_error() {
     let home = tmp("prepare-none");
@@ -1025,6 +1044,7 @@ fn prepare_prefix_without_a_runtime_says_so_and_is_not_a_launch_error() {
     assert!(e.starts_with("no verified GE-Proton runtime under "), "{e}");
 }
 
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn only_a_launch_adds_the_install_hint_to_the_no_runtime_error() {
     let home = tmp("hint-none");
@@ -1037,4 +1057,156 @@ fn only_a_launch_adds_the_install_hint_to_the_no_runtime_error() {
     );
     let e = s.prepare_prefix().unwrap_err();
     assert!(!e.contains("vfs-proton install"), "{e}");
+}
+
+#[test]
+fn an_unusable_crossover_install_is_named() {
+    let home = tmp("cx-none");
+    let mut s = Session::new();
+    s.set_home(&home);
+    let cx = home.join("CrossOver.app");
+    s.set_wine_host(WineHost::CrossOver(cx.clone()));
+    s.set_state_dir(tmp("cx-none-state"));
+    s.set_prefix_name("fake").unwrap();
+    let e = s.prepare_prefix().unwrap_err();
+    assert!(
+        e.contains("CrossOver") && e.contains(&*cx.to_string_lossy()),
+        "{e}"
+    );
+    assert!(
+        !home.join("sessions").join("fake").exists(),
+        "nothing set up"
+    );
+}
+
+/// A fake CrossOver install under `home` (the `Contents/SharedSupport/CrossOver`
+/// directory): a `wine` front end that takes `--bottle <prefix> --no-convert`
+/// before the program and records itself into the bottle as the Proton fake
+/// does into `WINEPREFIX`; a `cxbottle` that refuses an existing directory, as
+/// the real one does; and the Proton fake's `wineserver`, which CrossOver's is.
+fn fake_crossover(home: &Path) -> PathBuf {
+    let cx = home.join("CrossOver.app/Contents/SharedSupport/CrossOver");
+    std::fs::create_dir_all(cx.join("lib/wine/x86_64-windows")).unwrap();
+    script(
+        &cx.join("bin/cxbottle"),
+        r#"echo "$@" >> "$CX_ROOT/cxbottle.calls"
+[ "$1" = --bottle ] || exit 2
+if [ -e "$2" ]; then echo "cxbottle:error: the '$2' bottle already exists"; exit 1; fi
+mkdir -p "$2/drive_c/windows/system32" "$2/dosdevices"
+ln -s ../drive_c "$2/dosdevices/c:"
+echo '[Bottle]' > "$2/cxbottle.conf""#,
+    );
+    script(
+        &cx.join("bin/wine"),
+        r#"[ "$1" = --bottle ] && [ "$3" = --no-convert ] || { echo "bad front-end argv: $*" >&2; exit 9; }
+b="$2"; shift 3
+env > "$b/fake-wine.env"
+echo "$@" > "$b/fake-wine.args"
+echo $$ > "$b/fake-wine.pid"
+case "$FAKE_WINE_MODE" in
+  sleep) exec sleep 30 ;;
+esac
+exit 0"#,
+    );
+    let proton_server = fake_home(&format!(
+        "{}-server",
+        home.file_name().unwrap().to_string_lossy()
+    ))
+    .join("runtimes/GE-Proton99-1/files/bin/wineserver");
+    std::fs::copy(proton_server, cx.join("bin/wineserver")).unwrap();
+    cx
+}
+
+/// A served session in `home` running under the fake CrossOver at `cx`, with a
+/// named prefix, root 0 at [`ROOT0`] holding `game.exe`, and placeholder
+/// artifacts. Returns the session, the prefix directory and the `shim_dll`.
+fn cx_session(tag: &str, home: &Path, cx: &Path) -> (Session, PathBuf, String) {
+    let mut s = Session::new();
+    s.set_home(home);
+    s.set_wine_host(WineHost::CrossOver(cx.to_path_buf()));
+    s.set_root(tmp(&format!("{tag}-root")));
+    s.set_state_dir(tmp(&format!("{tag}-state")));
+    s.set_overlay(tmp(&format!("{tag}-overlay")));
+    s.declare_root(0, ROOT0);
+    s.set_prefix_name("fake").unwrap();
+    s.set_steam_helper(false);
+    std::fs::write(s.virtual_root().join("game.exe"), b"MZ").unwrap();
+    let art = tmp(&format!("{tag}-art"));
+    for f in vfs_proton::artifacts::LAUNCH {
+        std::fs::write(art.join(f), b"MZ").unwrap();
+    }
+    s.serve().unwrap();
+    let shim = art
+        .join(vfs_proton::artifacts::SHIM_DLL)
+        .to_string_lossy()
+        .into_owned();
+    (s, home.join("sessions").join("fake").join("prefix"), shim)
+}
+
+#[test]
+fn a_crossover_launch_runs_its_front_end_in_a_bottle_made_once() {
+    let home = tmp("cx-launch");
+    let cx = fake_crossover(&home);
+    let (s, pfx, shim) = cx_session("cx-launch", &home, &cx);
+    assert_eq!(s.launch(&opts(&shim, "ok", true)).unwrap(), 0);
+
+    // The bottle was made by cxbottle, beside the prefix's lock and then
+    // moved in, so the lock taken before setup did not stop it.
+    assert!(pfx.join("drive_c/windows/system32").is_dir());
+    assert!(pfx.join("cxbottle.conf").is_file());
+    assert!(pfx.join("drive_c/Games/Fake").is_symlink(), "root 0 linked");
+
+    // The injector's argv follows the front end's own arguments unchanged.
+    let args = std::fs::read_to_string(pfx.join("fake-wine.args")).unwrap();
+    let args: Vec<&str> = args.split_whitespace().collect();
+    assert!(
+        args[0].ends_with(vfs_proton::artifacts::INJECTOR),
+        "{args:?}"
+    );
+    assert_eq!(args[1], format!(r"{ROOT0}\game.exe"));
+    assert_eq!(args[2], shim);
+
+    // CrossOver's environment, not Proton's.
+    let env = child_env(&pfx);
+    assert_eq!(Path::new(&env["CX_ROOT"]), cx);
+    assert!(!env.contains_key("PROTONPATH"), "{env:?}");
+    assert_eq!(env["WINEDLLOVERRIDES"], "mscoree=d;mshtml=d");
+    assert!(env.contains_key("VFS_RING_PATH"));
+
+    // A second launch reuses the bottle.
+    assert_eq!(s.launch(&opts(&shim, "ok", true)).unwrap(), 0);
+    let calls = std::fs::read_to_string(cx.join("cxbottle.calls")).unwrap();
+    assert_eq!(calls.lines().count(), 1, "cxbottle ran once: {calls}");
+    assert!(calls.contains("--create") && calls.contains("--template win10_64"));
+}
+
+#[test]
+fn a_crossover_launch_is_stopped_through_its_wineserver() {
+    let home = tmp("cx-stop");
+    let cx = fake_crossover(&home);
+    let (s, pfx, shim) = cx_session("cx-stop", &home, &cx);
+    assert_eq!(s.launch(&opts(&shim, "sleep", false)).unwrap(), 0);
+    wait_for(&pfx.join("fake-wine.pid"));
+    assert!(s.stop_launch().unwrap());
+    assert!(
+        wineserver_was_killed(&pfx),
+        "CrossOver's wineserver -k ran with this prefix as WINEPREFIX"
+    );
+}
+
+#[test]
+fn protons_own_prefix_setup_is_refused_under_crossover() {
+    let home = tmp("cx-proton-init");
+    let cx = fake_crossover(&home);
+    let mut s = Session::new();
+    s.set_home(&home);
+    s.set_wine_host(WineHost::CrossOver(cx));
+    s.set_state_dir(tmp("cx-proton-init-state"));
+    s.set_prefix_name("fake").unwrap();
+    s.set_prefix_init(PrefixInit::Proton {
+        steam_client: tmp("cx-proton-init-steam"),
+        app_id: None,
+    });
+    let e = s.prepare_prefix().unwrap_err();
+    assert!(e.contains("needs a GE-Proton runtime"), "{e}");
 }

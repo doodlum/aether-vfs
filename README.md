@@ -93,6 +93,31 @@ The first `bin/build-windows` downloads the MSVC CRT and Windows SDK via
 `cargo build --workspace` on Linux fails; build the Linux crates by name.
 (The `skyrim-live` harness lives in `vfs-bench` and is Windows-only; it just exits on Linux.)
 
+### macOS (CrossOver)
+
+On macOS the Wine host is [CrossOver](https://www.codeweavers.com/crossover), installed
+by the user; everything else about a launch (injector, shim, file-backed ring, prefix and
+root links) is the Proton path's. A session's prefix is a CrossOver bottle made with
+`cxbottle --create` under `$VFS_HOME/sessions`, never in CrossOver's own bottle list.
+CrossOver's Wine is x86_64 and runs under Rosetta on Apple Silicon; the Director is
+native. GE-Proton's extras (its prefix setup, the Steam bridge, NVAPI) do not exist here,
+and their tests skip.
+
+```bash
+# one-time toolchain
+brew install llvm lld
+rustup target add x86_64-pc-windows-msvc
+cargo install --locked cargo-xwin
+
+PATH="/opt/homebrew/opt/lld/bin:/opt/homebrew/opt/llvm/bin:$PATH" bin/build-windows
+
+# end to end: the same Wine tests as Linux, under CrossOver
+cd rust && cargo test -p vfs-embed --test proton_launch -- --ignored
+```
+
+CrossOver is found at `$VFS_CROSSOVER_APP`, else `/Applications/CrossOver.app`, else
+`~/Applications/CrossOver.app`; `Session::set_wine_host` chooses one in code.
+
 ### Tests
 
 Run from `rust/`. Which crates build depends on the host: `vfs-inject`, `vfs-shim`,
