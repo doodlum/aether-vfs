@@ -2,6 +2,8 @@
 //! `cargo test -p aether-steam --test live -- --ignored --nocapture`.
 //! The logged-in tests read the login file `$AETHER_STEAM_LOGIN` names
 //! (written by the `steam_login` example, or a host's own login).
+//! Steam keeps one session per account, so run those one at a time
+//! (`--test-threads=1`): two at once can log each other out.
 use aether_steam::{
     AppId, CdnConfig, CredentialFile, DepotId, SessionConfig, SteamCache, SteamContent,
     SteamCredentials, SteamGame, SteamSession,
@@ -96,4 +98,37 @@ async fn owns_the_anniversary_upgrade() {
     assert!(s.owns_app(AppId(489830)).await.unwrap());
     assert!(s.owns_app(AppId(1746860)).await.unwrap());
     assert!(!s.owns_app(AppId(1691340)).await.unwrap(), "Steel Hunters");
+}
+
+/// AE-28: a depot that ships a DLC inside its game's app names the DLC app
+/// (`dlcappid`), so a host installs only what the account's licences cover.
+/// Read from PICS, which needs no ownership. Prints ids only.
+#[tokio::test]
+#[ignore = "network: needs a saved Steam login ($AETHER_STEAM_LOGIN)"]
+async fn a_depot_names_the_dlc_app_its_content_needs() {
+    let Some(creds) = saved_login() else {
+        eprintln!("skipping: no saved Steam login (set AETHER_STEAM_LOGIN)");
+        return;
+    };
+    let s = SteamSession::login(&creds, SessionConfig::default())
+        .await
+        .unwrap();
+    // Cyberpunk 2077 (1091500) carries a DLC's content in depot 2060310.
+    let cp = s.branch_depots(AppId(1091500), "public").await.unwrap();
+    let dlc: Vec<_> = cp.iter().filter(|d| d.dlc_app.is_some()).collect();
+    for d in &dlc {
+        eprintln!("1091500: depot {} needs app {:?}", d.depot, d.dlc_app);
+    }
+    let d = cp.iter().find(|d| d.depot == DepotId(2060310)).unwrap();
+    assert_eq!(d.dlc_app, Some(AppId(2060310)));
+    assert!(
+        cp.iter()
+            .any(|d| d.depot == DepotId(1091501) && d.dlc_app.is_none()),
+        "the base game's content needs no DLC"
+    );
+    // Skyrim SE's Anniversary content is an app of its own (1746860); none
+    // of the game's own depots names one.
+    let sse = s.branch_depots(AppId(489830), "public").await.unwrap();
+    assert!(!sse.is_empty());
+    assert!(sse.iter().all(|d| d.dlc_app.is_none()), "{sse:?}");
 }

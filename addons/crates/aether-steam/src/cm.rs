@@ -517,6 +517,7 @@ impl CmConn for LoggedInConn {
                             name: dep.name.clone(),
                             os_list: dep.config.os_list.clone(),
                             language: dep.config.language.clone(),
+                            dlc_app: depot_dlc_app(&d.key_values, dep.id.0),
                         })
                     })
                     .collect();
@@ -553,6 +554,21 @@ impl LoggedInConn {
             .map(Reply::Ticket)
             .map_err(CmFail::Refused)
     }
+}
+
+/// `depots/<depot>/dlcappid` in an app's PICS info: the DLC app a depot's
+/// content belongs to. steamroom keeps it only in the raw tree. Binary PICS
+/// carries it as an integer, text VDF as a string; 0 is none.
+fn depot_dlc_app(app: &steamroom::types::key_value::KeyValue, depot: u32) -> Option<AppId> {
+    let kv = app
+        .get("depots")?
+        .get(&depot.to_string())?
+        .get("dlcappid")?;
+    let id = kv
+        .as_u64()
+        .or_else(|| kv.as_i32().and_then(|i| u64::try_from(i).ok()))
+        .or_else(|| kv.as_str().and_then(|s| s.trim().parse().ok()))?;
+    u32::try_from(id).ok().filter(|&id| id != 0).map(AppId)
 }
 
 /// Packages asked about per PICS request.
@@ -752,6 +768,26 @@ fn take(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn a_depots_dlc_app_comes_from_its_pics_entry() {
+        let kv = steamroom::types::key_value::parse_text_kv(
+            r#""489830"
+{
+    "depots"
+    {
+        "489831" { "name" "Skyrim SE Content" "manifests" { "public" { "gid" "1" } } }
+        "1691981" { "dlcappid" "1746860" "manifests" { "public" { "gid" "2" } } }
+        "489833" { "dlcappid" "0" }
+    }
+}"#,
+        )
+        .unwrap();
+        assert_eq!(depot_dlc_app(&kv, 489831), None);
+        assert_eq!(depot_dlc_app(&kv, 1691981), Some(AppId(1746860)));
+        assert_eq!(depot_dlc_app(&kv, 489833), None, "0 is none");
+        assert_eq!(depot_dlc_app(&kv, 1), None);
+    }
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use steamroom::generated::CContentServerDirectoryServerInfo as Info;

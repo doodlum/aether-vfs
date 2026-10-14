@@ -26,6 +26,12 @@ pub struct BranchDepot {
     pub os_list: Vec<String>,
     /// `language` (`"english"`, `"german"`); `None` is every language.
     pub language: Option<String>,
+    /// `dlcappid`: the DLC app whose licence the depot's content needs, for a
+    /// depot that ships a DLC inside the game's app (Cyberpunk 2077's depot
+    /// 2060310, Baldur's Gate 3's 2330358). `None` is the game's own content. A client installs such a
+    /// depot only for an account that owns that app
+    /// ([`SteamSession::owns_app`](crate::SteamSession::owns_app)).
+    pub dlc_app: Option<AppId>,
 }
 
 impl BranchDepot {

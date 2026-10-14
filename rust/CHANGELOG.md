@@ -39,6 +39,11 @@ first. Internal refactors are in the git history, not here.
   nothing is written into the placeholder. `vfs-embed/tests/proton_prefix.rs`
   (`#[ignore]`d, runtime only, run by the `proton-linux` CI job) checks it and
   the known folders against a real GE-Proton.
+- `aether-steam`: `BranchDepot::dlc_app: Option<AppId>`, PICS's `dlcappid`,
+  the DLC app a depot's content needs (Cyberpunk 2077's depot 2060310), so a
+  host installs only what the account's licences cover (with
+  `SteamSession::owns_app`). A new public field: a struct literal of
+  `BranchDepot` needs it.
 - Unix: `vfs_embed::proton::steam::{state_dir, running_client}`, the Steam
   liveness test a launch makes, so a host's own check (a Play gate) needs no
   `vfs-proton` dependency. `Session::set_steam_state_dir` (Flatpak Steam) was
