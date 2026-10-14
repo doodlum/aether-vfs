@@ -178,9 +178,11 @@ mod tests {
         let h = WineHost::CrossOver("/cx".into());
         assert_eq!(h.wine(), Path::new("/cx/bin/wine"));
         assert_eq!(h.wineserver(), Path::new("/cx/bin/wineserver"));
+        // Absolute on whatever host this runs on.
+        let p = std::env::temp_dir().join("p");
         assert_eq!(
-            h.prefix_args(Path::new("/p")),
-            ["--bottle", "/p", "--no-convert"]
+            h.prefix_args(&p),
+            ["--bottle", &*p.to_string_lossy(), "--no-convert"]
         );
         assert!(!h.is_proton());
     }

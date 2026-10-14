@@ -278,7 +278,7 @@ mod tests {
         let args = bottle_args(Path::new("rel/prefix"));
         assert_eq!(args[0], "--bottle");
         assert!(Path::new(&args[1]).is_absolute(), "{args:?}");
-        assert!(args[1].ends_with("rel/prefix"));
+        assert!(Path::new(&args[1]).ends_with("rel/prefix"), "{args:?}");
         assert_eq!(
             args[2], "--no-convert",
             "arguments reach the program as given"
