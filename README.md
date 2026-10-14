@@ -118,6 +118,31 @@ cd rust && cargo test -p vfs-embed --test proton_launch -- --ignored
 CrossOver is found at `$VFS_CROSSOVER_APP`, else `/Applications/CrossOver.app`, else
 `~/Applications/CrossOver.app`; `Session::set_wine_host` chooses one in code.
 
+A Steam game, by hand (Skyrim Special Edition, app 489830, as the example):
+
+```bash
+# a persistent prefix with Windows Steam in it; sign in once in its window
+cd rust
+cargo run -p vfs-embed --example wine -- prefix steam
+cargo run -p vfs-embed --example wine -- run steam /path/to/SteamSetup.exe /S
+cargo run -p vfs-embed --example wine -- run steam 'C:\Program Files (x86)\Steam\steam.exe' &
+
+# the game's files, from Steam, with aether-steam's own login (QR code)
+cd ../addons
+export AETHER_STEAM_LOGIN=~/.local/share/aether-vfs/steam/login.json
+cargo run -p aether-steam --example steam_login
+cargo run -p aether-steam --example steam_download -- 489830 ~/games/skyrim-se
+printf 489830 > ~/games/skyrim-se/steam_appid.txt
+
+# served through aether-vfs into the Steam prefix, which the launch shares
+cd ../rust
+cargo run -p vfs-embed --example wine -- launch steam ~/games/skyrim-se SkyrimSE.exe
+```
+
+SkyrimSE.exe's SteamStub checks with the Steam client running beside it, so the launch
+shares the prefix (`Session::set_prefix_shared`): it follows and stops only the game's own
+processes, and Steam keeps running.
+
 ### Tests
 
 Run from `rust/`. Which crates build depends on the host: `vfs-inject`, `vfs-shim`,
