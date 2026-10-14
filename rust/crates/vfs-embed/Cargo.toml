@@ -60,6 +60,8 @@ vfs-protocol.workspace = true
 [target.'cfg(windows)'.dependencies]
 vfs-inject.workspace = true
 vfs-shim.workspace = true
+# The shell's known folders (`Session::known_folder`).
+vfs-win.workspace = true
 
 # The Proton (Wine) delivery mechanism: the unix counterpart of the pair above.
 # GE-Proton discovery and verification, the per-session Wine prefix, and the

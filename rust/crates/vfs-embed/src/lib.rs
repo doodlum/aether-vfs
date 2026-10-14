@@ -143,8 +143,8 @@ pub use fold::{
     fold_path, fold_segment, fold_unicode_version, paths_equal, PathEscapesRoot, FOLD_VERSION,
 };
 pub use session::{
-    compose_root, compose_root_routed, Activation, LaunchExit, LaunchOpts, RegistrySync, Session,
-    StageOpts, STOPPED_EXIT_CODE,
+    compose_root, compose_root_routed, Activation, KnownFolder, LaunchExit, LaunchOpts,
+    RegistrySync, Session, StageOpts, STOPPED_EXIT_CODE,
 };
 #[cfg(any(unix, windows))]
 pub use session::{LaunchHandle, LaunchStopper};

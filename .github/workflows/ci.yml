@@ -277,6 +277,14 @@ jobs:
         working-directory: rust
         env:
           VFS_TEST_REQUIRE_ALL: "1"
+      # Proton's own prefix setup with a placeholder Steam client directory
+      # (no Steam on the runner), and the prefix user's known folders read
+      # from the prefix. Needs the runtime only.
+      - name: Proton prefix and known folders (no Windows fixture)
+        run: timeout 600 cargo test -p vfs-embed --test proton_prefix -- --ignored --nocapture
+        working-directory: rust
+        env:
+          VFS_TEST_REQUIRE_ALL: "1"
 
   # The add-ons workspace (addons/): optional crates on top of the core. Its own
   # job, so the core's build never sees them.

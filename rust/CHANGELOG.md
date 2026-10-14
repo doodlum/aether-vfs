@@ -8,6 +8,24 @@ first. Internal refactors are in the git history, not here.
 
 ### Added
 
+- `Session::known_folder(KnownFolder) -> Result<PathBuf, String>` and
+  `vfs_embed::KnownFolder` (`Documents`, `LocalAppData`, `SavedGames`;
+  `#[non_exhaustive]`): where a root under the user's own folders goes, so a
+  host never spells a prefix's user name. Unix: the prefix user's folder as a
+  `C:\…` location (`C:\users\steamuser\Documents` under GE-Proton, whose
+  Wine names its user `steamuser` in `wineboot` prefixes too), read from the
+  prefix's registry as Wine's shell reads it, else from `drive_c\users`; a
+  prefix not yet set up is set up first, as `prepare_prefix` does. Windows:
+  `SHGetKnownFolderPath`, so a moved (OneDrive) folder is followed.
+- `vfs-proton`: `Prefix::user_profile`, `Prefix::known_folder` and
+  `KnownFolder`; `PrefixError` gains `UserProfile(String)` (a new variant: an
+  exhaustive `match` on `PrefixError` needs an arm). `vfs-win`:
+  `known_folder(KnownFolderId)`.
+- Documented and tested: `PrefixInit::Proton` with an empty placeholder
+  `steam_client` directory gives a whole Proton prefix (GOG installs, CI), and
+  nothing is written into the placeholder. `vfs-embed/tests/proton_prefix.rs`
+  (`#[ignore]`d, runtime only, run by the `proton-linux` CI job) checks it and
+  the known folders against a real GE-Proton.
 - Unix: `vfs_embed::proton::steam::{state_dir, running_client}`, the Steam
   liveness test a launch makes, so a host's own check (a Play gate) needs no
   `vfs-proton` dependency. `Session::set_steam_state_dir` (Flatpak Steam) was

@@ -18,6 +18,7 @@ use vfs_director::Director;
 use vfs_provider::{overlay_layer_dir, RootId};
 
 mod compose;
+mod known_folder;
 mod opts;
 #[cfg(unix)]
 mod proton;
@@ -28,6 +29,7 @@ mod stage;
 mod windows;
 
 pub use compose::{compose_root, compose_root_routed};
+pub use known_folder::KnownFolder;
 pub use opts::{Activation, LaunchOpts, StageOpts};
 #[cfg(unix)]
 pub use proton::{LaunchHandle, LaunchStopper};

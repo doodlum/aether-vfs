@@ -42,7 +42,7 @@ pub use install::{
 };
 pub use launch::{finish, launch_env, merge_dll_overrides, spawn, WineLaunch, DEFAULT_WINEDEBUG};
 pub use layout::Root;
-pub use prefix::{ensure, ensure_with, Prefix, PrefixInit};
+pub use prefix::{ensure, ensure_with, KnownFolder, Prefix, PrefixInit};
 #[cfg(feature = "acquire")]
 pub use release::{fetch_releases, pick, resolve, Release, DEFAULT_MAJOR};
 pub use runtime::{cmp_tags, installed, installed_dirs, verify_ge};

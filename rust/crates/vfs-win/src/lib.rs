@@ -1,12 +1,15 @@
 //! Windows platform layer: cross-process shared memory backing a `vfs_ipc::SharedSeg`,
 //! and raw Win32 volume/path lookups for canonicalisation (`vfs-redirect`).
-//! Unsafe is confined to `mapping`, `event_notifier`, and `volumes`.
+//! Unsafe is confined to `mapping`, `event_notifier`, `volumes` and
+//! `known_folder`.
 
 mod event_notifier;
+mod known_folder;
 mod mapping;
 mod volumes;
 
 pub use event_notifier::EventNotifier;
+pub use known_folder::{known_folder, KnownFolderId};
 pub use mapping::SharedMapping;
 pub use volumes::{
     drive_mappings, expand_long_path, final_path_for_handle, final_path_for_open,

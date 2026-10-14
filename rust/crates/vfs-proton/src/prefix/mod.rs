@@ -7,6 +7,7 @@
 
 mod init;
 mod links;
+mod profile;
 mod wineserver;
 
 pub use init::{
@@ -14,6 +15,7 @@ pub use init::{
     PROTON_INIT_LOG, PROTON_INIT_TIMEOUT,
 };
 pub use links::{parse_location, LINK_MANIFEST};
+pub use profile::KnownFolder;
 pub use wineserver::WINESERVER_STOP_TIMEOUT;
 
 use std::io;
@@ -60,6 +62,11 @@ pub enum PrefixError {
     /// `cxbottle --create` did not leave a bottle. Carries what happened and
     /// the tail of its log.
     Bottle(String),
+    /// The prefix's user profile, or one of its known folders, cannot be
+    /// told from the prefix ([`Prefix::user_profile`],
+    /// [`Prefix::known_folder`]): the prefix is not set up, or says
+    /// something ambiguous. Carries the prefix and what was found.
+    UserProfile(String),
 }
 
 impl std::fmt::Display for PrefixError {
@@ -74,6 +81,7 @@ impl std::fmt::Display for PrefixError {
             PrefixError::BadLocation(s) => write!(f, "bad root location {s}"),
             PrefixError::ProtonInit(s) => write!(f, "proton prefix setup failed: {s}"),
             PrefixError::Bottle(s) => write!(f, "CrossOver bottle setup failed: {s}"),
+            PrefixError::UserProfile(s) => write!(f, "prefix user profile: {s}"),
             PrefixError::Missing32Bit => write!(
                 f,
                 "wineboot needs a 32-bit runtime: install lib32-glibc and \
@@ -93,7 +101,8 @@ impl std::error::Error for PrefixError {
             | PrefixError::Busy(_)
             | PrefixError::BadLocation(_)
             | PrefixError::ProtonInit(_)
-            | PrefixError::Bottle(_) => None,
+            | PrefixError::Bottle(_)
+            | PrefixError::UserProfile(_) => None,
         }
     }
 }

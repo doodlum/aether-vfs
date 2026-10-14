@@ -36,7 +36,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use vfs_embed::{
-    DiskProvider, HelperStatus, LaunchExit, LaunchOpts, PrefixInit, Session, WineHost,
+    DiskProvider, HelperStatus, KnownFolder, LaunchExit, LaunchOpts, PrefixInit, Session, WineHost,
     STOPPED_EXIT_CODE,
 };
 
@@ -90,6 +90,7 @@ fn fake_home(tag: &str) -> PathBuf {
     script(
         &rt.join("proton"),
         r#"mkdir -p "$STEAM_COMPAT_DATA_PATH/pfx/drive_c/windows/system32"
+mkdir -p "$STEAM_COMPAT_DATA_PATH/pfx/drive_c/users/Public" "$STEAM_COMPAT_DATA_PATH/pfx/drive_c/users/fakeuser"
 echo GE-Proton99-1 > "$STEAM_COMPAT_DATA_PATH/version""#,
     );
     script(
@@ -1303,4 +1304,68 @@ fn stopping_a_shared_prefix_launch_stops_its_game_and_leaves_steam() {
         !wineserver_was_killed(&pfx),
         "a shared prefix's wineserver is not the launch's to stop"
     );
+}
+
+/// AE-21: a known folder is the prefix's own user's, set up on first ask.
+/// The fake Proton names its user `fakeuser`, so nothing here can pass by
+/// assuming `steamuser`.
+#[test]
+fn a_known_folder_sets_the_prefix_up_and_is_its_users() {
+    let home = fake_home("kf-setup");
+    let (s, pfx, _shim) = session("kf-setup", &home);
+    assert!(!pfx.join("drive_c").exists(), "not set up yet");
+    assert_eq!(
+        s.known_folder(KnownFolder::Documents).unwrap(),
+        Path::new(r"C:\users\fakeuser\Documents")
+    );
+    assert!(pfx
+        .join("drive_c")
+        .join("windows")
+        .join("system32")
+        .is_dir());
+    assert_eq!(
+        s.known_folder(KnownFolder::LocalAppData).unwrap(),
+        Path::new(r"C:\users\fakeuser\AppData\Local")
+    );
+    let saves = s.known_folder(KnownFolder::SavedGames).unwrap();
+    assert_eq!(saves, Path::new(r"C:\users\fakeuser\Saved Games"));
+    // What a host does with it: a root at the game's subfolder.
+    let loc = saves.join("FakeGame");
+    Session::check_root_location(&loc.to_string_lossy()).unwrap();
+}
+
+/// The prefix's registry is what a program's shell reads, so it wins over the
+/// directory listing; and a set-up prefix is only read, so asking while a
+/// launch holds the prefix works.
+#[test]
+fn a_known_folder_follows_the_prefixs_registry_while_a_launch_runs() {
+    let home = fake_home("kf-reg");
+    let (s, pfx, shim) = session("kf-reg", &home);
+    s.prepare_prefix().unwrap();
+    std::fs::write(
+        pfx.join("system.reg"),
+        "WINE REGISTRY Version 2\n\n\
+         [Software\\\\Microsoft\\\\Windows NT\\\\CurrentVersion\\\\ProfileList\\\\S-1-5-21-0-0-0-1000] 1\n\
+         \"ProfileImagePath\"=\"C:\\\\users\\\\someone\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        pfx.join("user.reg"),
+        "WINE REGISTRY Version 2\n\n\
+         [Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Explorer\\\\User Shell Folders] 1\n\
+         \"{4C5C32FF-BB9D-43B0-B5B4-2D72E54EAAA4}\"=str(2):\"%USERPROFILE%\\\\Games\\\\Saves\"\n",
+    )
+    .unwrap();
+    let h = s.launch_detached(&opts(&shim, "sleep", true)).unwrap();
+    wait_for(&pfx.join("fake-wine.pid"));
+    assert_eq!(
+        s.known_folder(KnownFolder::SavedGames).unwrap(),
+        Path::new(r"C:\users\someone\Games\Saves")
+    );
+    assert_eq!(
+        s.known_folder(KnownFolder::Documents).unwrap(),
+        Path::new(r"C:\users\someone\Documents"),
+        "a folder the registry does not name is at its default place"
+    );
+    h.stop().unwrap();
 }

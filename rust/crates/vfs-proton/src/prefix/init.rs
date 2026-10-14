@@ -99,7 +99,11 @@ pub enum PrefixInit {
         /// `STEAM_COMPAT_CLIENT_INSTALL_PATH`: the Steam client's install
         /// directory (`~/.local/share/Steam`). Must exist; Proton reads
         /// Steam's own files from it where they exist and does without them
-        /// where they do not.
+        /// where they do not. **An empty placeholder directory is enough**
+        /// where there is no Steam client (a GOG install, CI): the prefix is
+        /// the same, Steam bridge included, and nothing is written into the
+        /// placeholder (`vfs-embed/tests/proton_prefix.rs` checks this
+        /// against a real runtime).
         steam_client: PathBuf,
         /// Sent as `SteamAppId` and `SteamGameId`; `0` when `None`.
         app_id: Option<u32>,
@@ -416,6 +420,25 @@ mod tests {
             1,
             "an up-to-date prefix is not set up again"
         );
+    }
+
+    /// AE-24: no Steam client, only an empty directory standing for one.
+    #[cfg(unix)]
+    #[test]
+    fn an_empty_placeholder_steam_client_is_enough() {
+        let root = Root::at(scratch("ph-home"));
+        let placeholder = scratch("ph-steam");
+        let rt = fake_proton_runtime("ph-rt", "GE-Proton99-1", "");
+        let init = PrefixInit::Proton {
+            steam_client: placeholder.clone(),
+            app_id: None,
+        };
+        ensure_with(&root, &rt, "s", &init).unwrap();
+        assert_eq!(
+            calls(&root, "s"),
+            [format!("run cmd /c exit|{}|0|0|1", placeholder.display())]
+        );
+        assert_eq!(std::fs::read_dir(&placeholder).unwrap().count(), 0);
     }
 
     #[cfg(unix)]

@@ -11,7 +11,7 @@ use vfs_proton::{
     artifacts,
     launch::{LaunchFiles, RingGeometry, WineLaunch},
     layout::Root as ProtonRoot,
-    prefix::{Prefix, PrefixInit, PrefixLock},
+    prefix::{KnownFolder, Prefix, PrefixInit, PrefixLock},
     steam::SteamSide,
     WineHost,
 };
@@ -757,6 +757,44 @@ impl Session {
         Ok(self.ensure_prefix()?.prefix.dir.clone())
     }
 
+    /// [`Session::known_folder`] on unix: `folder` of this session's prefix's
+    /// user, read from the prefix, which is set up first if it is not yet
+    /// (its lock is held only for that).
+    pub(in crate::session) fn prefix_known_folder(
+        &self,
+        folder: crate::session::KnownFolder,
+    ) -> Result<PathBuf, String> {
+        let home = self.proton_home()?;
+        let dir =
+            vfs_proton::prefix::prefix_dir(&home, &self.prefix_id(), &self.proton.prefix_init)
+                .map_err(|e| format!("known folder: wine prefix: {e}"))?;
+        let prefix = if dir.join("drive_c").join("users").is_dir() {
+            Prefix { dir }
+        } else {
+            self.ensure_prefix()
+                .map_err(|e| format!("known folder: {e}"))?
+                .prefix
+        };
+        let folder = match folder {
+            crate::session::KnownFolder::Documents => KnownFolder::Documents,
+            crate::session::KnownFolder::LocalAppData => KnownFolder::LocalAppData,
+            crate::session::KnownFolder::SavedGames => KnownFolder::SavedGames,
+        };
+        prefix
+            .known_folder(folder)
+            .map(PathBuf::from)
+            .map_err(|e| format!("known folder {folder:?}: {e}"))
+    }
+
+    /// The prefix's name under the home's `sessions/`: the persistent one
+    /// [`Session::set_prefix_name`] chose, else the anonymous one.
+    fn prefix_id(&self) -> String {
+        match &self.proton.prefix_name {
+            Some(name) => name.clone(),
+            None => self.wine_session_id(),
+        }
+    }
+
     /// The newest verified runtime and this session's prefix, locked and set
     /// up. An anonymous prefix is recorded for `Drop` before it is booted, so
     /// a boot that fails half-way is still deleted. The errors carry no
@@ -766,10 +804,7 @@ impl Session {
         let home = self.proton_home()?;
         let host = self.resolve_wine_host(&home)?;
 
-        let prefix_id = match &self.proton.prefix_name {
-            Some(name) => name.clone(),
-            None => self.wine_session_id(),
-        };
+        let prefix_id = self.prefix_id();
         let prefix_dir =
             vfs_proton::prefix::prefix_dir(&home, &prefix_id, &self.proton.prefix_init)
                 .map_err(|e| format!("wine prefix: {e}"))?;
