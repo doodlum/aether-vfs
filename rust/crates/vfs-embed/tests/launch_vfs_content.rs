@@ -27,6 +27,10 @@ use vfs_embed::{InlineProvider, Provider, RootId, Session, StageOpts};
 #[cfg(windows)]
 use vfs_embed::{DiskProvider, LaunchOpts};
 
+mod support;
+#[cfg(windows)]
+use support::artifacts::{ensure_inject_artifacts, locate_artifact};
+
 /// Minimal PE: MZ header, e_lfanew, PE32+ optional header, no imports — the
 /// same shape `vfs_director::stage`'s own tests and `staging.rs` use. The trailing marker is what makes "which copy answered"
 /// an observable fact rather than an inference.
@@ -245,93 +249,6 @@ fn launch_stages_companion_images_at_their_vpath_inside_the_root() {
 // The capability, end to end: a real process, from bytes only the graph held.
 // ---------------------------------------------------------------------------
 
-// The fixture-locating trio serves only the `#[cfg(windows)]` launch tests
-// below: the artifacts they look for are Windows PEs and DLLs.
-#[cfg(windows)]
-fn profile_dir() -> std::path::PathBuf {
-    let exe = std::env::current_exe().expect("current_exe");
-    let dir = exe.parent().unwrap();
-    if dir.file_name().and_then(|s| s.to_str()) == Some("deps") {
-        dir.parent().unwrap().to_path_buf()
-    } else {
-        dir.to_path_buf()
-    }
-}
-
-#[cfg(windows)]
-fn locate_artifact(name: &str) -> std::path::PathBuf {
-    let profile = profile_dir();
-    for cand in [profile.join(name), profile.join("deps").join(name)] {
-        if cand.is_file() {
-            return cand;
-        }
-    }
-    panic!("{name} not found near {profile:?} after ensure_fixtures()");
-}
-
-/// Build the shim DLL, the (separate-workspace) payload DLL, `vfs-probe` and
-/// `vfs-fixture-read` once per test process and co-locate them beside the test binary, so
-/// `Session::launch`'s own DLL search (near `current_exe()`) finds them.
-///
-/// Duplicated from `fuse_init_gate.rs` rather than shared: this is the
-/// convention every launch-capable test harness in the workspace follows
-/// (`vfs-inject`'s does the same), and `tests/support/artifacts.rs`, which
-/// rebuilds on staleness, serves the e2e tests that need the full fixture
-/// set.
-#[cfg(windows)]
-fn ensure_fixtures() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-        let workspace = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .canonicalize()
-            .expect("workspace root");
-
-        // Build for the profile this test runs in: `profile_dir()` is that profile's
-        // directory, so a debug build under `cargo test --release` would land elsewhere.
-        let release: &[&str] = if cfg!(debug_assertions) {
-            &[]
-        } else {
-            &["--release"]
-        };
-        let status = std::process::Command::new(&cargo)
-            .current_dir(&workspace)
-            .args([
-                "build",
-                "-p",
-                "vfs-shim-dll",
-                "-p",
-                "vfs-inject",
-                "--bin",
-                "vfs-probe",
-                "-p",
-                "vfs-fixture-read",
-                "--quiet",
-            ])
-            .args(release)
-            .status()
-            .expect("spawn cargo to build shim + vfs-probe + vfs-fixture-read");
-        assert!(
-            status.success(),
-            "shim/vfs-probe/vfs-fixture-read build failed: {status}"
-        );
-
-        let profile = profile_dir();
-        for name in ["vfs_shim_dll.dll", "vfs-probe.exe", "vfs-fixture-read.exe"] {
-            let dest = profile.join(name);
-            if dest.is_file() {
-                continue;
-            }
-            let src = profile.join("deps").join(name);
-            if src.is_file() {
-                let _ = std::fs::copy(&src, &dest);
-            }
-        }
-    });
-}
-
 /// **The capability.** The managed root is empty on real disk, the executable
 /// exists only as bytes in the provider graph, and `Session::launch` runs it.
 ///
@@ -351,7 +268,7 @@ fn ensure_fixtures() {
 #[cfg(windows)]
 #[test]
 fn an_image_only_the_provider_graph_holds_launches_from_an_empty_managed_root() {
-    ensure_fixtures();
+    ensure_inject_artifacts();
 
     let probe = std::fs::read(locate_artifact("vfs-probe.exe")).expect("read vfs-probe.exe");
     let root = tmp("live-root");
@@ -469,7 +386,7 @@ fn an_image_only_the_provider_graph_holds_launches_from_an_empty_managed_root() 
 #[cfg(windows)]
 #[test]
 fn an_absolute_image_inside_root_zero_that_only_the_graph_holds_is_staged_and_launched() {
-    ensure_fixtures();
+    ensure_inject_artifacts();
 
     let content = tmp("abs-content");
     std::fs::copy(
