@@ -355,8 +355,21 @@ unsafe fn fuse_query_information(
             STATUS_SUCCESS
         }
         _ => {
+            // A metadata class with no arm of its own (77
+            // `FileStatBasicInformation`, which Wine's kernelbase asks on a
+            // handle) is filled as the by-name query fills it. Success with
+            // nothing written hands the caller its own uninitialised buffer.
+            let written = match vfs_ntlayout::by_name_info_len(class) {
+                None => 0,
+                Some(need) if (length as usize) < need => return STATUS_INFO_LENGTH_MISMATCH,
+                Some(need) => {
+                    // SAFETY: `info` is non-null and `length` covers the structure (checked above).
+                    let buf = unsafe { caller_buf(info, need) };
+                    vfs_ntlayout::by_name_info(class, buf, is_dir, size).unwrap_or(0)
+                }
+            };
             // SAFETY: same NT-pointer contract as this fn (hook/mod.rs).
-            unsafe { crate::ntbuf::iosb_set(iosb, STATUS_SUCCESS, 0) };
+            unsafe { crate::ntbuf::iosb_set(iosb, STATUS_SUCCESS, written) };
             STATUS_SUCCESS
         }
     }
