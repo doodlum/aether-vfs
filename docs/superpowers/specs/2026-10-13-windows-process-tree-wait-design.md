@@ -1,6 +1,6 @@
 # Windows launches wait for the whole process tree — Design Spec
 
-**Status:** Proposed (implemented on branch `windows-process-tree-wait`; Windows runtime behaviour
+**Status:** Implemented on branch `windows-process-tree-wait` (Windows runtime behaviour
 compile-checked only, see §8).
 **Date:** 2026-10-13
 **Consumers:** Mauvi (mod manager), any host of `vfs-embed` on Windows.
@@ -103,7 +103,7 @@ as a `LaunchHandle::notes()` line for a running or finished launch.
 7, or a job with conflicting UI limits; Windows 8+ nests jobs otherwise). Failing the launch would
 make the VFS unusable under such a host, so the launch degrades to first-process tracking — the old
 behaviour — and says so: `ProcessTree::untracked_reason`, surfaced as the first
-`LaunchHandle::notes()` line and on stderr.
+`LaunchHandle::notes()` line (vfs-embed writes nothing to stderr itself; the host decides whether to log it).
 
 ### 4.4 The Steam helper
 
@@ -185,3 +185,22 @@ must be run on Windows before merge.
    Proton does?
 3. **Kill on host exit** (§3.1): `KILL_ON_JOB_CLOSE` ends the game if the host crashes. The director
    is in the host, so the game cannot work past that point anyway, but a host may prefer otherwise.
+
+## 10. Status (2026-10-13)
+
+Implemented on `windows-process-tree-wait` (the WIP checkpoint was squashed into one commit).
+Checked on Linux:
+
+- `cargo check --target x86_64-pc-windows-gnu -p vfs-embed -p vfs-inject --tests`: passes.
+- `cargo clippy --target x86_64-pc-windows-gnu -p vfs-inject -p vfs-embed -p vfs-fixture-read
+  --all-targets`: no warnings in the changed crates. The warnings left are newer-toolchain lints in
+  crates this branch does not touch.
+- `cargo test -p vfs-embed -p vfs-env -p vfs-proton`: passes (the live-Proton tests are `#[ignore]`d).
+- `cargo clippy -p vfs-embed -p vfs-env -p vfs-proton -p vfs-fixture-read --all-targets`: as above.
+  `vfs-inject` is Windows-only and is not built for Linux.
+- `cargo fmt --all -- --check`: clean.
+- Architecture §3.10, §3.11, §4.3 and `rust/CHANGELOG.md` updated.
+
+**Not verified:** any Windows runtime behaviour. The four process-tree tests in
+`vfs-embed/tests/launch_process_tree.rs` compile but have never run (no Windows or Wine here). Run
+them on Windows before merge. The open questions in §9 are still open, and the current choices stand.

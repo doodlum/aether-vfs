@@ -32,10 +32,14 @@ pub use opts::{Activation, LaunchOpts, StageOpts};
 #[cfg(unix)]
 pub use proton::{LaunchHandle, LaunchStopper};
 pub use registry::RegistrySync;
+#[cfg(windows)]
+pub use windows::{LaunchHandle, LaunchStopper};
 
 use compose::RootComposition;
 #[cfg(unix)]
 use proton::ProtonState;
+#[cfg(windows)]
+use windows::WindowsState;
 
 /// Host entrypoint: one configured director + optional IPC + launch.
 ///
@@ -78,6 +82,9 @@ pub struct Session {
     /// Everything the session holds only for the Proton (Wine) delivery.
     #[cfg(unix)]
     proton: ProtonState,
+    /// The launches a Windows session started, for `stop_launch` and `Drop`.
+    #[cfg(windows)]
+    windows: WindowsState,
     /// The most recent staged launch directory, held here because
     /// [`StagedDir`]'s `Drop` removes the staged files — not the virtual root
     /// they now live in — and Windows keeps the image file mapped for as long
@@ -118,6 +125,8 @@ impl Session {
             io_workers: None,
             #[cfg(unix)]
             proton: ProtonState::default(),
+            #[cfg(windows)]
+            windows: WindowsState::default(),
             staged: Mutex::new(None),
         }
     }
@@ -399,22 +408,29 @@ impl Drop for Session {
     /// `wineserver`, which would otherwise write the registry back into it. A named prefix
     /// ([`Session::set_prefix_name`]) is persistent and left alone. Best
     /// effort — a destructor has nowhere to report a failure.
+    ///
+    /// On Windows: stop every launch that is still running (the program and
+    /// everything it started, by terminating its job), then stop serving.
     fn drop(&mut self) {
         // Unix flushes inside `stop_serve`, below.
         #[cfg(windows)]
-        self.stop_serve();
+        {
+            let _ = self.stop_launch();
+            self.stop_serve();
+        }
         #[cfg(unix)]
         self.drop_proton();
     }
 }
 
-/// What a waited-on Proton [`Session::launch`] returns when
+/// What a waited-on [`Session::launch`] returns when
 /// [`Session::stop_launch`] ended it: 128 + `SIGKILL`, the shell's
-/// convention. Stopping kills the prefix's processes, and `wine` does not
-/// report that reliably (it can exit 0), so the session says so instead.
+/// convention. Stopping kills the prefix's processes (Proton) or the launch's
+/// job (Windows), and the program's own exit code then says nothing reliable
+/// (`wine` can exit 0), so the session says so instead.
 pub const STOPPED_EXIT_CODE: i32 = 128 + 9;
 
-/// How a Proton launch ended.
+/// How a launch ended: the whole process tree, on either target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaunchExit {
     /// The program exited by itself, with this code.

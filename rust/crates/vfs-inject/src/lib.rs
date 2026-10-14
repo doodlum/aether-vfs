@@ -1,7 +1,10 @@
 #![deny(unsafe_code)]
 
 //! Launch a target process with the VFS shim: [`run_target_with_shim`] starts
-//! an import-patched exe normally, or injects the shim into an unpatched one.
+//! an import-patched exe normally, or injects the shim into an unpatched one,
+//! and waits for that process. [`spawn_target_with_shim`] does the same inside
+//! a Job Object and hands back a [`ProcessTree`], which ends only when every
+//! process the target started has exited.
 
 use std::time::Duration;
 
@@ -11,6 +14,7 @@ mod inject;
 mod map;
 mod pe;
 mod steam_helper;
+mod tree;
 
 pub use pe::map_image_from_pe_bytes_local;
 
@@ -26,6 +30,7 @@ pub struct RunConfig {
     pub ready_path: String,
     pub ready_timeout: Duration,
     /// When true, return as soon as the target is running (do not wait for exit).
+    /// [`run_target_with_shim`] only; [`spawn_target_with_shim`] never waits.
     pub detach: bool,
 }
 
@@ -67,12 +72,19 @@ pub enum InjectError {
     /// before the shim reported ready. Reported as soon as it is seen rather
     /// than after the ready timeout, which is what a dead target used to cost.
     TargetExited(u32),
+    /// A [`TreeKiller`] could not terminate the launch's job (or, for a
+    /// launch without one, its process).
+    Terminate,
 }
 
 pub use artifacts::{exe_imports_shim, find_near};
 pub use cli::{parse_injector_args, InjectorArgs};
-pub use inject::{expand_primary_stack, inject_dll, run_target_with_shim, PRIMARY_STACK_BYTES};
+pub use inject::{
+    expand_primary_stack, inject_dll, run_target_with_shim, spawn_target_with_shim,
+    PRIMARY_STACK_BYTES,
+};
 pub use steam_helper::{
     active_process_pid, check_helper_command, clear_active_process_pid, running_under_wine,
     start_steam_helper, SteamHelper, SteamHelperError, ACTIVE_PROCESS_KEY,
 };
+pub use tree::{ProcessTree, TreeKiller};

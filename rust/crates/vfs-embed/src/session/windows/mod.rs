@@ -3,13 +3,32 @@
 //! process environment.
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use vfs_director::ipc::IpcServe;
 
 use super::stage::ResolvedImage;
-use super::{check_image, LaunchOpts, Session};
+use super::{check_image, LaunchExit, LaunchOpts, Session, STOPPED_EXIT_CODE};
+
+mod handle;
+
+use handle::{refusal_notes, StopInner};
+pub use handle::{LaunchHandle, LaunchStopper};
+
+/// What a session holds for its Windows launches.
+#[derive(Default)]
+pub(in crate::session) struct WindowsState {
+    /// The launches `wait: false` [`Session::launch`] calls started, held
+    /// because dropping a [`LaunchHandle`] stops its launch. Ended ones are
+    /// dropped at the next launch or stop.
+    detached: Mutex<Vec<LaunchHandle>>,
+    /// Every launch this session started, weakly: whoever holds it — the
+    /// list above, a waiting `launch`, or a caller of
+    /// [`Session::launch_detached`] that kept its handle — this sees it while
+    /// it runs, for [`Session::stop_launch`] and the session's `Drop`.
+    live: Mutex<Vec<Weak<StopInner>>>,
+}
 
 /// Serializes **every** process-global env mutation this crate performs —
 /// [`Session::serve`]'s as well as [`Session::launch`]'s.
@@ -123,7 +142,25 @@ impl Session {
     /// Launch `opts.image` under the virtual root with dual-layer inject.
     /// Child sees remapped I/O for paths under `virtual_root`.
     ///
-    /// Requires [`serve`] first. On `wait: false`, keep this `Session` alive.
+    /// Requires [`serve`] first.
+    ///
+    /// ## How long a launch lasts
+    ///
+    /// Until the program **and every process it started** have exited: the
+    /// program is put in a Job Object before it runs, and its children
+    /// inherit the job (see [`LaunchHandle`]). A launcher that starts the game
+    /// and exits keeps the launch running until the game exits. The exit code
+    /// returned is the program's own (the first process's).
+    ///
+    /// `wait: false` returns `Ok(0)` once the program is running, and the
+    /// session holds the launch: [`Session::stop_launch`] stops it, and
+    /// dropping the session stops it. A launch that is waited on can be
+    /// stopped from another thread with [`Session::stop_launch`] too; it then
+    /// returns `Ok(`[`STOPPED_EXIT_CODE`]`)`. A host that wants the handle
+    /// itself calls [`Session::launch_detached`].
+    ///
+    /// Unlike a Proton session, a Windows session does not refuse a second
+    /// launch while one runs; [`Session::stop_launch`] stops them all.
     ///
     /// ## How `image` is resolved
     ///
@@ -181,6 +218,33 @@ impl Session {
     /// shape.
     #[cfg(windows)]
     pub fn launch(&self, opts: &LaunchOpts) -> Result<i32, String> {
+        let mut handle = self.launch_detached(opts)?;
+        if !opts.wait {
+            self.reap_detached();
+            self.windows
+                .detached
+                .lock()
+                .map_err(|_| "detached launch lock poisoned".to_string())?
+                .push(handle);
+            return Ok(0);
+        }
+        let exit = handle.block();
+        drop(handle);
+        Ok(match exit? {
+            LaunchExit::Exited(code) => code,
+            LaunchExit::Stopped => STOPPED_EXIT_CODE,
+        })
+    }
+
+    /// Windows: [`Session::launch`] without waiting, handing the running
+    /// launch back once the program is running with its shim up.
+    /// `opts.wait` is ignored. Dropping the handle while the program runs
+    /// stops it — keep it (and this session, whose ring the program reads
+    /// through) for as long as the program should run.
+    ///
+    /// The same call, with the same handle API, as on Proton.
+    #[cfg(windows)]
+    pub fn launch_detached(&self, opts: &LaunchOpts) -> Result<LaunchHandle, String> {
         let ipc = self.require_serving()?;
         check_image(opts)?;
 
@@ -238,7 +302,7 @@ impl Session {
         );
 
         let mut saved: Vec<(String, Option<String>)> = Vec::with_capacity(opts.env.len() + 2);
-        // `run_target_with_shim` publishes these for the target to inherit;
+        // `spawn_target_with_shim` publishes these for the target to inherit;
         // they must not outlive this launch in a host that launches again.
         // Saved before `opts.env` and before the ready timeout is read below.
         for k in [vfs_env::READY_TIMEOUT_SECS, vfs_env::CHILD_REFUSED_LOG] {
@@ -256,7 +320,7 @@ impl Session {
                 .unwrap_or(DEFAULT_READY_TIMEOUT)
         });
 
-        let exit = vfs_inject::run_target_with_shim(vfs_inject::RunConfig {
+        let spawned = vfs_inject::spawn_target_with_shim(vfs_inject::RunConfig {
             target_exe: target.to_string_lossy().into_owned(),
             args: opts.args.clone(),
             current_dir: Some(root_s),
@@ -264,7 +328,7 @@ impl Session {
             config_path: config_path_s,
             ready_path: ready_path_s.clone(),
             ready_timeout,
-            detach: !opts.wait,
+            detach: true,
         });
 
         for (k, old) in saved {
@@ -273,23 +337,78 @@ impl Session {
                 None => std::env::remove_var(&k),
             }
         }
+        // The program has inherited its environment; nothing below touches
+        // process env, so another launch need not wait for this one to end.
+        drop(_guard);
 
         // Children the shim killed because it could not inject them, one
         // `<image> <reason>` line each, beside the ready file.
-        let refused =
-            std::fs::read_to_string(format!("{ready_path_s}{}", vfs_env::CHILD_REFUSED_SUFFIX))
-                .unwrap_or_default();
-        exit.map_err(|e| {
+        let refused_log = PathBuf::from(format!("{ready_path_s}{}", vfs_env::CHILD_REFUSED_SUFFIX));
+        let tree = spawned.map_err(|e| {
+            let refused = std::fs::read_to_string(&refused_log).unwrap_or_default();
             let mut msg = format!("launch: {e:?}");
-            for line in refused.lines().filter(|l| !l.trim().is_empty()) {
-                msg.push_str(&format!(
-                    "\na child process was refused and killed because the shim could not \
-                     inject it (`<image> <reason>`): {}",
-                    line.trim()
-                ));
+            for note in refusal_notes(&refused) {
+                msg.push('\n');
+                msg.push_str(&note);
             }
             msg
+        })?;
+
+        let stopper = LaunchStopper::new(tree.killer());
+        if let Ok(mut live) = self.windows.live.lock() {
+            live.retain(|w| w.strong_count() > 0);
+            live.push(Arc::downgrade(&stopper.0));
+        }
+        Ok(LaunchHandle {
+            tree,
+            stopper,
+            refused_log,
+            outcome: None,
         })
+    }
+
+    /// Windows: stops every launch of this session that is still running —
+    /// those `wait: false` [`Session::launch`] calls started, one a waiting
+    /// `launch` on another thread is blocked on (it then returns
+    /// `Ok(`[`STOPPED_EXIT_CODE`]`)`), and handles a caller of
+    /// [`Session::launch_detached`] kept — by terminating each one's job.
+    /// `Ok(false)` when nothing was running.
+    #[cfg(windows)]
+    pub fn stop_launch(&self) -> Result<bool, String> {
+        let running: Vec<LaunchStopper> = self
+            .windows
+            .live
+            .lock()
+            .map_err(|_| "live launch lock poisoned".to_string())?
+            .iter()
+            .filter_map(Weak::upgrade)
+            .map(LaunchStopper)
+            .filter(|s| !s.has_ended())
+            .collect();
+        let mut first_err = None;
+        for stopper in &running {
+            if let Err(e) = stopper.stop() {
+                first_err.get_or_insert(e);
+            }
+        }
+        // Reaps the held handles: each `poll` sees its job empty once the
+        // terminate lands, and a held handle that is still running is stopped
+        // by its own `Drop` here at the latest.
+        if let Ok(mut d) = self.windows.detached.lock() {
+            d.clear();
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(!running.is_empty()),
+        }
+    }
+
+    /// Drops the held `wait: false` launches that have ended.
+    #[cfg(windows)]
+    fn reap_detached(&self) {
+        if let Ok(mut d) = self.windows.detached.lock() {
+            d.retain_mut(|h| h.is_running());
+        }
     }
 }
 

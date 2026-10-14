@@ -4,6 +4,49 @@ Changes to the host-facing API of `vfs-embed`, `vfs-proton`, `vfs-provider`
 and `vfs-env` that a host (Haskill) has to adapt to or can start using. Newest
 first. Internal refactors are in the git history, not here.
 
+## Unreleased (Windows process-tree wait)
+
+Windows launches now last as long as their whole process tree, as Proton
+launches already did. A launcher chain (`skse64_loader.exe` starts
+`SkyrimSE.exe` and exits) is one launch that ends when the game ends. Design:
+`docs/superpowers/specs/2026-10-13-windows-process-tree-wait-design.md`.
+The Windows behaviour is compile-checked only so far: the new Windows tests
+have not been run on Windows.
+
+### Added
+
+- Windows: `Session::launch_detached(&LaunchOpts) -> Result<LaunchHandle, String>`,
+  `Session::stop_launch() -> Result<bool, String>`, and `vfs_embed::LaunchHandle`
+  (`pid`, `notes`, `stopper`, `is_running`, `try_wait`, `wait`, `stop`) and
+  `vfs_embed::LaunchStopper` (`stop`, `was_stopped`), with the Proton handle's
+  contract: the launch runs until every process it started has exited, the
+  exit code is the first process's, and `stop` ends the whole tree
+  (`LaunchExit::Stopped`). `LaunchHandle::pid` is the launched program's pid.
+  The Steam helper accessors stay Proton-only.
+- `vfs_inject::spawn_target_with_shim(RunConfig) -> Result<ProcessTree, InjectError>`
+  with `ProcessTree` and `TreeKiller`: the target in a Job Object before any of
+  its code runs. `run_target_with_shim` (used by `vfs-injector.exe` under Wine)
+  is unchanged.
+
+### Changed (Windows)
+
+- `Session::launch` with `wait: true` returns when the whole process tree has
+  exited, not when the first process has. The exit code is still the first
+  process's.
+- `Session::launch` with `wait: false` is held by the session: `stop_launch`
+  stops it, and dropping the session stops it before the ring goes. Before,
+  the child was left running against a ring that had gone away.
+- The process-wide launch environment lock is released once the target is
+  running, not held for the whole wait, so another session in the same host
+  can launch while one launch is being waited on.
+- Unlike Proton, a Windows session still allows several launches at once;
+  `stop_launch` stops all of them that are running.
+- A child that asks for `CREATE_BREAKAWAY_FROM_JOB` leaves the job and is
+  neither waited for nor stopped. If the host's own job forbids nesting, the
+  launch falls back to first-process tracking and says so in
+  `LaunchHandle::notes()`. The job is killed when its handle closes, so a
+  crashed host takes the game with it.
+
 ## Unreleased (add-ons)
 
 ### Removed

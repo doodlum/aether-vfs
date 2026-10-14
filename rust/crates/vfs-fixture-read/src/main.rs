@@ -22,6 +22,9 @@
 //! read and exits 1 unless that copy, which the shim injects, also reads the
 //! file.
 //!
+//! `VFS_FIXTURE_ORPHAN_DIR` starts a copy of the fixture after the first read
+//! and exits without waiting for it, the copy outliving it: see `orphan.rs`.
+//!
 //! `VFS_FIXTURE_NAMES` and its companions run the names phase first: see
 //! `names.rs`. Windows only — it calls Win32 directly.
 //!
@@ -62,6 +65,7 @@ fn read_in_one_call(path: &str) -> std::io::Result<Vec<u8>> {
 mod cache;
 #[cfg(windows)]
 mod names;
+mod orphan;
 
 fn env_num(name: &str, default: usize) -> usize {
     std::env::var(name)
@@ -225,6 +229,7 @@ fn main() {
             exit(1);
         }
     }
+    orphan::run();
     if std::env::var_os("VFS_FIXTURE_SPAWN_CHILD").is_some() {
         spawn_copy_of_self();
     }
