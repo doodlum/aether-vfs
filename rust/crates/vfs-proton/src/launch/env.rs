@@ -252,21 +252,33 @@ mod tests {
     use crate::launch::tests::{abs, sample};
     use crate::launch::*;
 
+    /// The runtime's own `LD_LIBRARY_PATH` and `WINEDLLPATH` directories, with
+    /// nothing inherited: what `launch_env` must put first. Taken from
+    /// `runtime_lib_env` (whose own tests pin the Linux spelling) so these
+    /// tests check the ordering on any host, `Path::join`'s separator
+    /// included.
+    fn runtime_dirs(l: &WineLaunch) -> (String, String) {
+        let m: BTreeMap<_, _> = runtime_lib_env(&l.runtime, None, None, None)
+            .into_iter()
+            .collect();
+        (m["LD_LIBRARY_PATH"].clone(), m["WINEDLLPATH"].clone())
+    }
+
     #[test]
     fn launch_env_puts_the_runtime_libs_first_on_ld_library_path() {
         let l = sample();
         let env = launch_env(&l);
-        let rt = path_string(&l.runtime);
+        let (rt_ld, rt_dll) = runtime_dirs(&l);
         assert!(
-            env["LD_LIBRARY_PATH"].starts_with(&format!(
-                "{rt}/files/lib/x86_64-linux-gnu:{rt}/files/lib/i386-linux-gnu"
-            )),
+            rt_ld.contains("files") && rt_ld.contains("x86_64-linux-gnu"),
+            "{rt_ld}"
+        );
+        assert!(
+            env["LD_LIBRARY_PATH"].starts_with(&rt_ld),
             "{}",
             env["LD_LIBRARY_PATH"]
         );
-        assert!(
-            env["WINEDLLPATH"].starts_with(&format!("{rt}/files/lib/vkd3d:{rt}/files/lib/wine"))
-        );
+        assert!(env["WINEDLLPATH"].starts_with(&rt_dll));
         assert!(
             env.contains_key("ORIG_LD_LIBRARY_PATH")
                 || std::env::var_os("ORIG_LD_LIBRARY_PATH").is_some()
@@ -279,8 +291,7 @@ mod tests {
         l.extra_env
             .insert("LD_LIBRARY_PATH".to_string(), "/mine/lib".to_string());
         let ld = launch_env(&l).remove("LD_LIBRARY_PATH").unwrap();
-        let rt = path_string(&l.runtime);
-        let rt_dirs = format!("{rt}/files/lib/x86_64-linux-gnu:{rt}/files/lib/i386-linux-gnu");
+        let (rt_dirs, _) = runtime_dirs(&l);
         assert!(ld.starts_with(&rt_dirs), "{ld}");
         let rest = &ld[rt_dirs.len()..];
         assert!(rest.starts_with(":/mine/lib"), "{ld}");
@@ -482,8 +493,9 @@ mod tests {
         // A caller's WINEDLLPATH keeps the runtime's and nvml's in front.
         l.extra_env = BTreeMap::from([("WINEDLLPATH".to_string(), "/mine".to_string())]);
         let dll = launch_env(&l)["WINEDLLPATH"].clone();
+        let (_, rt_dll) = runtime_dirs(&l);
         assert!(dll.starts_with("/rt/nvml/wine:"), "{dll}");
-        assert!(dll.contains("/files/lib/wine:/mine"), "{dll}");
+        assert!(dll.contains(&format!("{rt_dll}:/mine")), "{dll}");
 
         l.extra_env = BTreeMap::from([("DXVK_ENABLE_NVAPI".to_string(), "0".to_string())]);
         assert_eq!(
