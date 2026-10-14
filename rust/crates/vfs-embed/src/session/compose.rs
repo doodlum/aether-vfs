@@ -31,6 +31,28 @@ pub fn compose_root(
     mounts: Vec<(String, Arc<dyn Provider>)>,
     write_layer: Option<Arc<dyn Provider>>,
 ) -> Result<Arc<dyn Provider>, i32> {
+    compose_root_routed(mounts, write_layer, Vec::new())
+}
+
+/// [`compose_root`], with **write routes** composed above the write layer:
+/// each `(pattern, provider)` owns every path matching `pattern` — reads,
+/// writes, creates, deletes and renames onto it — so the overlay never copies
+/// those paths up. Later routes win over earlier ones, as mounts do. See
+/// [`Session::route_at`].
+///
+/// With no routes this is exactly [`compose_root`]; with routes it is a
+/// [`vfs_compose::RouterProvider`] whose default is that composition.
+/// `ST_BAD_REQUEST` for a route pattern that is empty or escapes with `..`,
+/// and for a `SeqRead` route provider, as for a mount.
+pub fn compose_root_routed(
+    mounts: Vec<(String, Arc<dyn Provider>)>,
+    write_layer: Option<Arc<dyn Provider>>,
+    routes: Vec<(String, Arc<dyn Provider>)>,
+) -> Result<Arc<dyn Provider>, i32> {
+    reject_sequential(routes.iter().map(|(_, p)| p))?;
+    for (pattern, _) in &routes {
+        check_route_pattern(pattern)?;
+    }
     // The funnel's own copy of the gate. `Session::mount_at` and
     // `Session::set_root_mounts` both check before they record, so they never
     // reach here with one; this catches the **third** route, which does not go
@@ -39,12 +61,38 @@ pub fn compose_root(
     // `Director::mount`.
     reject_sequential(mounts.iter().map(|(_, p)| p))?;
     let graph: Arc<dyn Provider> = Arc::new(MountGraph::new(mounts)?);
-    match write_layer {
-        Some(upper) => Ok(Arc::new(
+    let below: Arc<dyn Provider> = match write_layer {
+        Some(upper) => Arc::new(
             vfs_compose::OverlayProvider::from_arcs(graph, upper).map_err(|_| bad_request())?,
-        )),
-        None => Ok(graph),
+        ),
+        None => graph,
+    };
+    if routes.is_empty() {
+        return Ok(below);
     }
+    // The router takes the first matching route; a session's routes are in
+    // registration order and the later one wins, so reverse them.
+    let routes = routes
+        .into_iter()
+        .rev()
+        .map(|(pattern, provider)| vfs_compose::Route { pattern, provider })
+        .collect();
+    Ok(Arc::new(vfs_compose::RouterProvider::new(below, routes)))
+}
+
+/// A route pattern is a root-relative glob: not empty, and no `..` component
+/// (a route cannot claim a path outside its root, any more than a mount
+/// prefix can).
+fn check_route_pattern(pattern: &str) -> Result<(), i32> {
+    let rel = trim_rel(pattern);
+    if rel.is_empty() || rel.split('/').any(|c| c == "..") {
+        return Err(bad_request());
+    }
+    Ok(())
+}
+
+fn trim_rel(s: &str) -> String {
+    s.replace('\\', "/").trim_matches('/').to_string()
 }
 
 /// Refuse any provider declaring `Access::SeqRead`, with `ST_BAD_REQUEST`.
@@ -111,6 +159,10 @@ pub(super) struct RootComposition {
     mounts: Vec<(String, Arc<dyn Provider>)>,
     /// The writable upper this root's writes copy up into, if one is set.
     write_layer: Option<Arc<dyn Provider>>,
+    /// Every `(pattern, provider)` given with [`Session::route_at`], in
+    /// registration order (later wins on a path both match). Composed
+    /// **above** the write layer.
+    routes: Vec<(String, Arc<dyn Provider>)>,
 }
 
 impl Session {
@@ -260,6 +312,51 @@ impl Session {
         self.recompose(root)
     }
 
+    /// Give `provider` every path in `root` matching `pattern`, **above** the
+    /// write layer: reads, writes, truncation, creates, deletes and renames
+    /// onto a matching path all go to `provider`, and nothing is copied up.
+    ///
+    /// For a writable file the host synthesizes and reads back after the
+    /// session — a `MemoryProvider` holding a rendered `Data/plugins.txt` —
+    /// on a root that also has a write layer. Mounted with
+    /// [`Session::mount_at`] instead, such a provider is just more content
+    /// *below* the write layer: the first write copies the file up, and the
+    /// host's buffer never sees it.
+    ///
+    /// - `pattern` is the router's glob (`*`, `**`, `?`), root-relative and
+    ///   matched case-insensitively. Later routes win over earlier ones.
+    /// - `provider` sees paths **unchanged**, so a memory provider for
+    ///   `Data/plugins.txt` holds that full key. It need not be mounted too:
+    ///   listings union the route in.
+    /// - A rename between a routed and an unrouted name moves the file
+    ///   between the two (write-temp-then-rename lands in `provider`); a
+    ///   delete removes it from `provider` and writes no whiteout.
+    /// - A read-only provider is allowed: the path is then pinned, and
+    ///   writes to it are refused rather than copied up.
+    ///
+    /// Routes survive [`Session::set_root_mounts`] and
+    /// [`Session::set_write_layer_at`]; [`Session::clear_root`] drops them.
+    /// `ST_BAD_REQUEST` for an empty pattern, one with a `..` component, or a
+    /// `SeqRead` provider — checked before anything is recorded.
+    ///
+    /// `docs/superpowers/specs/2026-10-13-write-routes-design.md`.
+    pub fn route_at(
+        &self,
+        root: RootId,
+        pattern: &str,
+        provider: Arc<dyn Provider>,
+    ) -> Result<(), i32> {
+        reject_sequential([&provider])?;
+        check_route_pattern(pattern)?;
+        {
+            let mut roots = self.roots.lock().map_err(|_| map_io_err())?;
+            self.claim(&mut roots, root)?
+                .routes
+                .push((pattern.to_string(), provider));
+        }
+        self.recompose(root)
+    }
+
     /// Rebuild `root`'s single provider from its accumulated mounts plus its
     /// optional write layer, and replace whatever `Director` currently serves
     /// for it — `Director` holds exactly one provider per root, so there is no
@@ -283,7 +380,7 @@ impl Session {
             Vec::with_capacity(composition.mounts.len() + 1);
         mounts.extend(composition.staging.map(|p| (String::new(), p)));
         mounts.extend(composition.mounts);
-        let composed = compose_root(mounts, composition.write_layer)?;
+        let composed = compose_root_routed(mounts, composition.write_layer, composition.routes)?;
         self.kernel.mount(root, composed)
     }
 
@@ -297,8 +394,8 @@ impl Session {
         self.clear_root(RootId::DEFAULT)
     }
 
-    /// Forget everything this session composes for `root` — mounts and write
-    /// layer together — and stop serving it. Also the way to hand a root back
+    /// Forget everything this session composes for `root` — mounts, write
+    /// layer and routes together — and stop serving it. Also the way to hand a root back
     /// so something else can mount it directly (see [`Session::mount_at`]'s
     /// ownership check).
     ///

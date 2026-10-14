@@ -54,11 +54,11 @@ impl Session {
     ///
     /// It is not a convenience. Two of spec §6's rules are statements about
     /// `readdir` and nothing else can check them from a host: `layered`
-    /// **unions** its children's listings with top-wins per name, while
-    /// `router`'s listing is **single-dispatch** rather than the union §6
-    /// specifies, so a file served by a route is readable by name and absent
-    /// from its own directory. A host that cannot list its graph cannot tell
-    /// those apart, and the second is a silent wrong answer.
+    /// **unions** its children's listings with top-wins per name, and
+    /// `router` unions them by ownership, each name from the route that
+    /// answers for it. (It was single-dispatch until 2026-10-13, so a file
+    /// served by a route was readable by name and absent from its own
+    /// directory — a silent wrong answer only a listing shows.)
     ///
     /// Drives the graph on the calling thread, like `read_file_at`. For a host
     /// whose provider is serviced by that same thread's event loop that is what

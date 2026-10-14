@@ -133,8 +133,11 @@ never cached).
   archive viable.
 - **`vfs-compose`** provides combinators over other providers: `layered`
   (top-wins; `readdir` unions), `router` (glob-pattern dispatch —
-  `getattr`/`open` take the first matching route; `readdir` is currently
-  single-dispatch rather than the cross-route union the design calls for),
+  every path is owned by the first matching route, else the default;
+  `readdir` unions the children's listings by that ownership, and a rename
+  between two owners moves the file; `Session::route_at` composes routes
+  above a root's write layer, so a writable synthesized file is not copied
+  up — see the [write routes design](../../docs/superpowers/specs/2026-10-13-write-routes-design.md)),
   `overlay` (a writable upper over a base provider: reads fall through to the
   base, the first write to a base-only file **copies it up** into the upper
   (staged as `.cu.<n>.<name>`, then renamed into place), and removing a
@@ -916,8 +919,6 @@ OS, and the zip provider never learns about the host.
   game support, and no macOS host.
 - **Stored zip entries only.** Deflate would defeat random access. Archives are
   expected to be repacked Stored.
-- **Router `readdir` is single-dispatch**, not the cross-route union the
-  provider design calls for.
 - **Anti-cheat.** The techniques here are indistinguishable from those an
   anti-cheat system exists to detect. This is a single-player modding tool.
 - **Per-child staging recursion** for sub-processes is designed but not

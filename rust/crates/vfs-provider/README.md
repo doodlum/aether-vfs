@@ -259,8 +259,8 @@ and in `vfs-compose` today. To avoid documenting aspiration as fact:
   and `overlay` exist. `overlay` is writable: it declares `Access::ReadWrite`
   (its upper must too), copies a base-only file up whole on the first write,
   and hides a removed base path with a `.wh.<name>` marker in the upper.
-  `router`'s `readdir` is single-dispatch (it returns one route's listing, not
-  the union across routes the design calls for). `cached` is not a
+  `router`'s `readdir` unions its children's listings, each name from the
+  route (or default) that owns it. `cached` is not a
   `vfs-compose` primitive: the `aether-storage` add-on has `Storage::cached`.
 - **No registry.** There is no `register_provider` and no `type` string →
   factory mapping; providers are constructed directly in Rust.
