@@ -28,9 +28,6 @@ const OP_SLEEP: u32 = 901;
 /// answer `b"released"`.
 const OP_HOLD: u32 = 902;
 
-/// Reads of this handle take [`SLOW_READ`] each; every other handle is instant.
-const FH_SLOW: u64 = 99;
-const SLOW_READ: Duration = Duration::from_millis(300);
 /// Reads of this handle block until the test opens the latch: a provider
 /// that has stopped answering, for exactly as long as the test says.
 const FH_HELD: u64 = 98;
@@ -53,9 +50,6 @@ struct Fixture {
     arena_off: usize,
     arena_len: usize,
     stop: AtomicBool,
-    /// Slow reads inside the handler right now, and the most there ever were.
-    slow_now: AtomicU32,
-    slow_peak: AtomicU32,
     /// Closed until the test opens it; held requests wait on it.
     latch: Mutex<bool>,
     latch_opened: Condvar,
@@ -77,8 +71,6 @@ impl Fixture {
             arena_off,
             arena_len,
             stop: AtomicBool::new(false),
-            slow_now: AtomicU32::new(0),
-            slow_peak: AtomicU32::new(0),
             latch: Mutex::new(false),
             latch_opened: Condvar::new(),
             held_now: AtomicU32::new(0),
@@ -166,12 +158,6 @@ impl Fixture {
                 }
                 P::OP_READ => {
                     let r = P::decode_read_req(&req.payload).unwrap();
-                    if r.fh == FH_SLOW {
-                        let now = self.slow_now.fetch_add(1, Ordering::SeqCst) + 1;
-                        self.slow_peak.fetch_max(now, Ordering::SeqCst);
-                        thread::sleep(SLOW_READ);
-                        self.slow_now.fetch_sub(1, Ordering::SeqCst);
-                    }
                     if r.fh == FH_HELD {
                         self.hold();
                     }
@@ -246,6 +232,49 @@ fn assert_bytes(fh: u64, offset: u64, got: &[u8]) {
             byte(fh, offset + i as u64)
         );
     }
+}
+
+/// A read of the held file with a short deadline, repeated until it times out
+/// **with the director inside it**: its slot retired and its permit kept, so
+/// that `gate.retired()` reaches `want_retired`. Returns once the server's
+/// handler has the request (`fx.held() == want_retired`).
+///
+/// A short deadline races the server's pick-up. On a loaded machine the
+/// client can give up before any worker has taken the request; the slot is
+/// then still SUBMITTED, so the client frees it and returns the permit
+/// (nothing can write to it any more), and the attempt proves nothing about
+/// a read the director is inside. That outcome is checked for what it is and
+/// retried, so the test proves the same property at any machine speed rather
+/// than assuming a worker always wins a 40 ms race.
+fn time_out_inside_the_director(
+    fx: &Fixture,
+    gate: &DataGate,
+    plan: &ReadPlan,
+    buf: &mut [u8],
+    want_retired: u32,
+) {
+    let impatient = fx.client().with_deadline(Duration::from_millis(40));
+    let t = Instant::now();
+    loop {
+        let r = read_fragmented(&impatient, gate, plan, FH_HELD, 0, buf);
+        assert_eq!(r, Err(P::ST_IO_ERROR), "a held read must fail, not hang");
+        if gate.retired() == want_retired {
+            break;
+        }
+        // Timed out before a worker took it: nothing of it is left behind.
+        assert_eq!(gate.retired(), want_retired - 1);
+        assert_eq!(gate.in_flight(), want_retired - 1, "its permit came back");
+        assert_eq!(fx.slots_in(ST_ABANDONED), want_retired as usize - 1);
+        assert!(
+            t.elapsed() < GIVE_UP,
+            "no worker took a read within its deadline in {GIVE_UP:?}"
+        );
+    }
+    // PROCESSING is set as a worker takes the slot, a moment before the
+    // handler reaches the latch.
+    fx.until("the timed-out read reached the handler", || {
+        fx.held() == want_retired
+    });
 }
 
 /// Eight threads, no lock between them, each reading its own handle in sizes
@@ -367,14 +396,10 @@ fn reads_that_timed_out_keep_their_permits_until_the_director_is_done() {
     let gate = DataGate::new(vfs_ipc::data_limit(4, 8));
     let plan = fx.plan();
     fx.with_workers(4, || {
-        // Long enough for a worker to take each read before it times out,
-        // even on a loaded box: one that times out still queued never puts
-        // the director inside it.
-        let impatient = fx.client().with_deadline(Duration::from_millis(200));
+        let impatient = fx.client().with_deadline(Duration::from_millis(40));
         let mut buf = vec![0u8; 100];
         for sent in 1..=3u32 {
-            let r = read_fragmented(&impatient, &gate, &plan, FH_HELD, 0, &mut buf);
-            assert_eq!(r, Err(P::ST_IO_ERROR));
+            time_out_inside_the_director(&fx, &gate, &plan, &mut buf, sent);
             assert_eq!(fx.held(), sent, "the director is still inside read {sent}");
             assert_eq!(gate.in_flight(), sent, "so its permit is still out");
             assert_eq!(gate.retired(), sent);
@@ -485,21 +510,21 @@ fn two_deep_reads_of_blocked_content_leave_room_for_a_small_read() {
 
 /// **The late reply, end to end.** A bulk read outlives its client's
 /// deadline. The client gets `Timeout`; the slot is retired, not freed; every
-/// request made while the server is still writing that slot — and its arena
+/// request made while the server is still inside that slot — and its arena
 /// bank — goes to another slot and gets its own bytes; and once the server
 /// finishes, the slot is free and serves a request correctly.
+///
+/// The server holds the read on the latch rather than sleeping, so "while the
+/// server is still inside it" is exactly as long as the test says, on any
+/// machine.
 #[test]
 fn a_timed_out_request_retires_its_slot_until_the_late_reply_is_drained() {
     let fx = Fixture::new(2);
     let gate = DataGate::new(8);
     let plan = fx.plan();
     fx.with_workers(2, || {
-        let impatient = fx.client().with_deadline(Duration::from_millis(100));
         let mut buf = vec![0u8; BANK];
-        let t = Instant::now();
-        let r = read_fragmented(&impatient, &gate, &plan, FH_SLOW, 0, &mut buf);
-        assert_eq!(r, Err(P::ST_IO_ERROR), "the read must fail, not hang");
-        assert!(t.elapsed() < SLOW_READ, "it gave up at its deadline");
+        time_out_inside_the_director(&fx, &gate, &plan, &mut buf, 1);
         assert_eq!(
             gate.in_flight(),
             1,
@@ -512,20 +537,24 @@ fn a_timed_out_request_retires_its_slot_until_the_late_reply_is_drained() {
         let retired = retired.expect("the timed-out slot must be ABANDONED, not FREE");
 
         // Reads made meanwhile — the same size, so they use an arena bank —
-        // never land in the retired slot and never see the slow file's bytes.
-        let c = fx.client();
-        let mut during = 0;
-        while fx.state(retired) == ST_ABANDONED {
+        // never land in the retired slot and never see the held file's bytes.
+        let c = fx.client().with_deadline(GIVE_UP);
+        for during in 0..50u64 {
             let fh = 7;
             let offset = during * 13;
             let n = read_fragmented(&c, &gate, &plan, fh, offset, &mut buf).unwrap();
             assert_eq!(n, BANK);
             assert_bytes(fh, offset, &buf);
-            during += 1;
+            assert_eq!(
+                fx.state(retired),
+                ST_ABANDONED,
+                "the slot stays retired while the server is inside it"
+            );
         }
-        assert!(during > 0, "no read was made while the slot was retired");
+        assert_eq!(fx.held(), 1, "the late reply is still being held");
 
-        // The server finished and drained it: free, and usable.
+        // The server finishes and drains it: free, and usable.
+        fx.open_latch();
         fx.await_state(retired, ST_FREE);
         let (resps, held) = c
             .submit_many_held(&[
@@ -567,7 +596,7 @@ fn a_request_nobody_serves_times_out_and_frees_its_slot() {
 fn a_batch_that_times_out_gives_every_slot_back() {
     let fx = Fixture::new(4);
     fx.with_workers(3, || {
-        let c = fx.client().with_deadline(Duration::from_millis(100));
+        let c = fx.client().with_deadline(Duration::from_millis(40));
         let r = c.submit_many_held(&[
             (OP_ECHO, 0, b"a".to_vec()),
             (OP_SLEEP, 0, 250u64.to_le_bytes().to_vec()),
@@ -661,21 +690,15 @@ fn a_full_ring_is_waited_for_off_the_processor_and_not_for_ever() {
 }
 
 /// One deadline for a whole batch. Three requests served one after another,
-/// each taking 100 ms, against a 150 ms deadline: the third answers at 300 ms.
+/// each taking 25 ms, against a 60 ms deadline: the third answers at 75 ms.
 /// With a clock per request, started when its turn to be awaited came, each
 /// was "on time" and the call ran past its deadline without noticing.
-///
-/// The margins are wide on purpose. A reply already there is taken without
-/// looking at the clock, so a client descheduled from before the deadline
-/// until after the last reply sees none of the wait: with 25 ms naps and a
-/// 60 ms deadline that took only a 15 ms oversleep, which a loaded macOS box
-/// gives.
 #[test]
 fn a_batch_has_one_deadline_not_one_per_request() {
     let fx = Fixture::new(4);
     fx.with_workers(1, || {
-        let c = fx.client().with_deadline(Duration::from_millis(150));
-        let nap = 100u64.to_le_bytes().to_vec();
+        let c = fx.client().with_deadline(Duration::from_millis(60));
+        let nap = 25u64.to_le_bytes().to_vec();
         let r = c.submit_many_held(&[
             (OP_SLEEP, 0, nap.clone()),
             (OP_SLEEP, 0, nap.clone()),

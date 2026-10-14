@@ -413,11 +413,31 @@ fn an_image_only_the_provider_graph_holds_launches_from_an_empty_managed_root() 
         "the host's own mount is gone, so its content must be gone with it — \
          otherwise the next assertion proves nothing"
     );
-    assert_eq!(
-        s.read_file("probe.exe").unwrap().len(),
-        probe.len(),
+    // What answers is the *staged* image, not the graph's original: staging
+    // rewrites an EXE to import the shim first (import activation, which adds
+    // an `.aether` section), so the bytes differ from `probe` by design. The
+    // contract is that the vpath stays readable, is a valid PE, and is that
+    // patched image — the shim first, then every import the original had.
+    let staged = s.read_file("probe.exe").expect(
         "the staged image must stay answerable at its vpath, and survive the host \
-         rebuilding the root's mounts"
+         rebuilding the root's mounts",
+    );
+    let original_imports =
+        vfs_pe::import_dll_names_of_pe(&probe).expect("vfs-probe.exe is a valid PE");
+    let staged_imports = vfs_pe::import_dll_names_of_pe(&staged)
+        .expect("what answers at the vpath after the rebuild must be a valid PE");
+    assert!(
+        staged_imports
+            .first()
+            .is_some_and(|d| d.eq_ignore_ascii_case(vfs_pe::SHIM_IMPORT_DLL)),
+        "what answers must be the staged, import-activated image (first import {}), \
+         got imports {staged_imports:?}",
+        vfs_pe::SHIM_IMPORT_DLL
+    );
+    assert_eq!(
+        staged_imports[1..],
+        original_imports[..],
+        "the staged image is the original with the shim import added, nothing else"
     );
 
     s.stop_serve();

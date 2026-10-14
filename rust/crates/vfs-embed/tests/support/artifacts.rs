@@ -1,5 +1,5 @@
 //! Locating, freshness-checking and building the Windows artefacts the launch
-//! tests inject (shim DLL, payload DLL, fixture executables).
+//! tests inject (shim DLL, fixture executables).
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -9,10 +9,7 @@ pub use vfs_testkit::artifacts::profile_dir;
 
 /// [`vfs_testkit::artifacts::locate`], panicking with this harness's build hint.
 pub fn locate_artifact(name: &str) -> PathBuf {
-    vfs_testkit::artifacts::locate_or_panic(
-        name,
-        "build -p vfs-fixture-read -p vfs-shim-dll and vfs-payload (--manifest-path crates/vfs-payload/Cargo.toml) first",
-    )
+    vfs_testkit::artifacts::locate_or_panic(name, "build -p vfs-shim-dll -p vfs-fixture-read first")
 }
 
 /// Every crate directory reachable from `crate_dir` by following `path =
