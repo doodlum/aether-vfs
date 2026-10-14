@@ -402,6 +402,39 @@ pub fn partial_path(root: &Root, tag: &str) -> PathBuf {
     root.downloads().join(format!("{tag}.tar.gz.partial"))
 }
 
+/// The HTTP agent [`install_release`] and [`crate::release::fetch_releases`]
+/// take, so a host builds one (`Agent::new_with_defaults()`) without naming
+/// `ureq` itself.
+pub use ureq::Agent;
+
+/// Installs GE-Proton under `root` in one call: the release tagged `tag`, else
+/// the newest of the [`DEFAULT_MAJOR`](crate::release::DEFAULT_MAJOR) series.
+/// What `vfs-proton install` does, for a host (a `runtime install` command).
+///
+/// A named tag that is already installed and verified needs no network at all,
+/// not even the releases listing, so a repeat install of one tag works
+/// offline; `force` downloads it again anyway. Otherwise the release is
+/// resolved ([`crate::release::resolve`]) and [`install_release`] does the
+/// rest; [`partial_path`] is where the download grows, for a host that shows
+/// progress. Blocking: run it off any thread that must stay responsive.
+pub fn install(root: &Root, tag: Option<&str>, force: bool) -> Result<Installed, String> {
+    if !force {
+        if let Some(tag) = tag {
+            let dir = root.try_runtime_dir(tag).map_err(|e| e.to_string())?;
+            if let Ok(tag) = verify_ge(&dir) {
+                return Ok(Installed {
+                    tag,
+                    dir,
+                    fresh: false,
+                });
+            }
+        }
+    }
+    let agent = Agent::new_with_defaults();
+    let release = crate::release::resolve(&agent, tag, crate::release::DEFAULT_MAJOR)?;
+    install_release(root, &release, &agent, force).map_err(|e| e.to_string())
+}
+
 /// Downloads, verifies and installs `rel` under `root`, returning the
 /// installed runtime.
 ///
@@ -585,6 +618,33 @@ fn download_to(agent: &ureq::Agent, url: &str, dest: &Path) -> Result<(), Instal
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A named tag already installed and verified is returned without a
+    /// request: this test has no network, and the host gets the same answer
+    /// `vfs-proton install --version` prints.
+    #[test]
+    fn installing_a_tag_that_is_already_there_needs_no_network() {
+        let home = crate::test_tmp::dir().join(format!("vfs-proton-inst-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let root = Root::at(home.clone());
+        let rt = root.runtimes().join("GE-Proton99-1");
+        std::fs::create_dir_all(&rt).unwrap();
+        std::fs::write(rt.join("version"), "1 GE-Proton99-1\n").unwrap();
+        let got = install(&root, Some("GE-Proton99-1"), false).unwrap();
+        assert_eq!(
+            got,
+            Installed {
+                tag: "GE-Proton99-1".into(),
+                dir: rt,
+                fresh: false
+            }
+        );
+        assert!(
+            install(&root, Some("../x"), false).is_err(),
+            "a tag is checked before it is joined onto a path"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
 
     #[test]
     fn parses_a_publisher_sha512sum_line() {

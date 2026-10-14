@@ -114,6 +114,32 @@ pub fn pick(releases: &[Release], major: Option<u32>) -> Option<&Release> {
         .max_by(|a, b| cmp_tags(&a.tag, &b.tag))
 }
 
+/// The major GE-Proton series [`resolve`] picks within when no tag is named.
+/// Eleven because that is the series this project runs; picking "newest
+/// overall" instead would silently jump a major the day GE tags 12.0, which is
+/// not a decision a runtime installer should make on a user's behalf.
+pub const DEFAULT_MAJOR: u32 = 11;
+
+/// The release to install: the one tagged `tag`, else the newest in the
+/// `major` series. The error says which was asked for and not found.
+///
+/// A named tag still needs the releases listing: the tarball and digest URLs
+/// come from the API, and building them by string convention instead would
+/// invent an asset name that upstream is free to change.
+pub fn resolve(agent: &ureq::Agent, tag: Option<&str>, major: u32) -> Result<Release, String> {
+    let releases =
+        fetch_releases(agent).map_err(|e| format!("could not list GE-Proton releases: {e}"))?;
+    match tag {
+        Some(tag) => releases
+            .into_iter()
+            .find(|r| r.tag == tag)
+            .ok_or_else(|| format!("no recent GE-Proton release is tagged {tag}")),
+        None => pick(&releases, Some(major)).cloned().ok_or_else(|| {
+            format!("no GE-Proton {major}.x release has an x86_64 asset pair in the recent listing")
+        }),
+    }
+}
+
 /// Extracts the `N` from a `GE-ProtonN-M` tag.
 fn tag_major(tag: &str) -> Option<u32> {
     let rest = tag.strip_prefix("GE-Proton")?;

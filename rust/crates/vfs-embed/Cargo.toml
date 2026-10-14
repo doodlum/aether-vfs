@@ -22,6 +22,12 @@ zip = ["dep:vfs-zip"]
 ## reached through vfs-provider's own `conformance` feature. Off by default:
 ## it is test code, enabled from a host's `[dev-dependencies]`.
 conformance = ["vfs-provider/conformance"]
+## Unix: GE-Proton installation through this crate
+## (`vfs_embed::proton::install`), for a host with a `runtime install` command.
+## Off by default for the reason `vfs-proton`'s own `acquire` feature exists: it
+## pulls `ureq` -> `rustls` -> `ring`, a TLS stack and a C build script, into a
+## host that may only want to launch. No effect on Windows.
+acquire = ["vfs-proton/acquire"]
 
 [dependencies]
 # The kernel this API is a seam over: `Director`, its ring/IPC server, the

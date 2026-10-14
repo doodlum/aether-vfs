@@ -177,6 +177,25 @@ pub mod proton {
     pub mod runtime {
         pub use vfs_proton::runtime::{cmp_tags, installed_dirs, newest_installed, verify_ge};
     }
+
+    /// Whether a Steam client is running, the way a launch asks it: the
+    /// client's state directory (`$HOME/.steam`, or the one a host passes to
+    /// [`Session::set_steam_state_dir`](crate::Session::set_steam_state_dir)
+    /// for a Flatpak Steam) and the live client running out of it, if any.
+    pub mod steam {
+        pub use vfs_proton::steam::{running_client, state_dir};
+    }
+
+    /// Installing GE-Proton under a `Root` (feature `acquire`): [`install`]
+    /// in one call, or [`resolve`] and [`install_release`] with a host's own
+    /// [`Agent`], watching [`partial_path`] grow for progress.
+    #[cfg(feature = "acquire")]
+    pub mod install {
+        pub use vfs_proton::install::{
+            install, install_release, partial_path, Agent, InstallError, Installed,
+        };
+        pub use vfs_proton::release::{fetch_releases, pick, resolve, Release, DEFAULT_MAJOR};
+    }
 }
 /// What became of Proton's Steam helper in a launch — see
 /// [`LaunchHandle::steam_helper_status`].
@@ -408,6 +427,25 @@ mod tests {
             b"[General]"
         );
         reset_rejected_writes();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// AE-25: a host's Play gate asks aether's own Steam question, and
+    /// installs a runtime, through this crate alone.
+    #[cfg(unix)]
+    #[test]
+    fn steam_liveness_and_runtime_install_are_reached_through_this_crate() {
+        let dir = crate::test_scratch::scratch_created("steam-state");
+        assert_eq!(proton::steam::running_client(&dir), None, "no steam.pid");
+        // A live pid that is not a process called `steam`.
+        std::fs::write(dir.join("steam.pid"), std::process::id().to_string()).unwrap();
+        assert_eq!(proton::steam::running_client(&dir), None);
+        let _: fn() -> Option<std::path::PathBuf> = proton::steam::state_dir;
+        #[cfg(feature = "acquire")]
+        {
+            let _ = proton::install::install;
+            assert_eq!(proton::install::DEFAULT_MAJOR, 11);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

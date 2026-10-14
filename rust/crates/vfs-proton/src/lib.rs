@@ -37,11 +37,13 @@ mod test_tmp;
 // repository's tests use.
 pub use host::WineHost;
 #[cfg(feature = "acquire")]
-pub use install::{extract_tar_gz, install_release, parse_sha512sum, partial_path, verify_digest};
+pub use install::{
+    extract_tar_gz, install, install_release, parse_sha512sum, partial_path, verify_digest,
+};
 pub use launch::{finish, launch_env, merge_dll_overrides, spawn, WineLaunch, DEFAULT_WINEDEBUG};
 pub use layout::Root;
 pub use prefix::{ensure, ensure_with, Prefix, PrefixInit};
 #[cfg(feature = "acquire")]
-pub use release::{fetch_releases, pick, Release};
+pub use release::{fetch_releases, pick, resolve, Release, DEFAULT_MAJOR};
 pub use runtime::{cmp_tags, installed, installed_dirs, verify_ge};
 pub use steam::{HelperStatus, SteamLaunch, SteamSide};

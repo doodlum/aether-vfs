@@ -4,6 +4,22 @@ Changes to the host-facing API of `vfs-embed`, `vfs-proton`, `vfs-provider`
 and `vfs-env` that a host (Haskill) has to adapt to or can start using. Newest
 first. Internal refactors are in the git history, not here.
 
+## Unreleased (host death, known folders, Steam and runtime re-exports)
+
+### Added
+
+- Unix: `vfs_embed::proton::steam::{state_dir, running_client}`, the Steam
+  liveness test a launch makes, so a host's own check (a Play gate) needs no
+  `vfs-proton` dependency. `Session::set_steam_state_dir` (Flatpak Steam) was
+  already there.
+- Unix, feature `acquire` (off by default): `vfs_embed::proton::install`, with
+  `install(&Root, Option<&str>, force) -> Result<Installed, String>` (what
+  `vfs-proton install` does: a named tag already installed needs no network)
+  and the pieces under it: `install_release`, `resolve`, `fetch_releases`,
+  `pick`, `partial_path` (for progress), `Agent`, `Installed`, `InstallError`,
+  `Release`, `DEFAULT_MAJOR`. `vfs-proton` gains `install`, `resolve` and
+  `DEFAULT_MAJOR` (moved from its CLI).
+
 ## Unreleased (registry fidelity on Windows 11 26H2)
 
 Registry hooks now follow the host where Windows and Wine differ, as found by

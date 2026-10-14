@@ -38,14 +38,8 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use vfs_proton::{
-    fetch_releases, install_release, installed_dirs, partial_path, pick, verify_ge, Release, Root,
+    install_release, installed_dirs, partial_path, resolve, verify_ge, Release, Root, DEFAULT_MAJOR,
 };
-
-/// The major GE-Proton series `install` resolves within when no `--version` is
-/// given. Eleven because that is the series this project runs; picking "newest
-/// overall" instead would silently jump a major the day GE tags 12.0, which is
-/// not a decision a runtime installer should make on a user's behalf.
-const DEFAULT_MAJOR: u32 = 11;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -184,25 +178,6 @@ fn cmd_install(
     }
     println!("{}", installed.dir.display());
     Ok(())
-}
-
-/// Turns `--version`/`--major` into a concrete [`Release`].
-///
-/// A named tag still needs the releases listing: the tarball and digest URLs
-/// come from the API, and building them by string convention instead would
-/// invent an asset name that upstream is free to change.
-fn resolve(agent: &ureq::Agent, version: Option<&str>, major: u32) -> Result<Release, String> {
-    let releases =
-        fetch_releases(agent).map_err(|e| format!("could not list GE-Proton releases: {e}"))?;
-    match version {
-        Some(tag) => releases
-            .into_iter()
-            .find(|r| r.tag == tag)
-            .ok_or_else(|| format!("no recent GE-Proton release is tagged {tag}")),
-        None => pick(&releases, Some(major)).cloned().ok_or_else(|| {
-            format!("no GE-Proton {major}.x release has an x86_64 asset pair in the recent listing")
-        }),
-    }
 }
 
 fn cmd_list(dir: Option<PathBuf>) -> Result<(), String> {
