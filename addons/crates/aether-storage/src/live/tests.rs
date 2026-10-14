@@ -262,9 +262,14 @@ fn a_failed_freeze_freezes_nothing() {
     assert!(s.live_keys().unwrap().is_empty());
     assert_eq!(live_store_ids(&s), 0);
     assert!(s.freeze("scratch", &[]).unwrap().is_empty());
-    // The same path twice is two keys.
+    // The same file twice, under two spellings, is one key and one live file.
     let f = s.freeze("scratch", &["d/a.txt", "D/A.TXT"]).unwrap();
-    assert_ne!(f[0].key, f[1].key);
+    assert_eq!(f[0].key, f[1].key);
+    assert_eq!(
+        (f[0].path.as_str(), f[1].path.as_str()),
+        ("d/a.txt", "D/A.TXT")
+    );
+    assert_eq!(live_store_ids(&s), 1);
 }
 
 /// A file a handle is still writing is frozen as readers see it: its
@@ -396,6 +401,206 @@ fn a_kill_before_the_durable_point_leaves_nothing() {
     assert_eq!(k.live_info(&[key]).unwrap(), vec![None]);
     assert_eq!(live_store_ids(&k), 0);
     assert!(matches!(k.open_live(key), Err(StorageError::NotFound(_))));
+}
+
+/// Session end re-run: freezing the same unchanged files again returns the
+/// same keys and adds no store file, no row and no fsync.
+#[test]
+fn freezing_twice_returns_the_same_keys_and_creates_nothing() {
+    let dir = vfs_testkit::tempdir().unwrap();
+    let s = open(dir.path());
+    let a = bytes(7, 2 * BS as usize + 3);
+    s.put_files(
+        "scratch",
+        &[("Saves/a.ess", &a), ("b.ini", b"b"), ("e", b"")],
+    )
+    .unwrap();
+    let first = s.freeze_layer("scratch").unwrap();
+    let ids_before = s.store.file_ids().unwrap();
+    let points = s.clock.points();
+    let second = s.freeze_layer("scratch").unwrap();
+    assert_eq!(first, second, "same paths, keys and infos");
+    let by_path = s.freeze("scratch", &["b.ini", "SAVES/A.ESS"]).unwrap();
+    assert_eq!(
+        by_path[0].key,
+        first.iter().find(|f| f.path == "b.ini").unwrap().key
+    );
+    assert_eq!(
+        by_path[1].key,
+        first.iter().find(|f| f.path == "Saves/a.ess").unwrap().key
+    );
+    assert_eq!(s.store.file_ids().unwrap(), ids_before, "no new store file");
+    assert_eq!(s.clock.points(), points, "nothing to make durable");
+    assert_eq!(s.live_keys().unwrap().len(), 3);
+    assert!(s.store.verify().unwrap().is_ok(), "no extra references");
+    // And after a reopen.
+    s.close().unwrap();
+    let s = open(dir.path());
+    assert_eq!(s.freeze_layer("scratch").unwrap(), first);
+    assert_eq!(s.store.file_ids().unwrap(), ids_before);
+}
+
+/// A crash after `freeze` returned, before the host recorded the keys: the
+/// re-run freeze returns the same keys. A crash in the middle of a freeze
+/// (rows and clones in, no durable point) loses it, and the retry derives the
+/// keys the lost one would have returned.
+#[cfg(not(windows))]
+#[test]
+fn a_crash_then_a_retried_freeze_gives_the_same_keys() {
+    let dir = vfs_testkit::tempdir().unwrap();
+    let s = open(dir.path());
+    let p = s.layer("scratch").unwrap();
+    write_file(&p, "save.ess", &bytes(8, BS as usize + 1));
+    write_file(&p, "other.ess", b"other");
+    s.sync().unwrap();
+
+    // Cut short: rows and clones, made durable in the store by a flush (as
+    // its auto-flush could), but no durable point.
+    let half = s
+        .layer_provider("scratch", false)
+        .unwrap()
+        .try_freeze(&crate::layer::Select::All)
+        .unwrap()
+        .expect("nothing busy");
+    s.store.flush().unwrap();
+    let killed = vfs_testkit::tempdir().unwrap();
+    crate::test_util::snapshot_as_killed(dir.path(), killed.path()).unwrap();
+    {
+        let k = open(killed.path());
+        assert_eq!(k.last_reconcile().orphans_deleted, 2);
+        assert!(k.live_keys().unwrap().is_empty());
+        assert_eq!(k.freeze_layer("scratch").unwrap(), half, "the retry");
+        assert_eq!(live_store_ids(&k), 2);
+    }
+
+    // The same retry in the live process: the rows exist, not yet durable;
+    // the freeze only adds the durable point.
+    let done = s.freeze_layer("scratch").unwrap();
+    assert_eq!(done, half);
+    assert_eq!(live_store_ids(&s), 2);
+
+    // Killed after it returned: the re-run returns the same keys again.
+    let killed = vfs_testkit::tempdir().unwrap();
+    crate::test_util::snapshot_as_killed(dir.path(), killed.path()).unwrap();
+    let k = open(killed.path());
+    let ids = k.store.file_ids().unwrap();
+    assert_eq!(k.freeze_layer("scratch").unwrap(), done);
+    assert_eq!(k.store.file_ids().unwrap(), ids);
+    assert_eq!(
+        read_live(&k, done[1].key),
+        read_layer(&k.layer("scratch").unwrap(), "save.ess")
+    );
+}
+
+/// A file rewritten since its freeze, in place (same GUID) or by
+/// replacement (new GUID), freezes to a new key; the old key keeps the old
+/// bytes.
+#[test]
+fn a_rewritten_file_gets_a_new_key() {
+    let dir = vfs_testkit::tempdir().unwrap();
+    let s = open(dir.path());
+    let p = s.layer("scratch").unwrap();
+    let a = bytes(9, 2 * BS as usize);
+    write_file(&p, "f", &a);
+    let k1 = s.freeze("scratch", &["f"]).unwrap()[0].key;
+
+    // In place: one block changes, length and GUID stay (mtime may too,
+    // within the same second): the content alone tells them apart.
+    let (h, _, _) = p.open(at("f"), OPEN_WRITE).unwrap();
+    p.write_at(h, BS, &bytes(10, BS as usize)).unwrap();
+    p.close(h).unwrap();
+    let k2 = s.freeze("scratch", &["f"]).unwrap()[0].key;
+    assert_ne!(k2, k1);
+
+    // Replaced by a rename over it, with the very same bytes: a new GUID.
+    let now = read_layer(&p, "f");
+    write_file(&p, "g", &now);
+    p.rename(at("g"), at("f")).unwrap();
+    let k3 = s.freeze("scratch", &["f"]).unwrap()[0].key;
+    assert_ne!(k3, k2);
+    assert_ne!(k3, k1);
+
+    assert_eq!(read_live(&s, k1), a);
+    assert_eq!(read_live(&s, k2), now);
+    assert_eq!(read_live(&s, k3), now);
+    assert_eq!(s.live_keys().unwrap().len(), 3);
+    // Unchanged since: the latest key again.
+    assert_eq!(s.freeze("scratch", &["f"]).unwrap()[0].key, k3);
+}
+
+/// A layer deleted and recreated under the same name, with the same paths
+/// and bytes, gets a new layer id and new GUIDs, so new keys; the old keys
+/// still read. Two layers holding equal files never share a key either.
+#[test]
+fn a_recreated_layer_gets_no_colliding_keys() {
+    let dir = vfs_testkit::tempdir().unwrap();
+    let s = open(dir.path());
+    let files: [(&str, &[u8]); 2] = [("a.ess", b"same bytes"), ("d/b.ini", b"b")];
+    s.put_files("scratch", &files).unwrap();
+    let old_id = s.catalog.layer_id("scratch").unwrap().unwrap();
+    let old = s.freeze_layer("scratch").unwrap();
+    s.delete_layer("scratch").unwrap();
+    s.put_files("scratch", &files).unwrap();
+    s.put_files("twin", &files).unwrap();
+    assert_ne!(
+        s.catalog.layer_id("scratch").unwrap().unwrap(),
+        old_id,
+        "ids are never reused"
+    );
+    let new = s.freeze_layer("scratch").unwrap();
+    let twin = s.freeze_layer("twin").unwrap();
+    let mut all: HashSet<LiveKey> = HashSet::new();
+    for f in old.iter().chain(&new).chain(&twin) {
+        assert!(all.insert(f.key), "{} collides", f.key);
+    }
+    assert_eq!(s.live_keys().unwrap().len(), 6);
+    for f in &old {
+        assert_eq!(
+            read_live(&s, f.key),
+            read_live(&s, new.iter().find(|n| n.path == f.path).unwrap().key)
+        );
+    }
+    // The layer id alone separates keys of an equal source state.
+    let st = || SourceState {
+        len: 1,
+        mtime: 2,
+        digest: [3; 32],
+    };
+    assert_ne!(
+        LiveKey::derive(1, &[4; 16], &st()),
+        LiveKey::derive(2, &[4; 16], &st())
+    );
+    assert_eq!(
+        LiveKey::derive(1, &[4; 16], &st()),
+        LiveKey::derive(1, &[4; 16], &st())
+    );
+}
+
+/// `delete_live`, then the same unchanged file frozen again: the key comes
+/// back, over the same bytes. Also when the delete left its store file
+/// behind (a failed store delete): the orphan is replaced, not refused.
+#[test]
+fn freezing_after_delete_live_recreates_the_key() {
+    let dir = vfs_testkit::tempdir().unwrap();
+    let s = open(dir.path());
+    s.put_files("scratch", &[("a", b"alpha")]).unwrap();
+    let k = s.freeze("scratch", &["a"]).unwrap()[0].key;
+    assert_eq!(s.delete_live(&[k]).unwrap(), 1);
+    assert_eq!(live_store_ids(&s), 0);
+    assert_eq!(s.freeze("scratch", &["a"]).unwrap()[0].key, k);
+    assert_eq!(read_live(&s, k), b"alpha");
+
+    s.fail_deletes
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(s.delete_live(&[k]).unwrap(), 1);
+    s.fail_deletes
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(live_store_ids(&s), 1, "the orphan");
+    assert_eq!(s.live_info(&[k]).unwrap(), vec![None]);
+    assert_eq!(s.freeze("scratch", &["a"]).unwrap()[0].key, k);
+    assert_eq!(read_live(&s, k), b"alpha");
+    assert_eq!(live_store_ids(&s), 1);
+    assert!(s.store.verify().unwrap().is_ok());
 }
 
 /// A live row whose store file is gone is dropped at open and reported.

@@ -167,6 +167,9 @@ crash between the two halves' commits left. It is skipped after a clean close:
 - The `layers` registry, then `gate` (a new layer is made durable while the
   registry is held; nothing holding the gate takes the registry).
 - Cache: `gate`, then `open_counts`, then `access`.
+- Live files: the storage's `live` lock, then `gate`. A freeze takes it before
+  anything else; `delete_live` holds it across its durable point; nothing holding
+  `gate`, `ns` or a cell's `state` takes it.
 - **The one exception: a freeze** (`layer/freeze.rs`) holds `gate` (shared) and
   `ns`, then takes selected cells' `state` — but only with `try_read`, which
   never waits, so it adds no wait-for edge. A `try_read` that fails sends the
@@ -190,8 +193,17 @@ reference, so nothing done to the layer afterwards reaches it. Its catalog row
   keys**. A crash before it returns loses the whole freeze (no row was durable; a
   clone the store's auto-flush made durable is an orphan that reconciliation
   deletes). A crash after it loses nothing.
+- Keys are derived from the source (layer id, GUID, length, mtime, content
+  digest), so a freeze is **idempotent**: a key whose row exists is returned and
+  nothing is written for it, and a retry after a crash derives the same keys. The
+  durable point still runs (it skips its fsyncs when nothing is pending), so a
+  retry that finds rows an earlier, failed attempt left non-durable makes them
+  durable before returning. A row-less `b'F'` store file a freeze finds for a new
+  key is an orphan and is deleted before the clone; the `live` lock keeps a
+  `delete_live` in progress from looking like one.
 - `delete_live` removes the rows, runs a durable point, then deletes the store
-  files (invariant 2). It does not wait for open `LiveFile`s.
+  files (invariant 2). It does not wait for open `LiveFile`s. A later freeze of the
+  unchanged source recreates the same key over the same bytes.
 - Reconciliation deletes `b'F'` ids without a row, and drops (and reports in
   `ReconcileReport::lost_live`) a row whose store file is missing, which no write
   order above produces. The "catalog lost" refusal counts `b'F'` ids as data.

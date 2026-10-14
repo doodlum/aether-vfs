@@ -8,13 +8,18 @@
 //! `try_read` never waits, so it adds no wait-for edge. A file whose state
 //! is busy or holds unwritten blocks sends the freeze back out to commit the
 //! layer's open files (as a `flush` would) and try again.
+//!
+//! Keys are derived, not drawn ([`LiveKey::derive`]): a source whose key
+//! already has a row is not frozen again (idempotence). The `live` lock,
+//! taken before the gate, keeps `delete_live` out of the row-and-clone step.
 
 use std::collections::HashSet;
 use std::sync::TryLockError;
 
 use super::*;
 use crate::ids::live_file_id;
-use crate::live::{EntryKind, FrozenFile, LiveInfo, LiveKey, entries_of};
+use crate::live::{EntryKind, FrozenFile, LiveInfo, LiveKey, SourceState, entries_of};
+use crate::util::lock;
 
 /// Rounds of "commit the open files, then try again" before a freeze gives
 /// up with `LayerInUse`.
@@ -70,8 +75,13 @@ impl LayerProvider {
         Ok(())
     }
 
-    /// One attempt: `None` if a selected open file is busy or dirty.
-    fn try_freeze(&self, sel: &Select<'_>) -> Result<Option<Vec<FrozenFile>>, StorageError> {
+    /// One attempt, without the durable point: `None` if a selected open
+    /// file is busy or dirty. (`pub(crate)` for tests of a freeze cut short.)
+    pub(crate) fn try_freeze(
+        &self,
+        sel: &Select<'_>,
+    ) -> Result<Option<Vec<FrozenFile>>, StorageError> {
+        let _live = lock(&self.storage.live_lock);
         let _gate = self.storage.gate_shared();
         let _ns = lock_status(&self.ns).map_err(|st| status_err("namespace", st))?;
         let catalog = &self.storage.catalog;
@@ -121,7 +131,6 @@ impl LayerProvider {
             .filter_map(|(_, r)| self.live_cell(&r.guid))
             .collect();
         let mut pins = Vec::with_capacity(cells.len());
-        let mut committed = HashMap::new();
         for c in &cells {
             let st = match c.state.try_read() {
                 Ok(st) => st,
@@ -133,61 +142,120 @@ impl LayerProvider {
             if st.is_dirty() {
                 return Ok(None);
             }
-            committed.insert(c.guid, st.committed_len);
             pins.push(st);
         }
 
-        // Rows first, then the store files (invariant 3), under the gate.
-        let keys: Vec<LiveKey> = picked.iter().map(|_| LiveKey::fresh()).collect();
-        let mut rows: Vec<crate::catalog::LiveRow> = picked
-            .iter()
-            .zip(&keys)
-            .map(|((_, r), k)| {
-                let len = committed.get(&r.guid).copied().unwrap_or(r.len);
-                (*k.as_bytes(), (len, r.mtime))
-            })
-            .collect();
-        catalog.live_put_many(&rows)?;
+        // Each key from its source's identity and state. The store's length
+        // is what a clone holds (a row that lagged it after a crash between
+        // a store flush and a durable catalog commit, see `acquire`, does not
+        // count). The sources cannot change while `ns` and the pins are held.
+        let store = &self.storage.store;
         let srcs: Vec<[u8; 17]> = picked.iter().map(|(_, r)| layer_file_id(&r.guid)).collect();
-        let dsts: Vec<[u8; 17]> = keys.iter().map(|k| live_file_id(k.as_bytes())).collect();
-        let pairs: Vec<(&[u8], &[u8])> = srcs
-            .iter()
-            .zip(&dsts)
-            .map(|(s, d)| (s.as_slice(), d.as_slice()))
-            .collect();
-        let lens = match self.storage.store.clone_files(&pairs) {
-            Ok(lens) => lens,
-            Err(e) => {
-                let raw: Vec<[u8; 16]> = keys.iter().map(|k| *k.as_bytes()).collect();
-                if let Err(r) = catalog.live_remove_many(&raw) {
-                    tracing::error!(error = %r, "freeze: removing the rows of a failed clone failed");
-                    self.storage
-                        .needs_reconcile("a failed freeze left live rows without store files");
-                }
-                return Err(e.into());
+        let src_refs: Vec<&[u8]> = srcs.iter().map(|s| s.as_slice()).collect();
+        let mut keys = Vec::with_capacity(picked.len());
+        let mut infos = Vec::with_capacity(picked.len());
+        for ((_, r), d) in picked.iter().zip(store.content_digests(&src_refs)?) {
+            let (len, digest) = d.ok_or(aether_block_store::Error::NotFound)?;
+            let state = SourceState {
+                len,
+                mtime: r.mtime,
+                digest,
+            };
+            keys.push(LiveKey::derive(self.id, &r.guid, &state));
+            infos.push(LiveInfo {
+                len,
+                mtime: r.mtime,
+            });
+        }
+
+        // Keys with a row already name exactly these bytes: nothing to do
+        // (idempotence). The rest, each once, get a row and then a clone
+        // (invariant 3), under the gate.
+        let raw: Vec<[u8; 16]> = keys.iter().map(|k| *k.as_bytes()).collect();
+        let mut fresh: Vec<usize> = Vec::new();
+        let mut seen_keys = HashSet::new();
+        for (i, row) in catalog.live_get_many(&raw)?.into_iter().enumerate() {
+            match row {
+                Some((len, mtime)) => debug_assert_eq!(
+                    LiveInfo { len, mtime },
+                    infos[i],
+                    "a live key derived for other bytes"
+                ),
+                None if seen_keys.insert(keys[i]) => fresh.push(i),
+                None => {}
             }
-        };
-        // The store's length is what the clone holds. A row that lagged it
-        // (a crash between a store flush and a durable catalog commit, see
-        // `acquire`) takes it.
-        if rows.iter().zip(&lens).any(|(r, l)| r.1.0 != *l) {
-            for (r, l) in rows.iter_mut().zip(&lens) {
-                r.1.0 = *l;
-            }
-            catalog.live_put_many(&rows)?;
+        }
+        if !fresh.is_empty() {
+            self.freeze_new(&fresh, &srcs, &keys, &infos)?;
         }
         drop(pins);
         Ok(Some(
             picked
                 .into_iter()
                 .zip(keys)
-                .zip(rows)
-                .map(|(((path, _), key), (_, (len, mtime)))| FrozenFile {
-                    path,
-                    key,
-                    info: LiveInfo { len, mtime },
-                })
+                .zip(infos)
+                .map(|(((path, _), key), info)| FrozenFile { path, key, info })
                 .collect(),
         ))
+    }
+
+    /// Rows, then clones, for the sources at `fresh` (indexes into `srcs`,
+    /// `keys` and `infos`), whose keys have no row. Called by `try_freeze`
+    /// under the `live` lock, the gate and `ns`.
+    ///
+    /// A store file that already exists for such a key is an orphan: a
+    /// row-less `b'F'` id can only be a clone whose row is gone (a
+    /// `delete_live` whose store delete failed; one in progress holds the
+    /// `live` lock) or never became durable (deleted at the next open). It is
+    /// deleted first, so the clone recreates it from the source.
+    fn freeze_new(
+        &self,
+        fresh: &[usize],
+        srcs: &[[u8; 17]],
+        keys: &[LiveKey],
+        infos: &[LiveInfo],
+    ) -> Result<(), StorageError> {
+        let s = &self.storage;
+        let dsts: Vec<[u8; 17]> = fresh
+            .iter()
+            .map(|&i| live_file_id(keys[i].as_bytes()))
+            .collect();
+        for d in &dsts {
+            if s.store.stat(d)?.is_some() {
+                tracing::warn!("freeze: deleting an orphan live file before recreating it");
+                s.ram.invalidate_file(d);
+                match s.store_delete(d) {
+                    Ok(()) | Err(aether_block_store::Error::NotFound) => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+        let rows: Vec<crate::catalog::LiveRow> = fresh
+            .iter()
+            .map(|&i| (*keys[i].as_bytes(), (infos[i].len, infos[i].mtime)))
+            .collect();
+        s.catalog.live_put_many(&rows)?;
+        let pairs: Vec<(&[u8], &[u8])> = fresh
+            .iter()
+            .zip(&dsts)
+            .map(|(&i, d)| (srcs[i].as_slice(), d.as_slice()))
+            .collect();
+        match s.store.clone_files(&pairs) {
+            Ok(lens) => {
+                debug_assert!(
+                    fresh.iter().zip(&lens).all(|(&i, l)| infos[i].len == *l),
+                    "a pinned source changed length"
+                );
+                Ok(())
+            }
+            Err(e) => {
+                let raw: Vec<[u8; 16]> = rows.iter().map(|r| r.0).collect();
+                if let Err(r) = s.catalog.live_remove_many(&raw) {
+                    tracing::error!(error = %r, "freeze: removing the rows of a failed clone failed");
+                    s.needs_reconcile("a failed freeze left live rows without store files");
+                }
+                Err(e.into())
+            }
+        }
     }
 }

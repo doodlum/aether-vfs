@@ -2,8 +2,9 @@
 
 Date: 2026-10-13
 Status: implemented (`aether-storage` module `live`, `aether-block-store`
-`BlockStore::clone_files`). Requested by Mauvi (its `D01-live-content.md`, item U1, and
-DEC-014: "AE-2").
+`BlockStore::clone_files` and `BlockStore::content_digests`). Requested by Mauvi (its
+`D01-live-content.md`, item U1, and DEC-014: "AE-2"). Amended the same day for **idempotent
+freeze** (Mauvi DEC-050, "AE-9"): keys are derived, not random (§3.2, §4, §6, §10).
 
 ## 1. Goal
 
@@ -23,6 +24,10 @@ Constraints:
 - **Crash safe and consistent with `DURABILITY.md`.** A key the host has been given is
   durable; a crash never leaves a key that names other bytes, or half a file.
 - **Enumerable.** The host must list a layer's files and its `.wh.` whiteouts.
+- **Idempotent** (DEC-050). After a crash the host re-runs its whole session end, which
+  starts by freezing the scratch layer again. Freezing an unchanged file again must return
+  the same key and create nothing, so a crash between the freeze and the host's own commit
+  leaks no live file.
 
 **Done means:** the API below exists; a frozen file reads back unchanged after its source
 is rewritten in place, replaced, or its layer deleted, and after a reopen of the storage
@@ -64,11 +69,42 @@ impl BlockStore {
 - It is the block store's second API addition after `file_ids` (block-store spec §3 lists
   the public API; §14 is amended).
 
+### 3.1a Block store: `content_digests`
+
+```rust
+impl BlockStore {
+    /// Per file: (length, BLAKE3 digest of the length and each slot's block content hash,
+    /// a marker for a missing slot), or None if the file does not exist. One read txn.
+    pub fn content_digests(&self, file_ids: &[&[u8]]) -> Result<Vec<Option<(u64, [u8; 32])>>>;
+}
+```
+
+- Hashes the 128-bit dedup hash each slot's `blocks` row already keeps, so it reads a
+  segment per 4096 blocks and a `blocks` row per block, and no pack. Equal digests mean
+  equal bytes and length; any write that changes a byte or the length changes it;
+  compaction (which moves blocks, not content) does not. A missing slot is not the same as
+  a block of zeros.
+- The block store's third API addition (block-store spec §14 amended likewise).
+
 ### 3.2 Storage: live keys
 
-A **live key** is 16 random bytes (UUID v4). Its store file is `b'F' + key` (17 bytes;
-`ids.rs` gains `StoreIdKind::Live`). Its string form is `live-` followed by 32 lowercase hex
-digits; that string is what a host stores. Keys are never reused.
+A **live key** is 16 bytes **derived from the source file's identity and state**:
+
+```text
+key = BLAKE3-derive-key("aether-storage 2026-10-13 live key v1",
+                        layer_id (u64 LE) || guid (16) || len (u64 LE) || mtime (i64 LE)
+                        || content_digest (32))[..16]
+```
+
+`layer_id` is the catalog's layer id, `guid` the layer file's GUID, `len` and
+`content_digest` the store file's (`content_digests`, §3.1a), `mtime` the catalog row's.
+BLAKE3's derive-key mode is a keyed hash whose key comes from the context string, so these
+keys cannot collide with any other BLAKE3 use in the system. The context string is fixed
+forever: changing it would change every key and break idempotence across versions.
+
+Its store file is `b'F' + key` (17 bytes; `ids.rs` gains `StoreIdKind::Live`). Its string
+form is `live-` followed by 32 lowercase hex digits; that string is what a host stores. A
+key always names one content: the same key is only ever derived for the same bytes (§10).
 
 The catalog gains a table `live`: `key → (len, mtime)`. `mtime` is the source row's.
 
@@ -104,8 +140,10 @@ impl LiveFile {
   catalog.
 - **`freeze(layer, paths)`**: freezes each named file, in order, and returns one
   `FrozenFile` per path (`path` echoes the argument). A path that is missing or a directory
-  fails the whole call with `NotFound` / `BadRequest`; nothing is frozen. Freezing a path
-  twice gives two keys. `NoSuchLayer` for a missing layer. An empty `paths` does nothing.
+  fails the whole call with `NotFound` / `BadRequest`; nothing is frozen. **Idempotent**:
+  a file whose current state already has a live key returns that key and costs nothing;
+  a path named twice in one call (or two spellings of it) gives the same key twice and one
+  live file. `NoSuchLayer` for a missing layer. An empty `paths` does nothing.
 - **`freeze_layer(layer)`**: freezes every `File` entry (not whiteouts, copy-up leftovers
   or directories) under one namespace lock, so the listing and the freeze agree; `path` is
   the original-case path. This is the session-end call.
@@ -120,22 +158,33 @@ impl LiveFile {
 - **`delete_live`**: removes the keys' rows, runs a durable point, then deletes their store
   files (catalog first, store second, as `delete_layer`), and returns how many existed.
   Unknown keys are ignored. A `LiveFile` still open on a deleted key fails its next reads.
+  It runs under the storage's `live` lock (§4). Freezing the unchanged source again later
+  **recreates the same key** over the same bytes (§10).
 
 ## 4. Freeze: what it does
 
 Under the layer's provider (the live one if a session has the layer open, else a new one;
 `delete_layer` is refused while it exists, so the layer cannot vanish mid-freeze):
 
-1. Take the durability gate **shared**, then the layer's `ns` lock. Resolve the rows.
+1. Take the storage's `live` lock, the durability gate **shared**, then the layer's `ns`
+   lock. Resolve the rows.
 2. For each selected file that has an open cell (a handle is open on it), `try_read` its
    state lock and keep the guard. If a `try_read` fails (a write or commit holds it), or
    the cell has dirty blocks, release everything, commit dirty open cells (each under its
    own state lock, as a `flush` would), and go back to 1. After 8 rounds the call fails with
    `LayerInUse`.
-3. Put the `live` rows (one non-durable catalog commit), then `clone_files` every
+3. Read the sources' `content_digests` (one store read transaction) and derive each key
+   (§3.2). Read the keys' `live` rows: a key that has one already names exactly these
+   bytes and is done. The rest (each distinct key once) are new.
+4. For the new keys: delete any `b'F' + key` store file that exists anyway (an orphan, see
+   §10), put their `live` rows (one non-durable catalog commit), then `clone_files` every
    `(b'L' + guid, b'F' + key)` pair (one non-durable store commit). If the clone fails the
-   rows are removed again (a failed removal marks the session for reconciliation).
-4. Release the locks and run a **durable point**. Only then are the keys returned.
+   rows are removed again (a failed removal marks the session for reconciliation). When
+   every key existed this step writes nothing.
+5. Release the locks and run a **durable point** (it skips its fsyncs when nothing is
+   pending, so a re-freeze of frozen files costs none; but if an earlier attempt's rows are
+   still non-durable, this makes them durable before the keys are returned). Only then are
+   the keys returned.
 
 So a frozen file is the file **as readers of the layer saw it** at the freeze: dirty blocks
 were committed first, and no write or commit can run on a selected open file between the
@@ -144,7 +193,9 @@ cannot be opened meanwhile (`ns` is held), so cannot be written.
 
 **Lock order.** The documented order is a cell's `state`, then `gate`, then `ns`. Freeze
 takes `state` after `ns`, but only with `try_read`, which never waits, so it adds no
-wait-for edge. `DURABILITY.md` records this exception.
+wait-for edge. `DURABILITY.md` records this exception. The `live` lock is outermost: a
+freeze takes it before the gate (holding nothing), `delete_live` holds it across its
+durable point, and nothing that holds the gate, `ns` or a `state` takes it.
 
 ## 5. Lifetime and GC
 
@@ -156,9 +207,10 @@ wait-for edge. `DURABILITY.md` records this exception.
 - Nothing in `aether-storage` deletes a live file except `delete_live`. Live files are not
   counted against the cache budget, are never evicted, and `clear_cache` ignores them.
 - **Leaks.** A host that crashes after `freeze` returned and before it recorded the keys
-  leaves live files nobody references. `live_keys` lists every key so the host can sweep
-  (delete what its database does not name). Mauvi v1 deletes nothing; the sweep is for
-  later.
+  and then re-runs the freeze over the same, unchanged layer gets the same keys back, so
+  nothing leaks (DEC-050). A host that never re-freezes (or whose layer changed in
+  between) still leaves keys nobody references; `live_keys` lists every key so it can
+  sweep (delete what its database does not name). Mauvi v1 deletes nothing.
 - `space_usage` reports live files as a new `live` bucket; `stats` gains `live_files`.
 
 ## 6. Durability and crash behaviour
@@ -170,7 +222,9 @@ Follows `DURABILITY.md`'s invariants, with live rows playing the part of layer r
 2. **Durable on return**: freeze runs a durable point before returning keys. A crash before
    it returns loses the freeze entirely (rows were never durable; a clone the store's own
    auto-flush made durable is an orphan `b'F'` id, which reconciliation deletes). A crash
-   after it returns loses nothing.
+   after it returns loses nothing. Either way **a retry returns the same keys**: the key
+   depends only on the source's state, which a crash after the source's own durable point
+   does not change (§10).
 3. **Delete** (invariant 2): rows first, durably, then the store delete. A crash between
    leaves an orphan, deleted at the next open.
 4. **Reconciliation** at open, extended: a `b'F'` store id with no `live` row is an orphan
@@ -201,26 +255,84 @@ Unit tests in `src/live/tests.rs`, in the style of `layer/tests`:
 | freeze of a missing path or a directory freezes nothing | batch atomicity |
 | `layer_entries` lists files, directories, whiteouts with original case | enumeration |
 | `live_info`, `live_keys`, `delete_live`, key string round trip, bad key strings | the rest |
+| freeze twice (and after a clean reopen): same keys, same store file ids, no fsync, refcounts OK | idempotence |
+| a freeze cut short (rows and clones, store flushed, no durable point), killed, reopened, retried; and retried in the live process; killed after it returned, retried | crash then retry: same keys |
+| rewrite in place (same GUID), then replace by rename with the same bytes (new GUID): new keys each time, old keys keep old bytes | a rewritten file gets a new key |
+| delete and recreate a layer with equal paths and bytes, and a twin layer: no key collides; `derive` separates layer ids | no collisions |
+| `delete_live`, freeze again: same key; with the store delete failed (an orphan left): same key, the orphan replaced | delete then re-freeze |
 | `read_at` past the end, unaligned ranges across blocks | reads |
 
 `aether-block-store` gains unit tests for `clone_files`: refcounts (via `verify`), writing
 the source or the clone leaves the other unchanged, deleting either keeps the other,
-`NotFound` / `AlreadyExists` commit nothing, multi-segment files.
+`NotFound` / `AlreadyExists` commit nothing, multi-segment files; and for
+`content_digests`: equal for a clone and for equal bytes written separately, changed by a
+write, a shrink or a missing slot, restored with the old bytes, unchanged by compaction.
 
 ## 8. Out of scope
 
 - A read-only `Provider` over `(path → live key)` entries (Mauvi's U2, which DEC-014
   replaced with a Mauvi-side provider).
-- Content-addressed keys (freezing equal bytes twice gives two keys). The manifests are a
-  few bytes per block and the blocks are shared, so the cost is small; see §9.
+- Purely content-addressed keys (equal bytes in two files, or two layers, give two keys:
+  the key includes the layer and the GUID). The manifests are a few bytes per block and the
+  blocks are shared, so the cost is small.
 - Freezing directories or whiteouts: a whiteout carries no bytes; the host records it from
   `layer_entries`.
 
 ## 9. Open questions for the owner
 
-- Should keys be **content-derived** (a hash of the block hashes and length) so that a
-  re-run of session end after a crash returns the same keys instead of leaking the first
-  set? It needs a per-block index read at freeze and a refcount per key (two freezes of the
-  same bytes share one store file).
+- ~~Should keys be content-derived so that a re-run of session end after a crash returns
+  the same keys?~~ Decided by DEC-050: keys are derived from the source's identity and
+  content (§3.2, §10). No refcount per key: a key is shared only by re-freezes of the same
+  file state, and the host deletes it once.
 - Should `delete_live` defer the store delete while a `LiveFile` is open, as layer files do
   for open handles? Not needed for Mauvi v1, which never deletes.
+
+## 10. Idempotent freeze: the cases
+
+The key is a function of `(layer id, GUID, len, mtime, content digest)`. What follows from
+that, case by case:
+
+- **Re-freeze of an unchanged file** (a later call, the same call twice, another spelling,
+  after a reopen): same inputs, same key; its row exists, so no row, no clone, no fsync.
+  The returned `LiveInfo` equals the first freeze's.
+- **Rewritten since the last freeze.** In place (the overlay reuses the GUID): bytes or
+  length change the content digest; a write that leaves bytes and length as they were but
+  touches the file changes `mtime`. Either gives a new key. By replacement (a rename over
+  it, or delete and create): a new random GUID, so a new key even for identical bytes. A
+  write that restores the exact earlier state (bytes, length and mtime) gives the earlier
+  key back, which still names exactly those bytes. Old keys keep their bytes.
+- **A layer deleted and recreated with the same name.** Layer ids come from the catalog's
+  `next_layer_id` counter and are never reused, and every file of the new layer gets a new
+  random GUID; either alone separates the keys. The counter could only restart with a new
+  catalog, and opening a store whose catalog is missing while it holds `b'L'` or `b'F'`
+  ids is refused (reconciliation's "catalog lost" check), so a restarted counter never
+  meets old live files.
+- **Two layers with the same GUID.** Cannot happen: every GUID is a fresh UUID v4 at file
+  creation (`namespace.rs`, `put_files`, `import_layer`), and a GUID names a store file, so
+  sharing one would already be a bug. The layer id is in the key regardless. Even a
+  128-bit collision of the whole derivation would only map one key to the same `(len,
+  digest)` it already names, since the digest is an input; the residual risk is BLAKE3's.
+- **Crash safety.** Rows are committed before the clone and both before the durable point
+  (§6). A crash before the durable point loses rows and orphans the clone, which the next
+  open deletes; the retry derives the same keys (the source's state is as of its last
+  durable point, which the freeze itself does not change) and recreates them. A failed
+  durable point leaves the rows non-durable in the running process; the retry finds them,
+  writes nothing and runs the durable point. A crash after the freeze returned keeps
+  everything; the retry finds every row and does nothing. A store file `b'F' + key` with no
+  row at freeze time can only be an orphan (a `delete_live` whose store delete failed, or
+  a clone whose row never became durable before reconciliation ran); the freeze deletes it
+  and clones afresh. The `live` lock keeps a `delete_live` in progress (row gone, store
+  file not yet) from being mistaken for one.
+- **`delete_live` then re-freeze.** The source unchanged, the same key is derived and,
+  having no row, is recreated over the same bytes. So deletion is not permanent while the
+  source state exists; a host that deletes a key and must not see it again should delete
+  or change the source layer first. That is the useful behaviour for DEC-050 (a re-run
+  session end recreates exactly what it recorded) and is harmless otherwise: a key never
+  names other bytes, so a stale reader, a stale RAM-tier block or a host record of the key
+  stays correct.
+- **Existing tests.** "Freezing a path twice gives two keys" became "one key"
+  (`a_failed_freeze_freezes_nothing`). Tests that need an unknown key use a random one
+  (`LiveKey::fresh`, now test-only), which no freeze derives.
+- **Cost.** A freeze now reads one `blocks` row per source block (the digest) before
+  deciding; the clone of a new key costs as before. A re-freeze costs the digest read and
+  one catalog read.

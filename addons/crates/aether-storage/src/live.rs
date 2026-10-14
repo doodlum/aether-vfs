@@ -1,12 +1,20 @@
 //! Live keys: layer files frozen into immutable, addressable files.
 //!
 //! [`Storage::freeze`] turns files of a layer into **live files**: each gets a
-//! fresh random [`LiveKey`] and a store file of its own (`b'F'` + key) whose
+//! [`LiveKey`] derived from the file's identity and state (layer id, GUID,
+//! length, mtime and content digest), and a store file of its own (`b'F'` +
+//! key) whose
 //! manifest names the same blocks as the layer file's
 //! (`aether_block_store::BlockStore::clone_files`), so no byte is copied and
 //! nothing that later happens to the layer — a rewrite in place, a
 //! replacement, a removal, `delete_layer` — changes what the key reads. Only
 //! [`Storage::delete_live`] removes a live file.
+//!
+//! **Freeze is idempotent.** Freezing a file whose state a live key already
+//! covers returns that key and writes nothing, so a host that re-runs its
+//! session end after a crash gets the same keys and leaks none. A key always
+//! names the same bytes: a file rewritten since (a new GUID, or new bytes,
+//! length or mtime) freezes to a new key.
 //!
 //! The catalog's `live` table holds each key's length and mtime. A freeze
 //! commits the rows before the clone, under the shared durability gate, and
@@ -26,7 +34,9 @@ use crate::ids::{Guid, live_file_id};
 use crate::layer::Select;
 use crate::storage::{Storage, StorageError};
 
-/// The handle to one frozen file's bytes. Stable, never reused, and
+/// The handle to one frozen file's bytes. Stable (it names the same bytes
+/// for as long as it exists, and if a freeze of the identical source state
+/// recreates it after [`Storage::delete_live`], the same bytes again) and
 /// serializable: its string form is `live-` followed by 32 lowercase hex
 /// digits ([`fmt::Display`] and [`FromStr`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -45,9 +55,44 @@ impl LiveKey {
         &self.0
     }
 
+    /// The key of one source state: layer `layer_id`'s file `guid`, with
+    /// this length, mtime and store content digest
+    /// (`aether_block_store::BlockStore::content_digests`). A keyed BLAKE3
+    /// hash (its derive-key mode, under a context string of its own)
+    /// truncated to 128 bits, so a freeze of the same unchanged file always
+    /// gives the same key, and any change of layer, file, bytes, length or
+    /// mtime gives another.
+    pub(crate) fn derive(layer_id: u64, guid: &Guid, src: &SourceState) -> Self {
+        let mut h = blake3::Hasher::new_derive_key(KEY_CONTEXT);
+        h.update(&layer_id.to_le_bytes())
+            .update(guid)
+            .update(&src.len.to_le_bytes())
+            .update(&src.mtime.to_le_bytes())
+            .update(&src.digest);
+        let mut out = [0u8; 16];
+        out.copy_from_slice(&h.finalize().as_bytes()[..16]);
+        LiveKey(out)
+    }
+
+    /// A random key, which no freeze derives (tests' unknown keys).
+    #[cfg(test)]
     pub(crate) fn fresh() -> Self {
         LiveKey(crate::ids::new_guid())
     }
+}
+
+/// The derive-key context of [`LiveKey::derive`]. Changing it changes every
+/// key a freeze derives, which breaks idempotence across versions: never.
+const KEY_CONTEXT: &str = "aether-storage 2026-10-13 live key v1";
+
+/// What a frozen key covers besides the file's identity.
+pub(crate) struct SourceState {
+    /// The store file's length (the clone's).
+    pub len: u64,
+    /// The catalog row's mtime.
+    pub mtime: i64,
+    /// The store file's content digest.
+    pub digest: [u8; 32],
 }
 
 impl fmt::Display for LiveKey {
@@ -207,6 +252,15 @@ impl Storage {
     /// when this returns; a crash before it returns loses the whole freeze.
     /// The layer itself is not changed. `LayerInUse` if writes keep racing
     /// the freeze (see the design doc).
+    ///
+    /// **Idempotent**: the key is derived from the file's layer, GUID,
+    /// length, mtime and content, so freezing an unchanged file again (in a
+    /// later call, or twice in one batch, under any spelling of its path)
+    /// returns the same key and creates nothing; only files without a live
+    /// file yet cost a row and a clone. A file rewritten since (in place or
+    /// by replacement) or merely touched gets a new key. After
+    /// [`Storage::delete_live`], freezing the unchanged file recreates the
+    /// same key over the same bytes.
     pub fn freeze(
         self: &Arc<Self>,
         layer: &str,
@@ -269,8 +323,14 @@ impl Storage {
     /// keys are ignored). Their rows go first and durably (a durable point),
     /// then their store files: a crash in between leaves orphans that
     /// reconciliation at the next open deletes. A [`LiveFile`] still open on
-    /// a deleted key fails its later reads.
+    /// a deleted key fails its later reads (until a freeze of the identical
+    /// source state recreates the key, when they read the same bytes again).
+    ///
+    /// Runs under the storage's `live` lock, which a freeze also takes, so a
+    /// freeze never sees a key's row gone with its store file still there
+    /// and mistakes it for an orphan.
     pub fn delete_live(&self, keys: &[LiveKey]) -> Result<u64, StorageError> {
+        let _live = crate::util::lock(&self.live_lock);
         let raw: Vec<[u8; 16]> = keys.iter().map(|k| k.0).collect();
         let gone = self.catalog.live_remove_many(&raw)?;
         if gone.is_empty() {
@@ -370,7 +430,8 @@ impl LiveFile {
             )));
         }
         // A delete racing this read may leave the block in the tier after
-        // its invalidate: harmless, as keys are never reused.
+        // its invalidate: harmless, as a key only ever names one content
+        // (a freeze that recreates it recreates the same bytes).
         Ok(s.ram.fill(&self.id, b, data))
     }
 }
