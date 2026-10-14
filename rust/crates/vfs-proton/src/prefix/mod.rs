@@ -118,12 +118,14 @@ impl From<io::Error> for PrefixError {
 pub struct PrefixLock {
     // Held, never read: closing the file releases the lock — every
     // descriptor for it, including the one a launch's host watch holds
-    // (`crate::launch::HostWatch`).
+    // (`crate::launch::HostWatch`). Only that watch reads it, and it is Unix-only.
+    #[cfg_attr(not(unix), allow(dead_code))]
     file: std::fs::File,
 }
 
 impl PrefixLock {
     /// The locked file, for a process that is to hold the lock too.
+    #[cfg(unix)]
     pub(crate) fn file(&self) -> &std::fs::File {
         &self.file
     }
