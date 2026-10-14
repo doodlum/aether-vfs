@@ -170,6 +170,37 @@ pub fn remove(t: &mut Tables<'_>, file_id: &[u8], block_size: u32) -> Result<Opt
     Ok(Some(ids))
 }
 
+/// Makes `dst` a file with `src`'s length and the same block ids, taking one more reference
+/// to each block. A slot whose block row is gone (a healed block) is copied as missing.
+/// Returns `src`'s length, or `None` if `src` does not exist. `dst` must not exist.
+/// One segment in memory at a time.
+pub fn copy(t: &mut Tables<'_>, src: &[u8], dst: &[u8], block_size: u32) -> Result<Option<u64>> {
+    let Some(seg0) = t.segment(src, 0)? else {
+        return Ok(None);
+    };
+    let len = file_len(&seg0);
+    for s in 0..segment_count(block_count(len, block_size)) {
+        let value = if s == 0 {
+            seg0.clone()
+        } else {
+            t.segment(src, s)?.ok_or_else(|| missing_segment(src, s))?
+        };
+        let mut slots = decode_ids(&value, s);
+        for id in &mut slots {
+            if *id == MISSING {
+                continue;
+            }
+            if t.block(*id)?.is_some() {
+                t.incref(*id)?;
+            } else {
+                *id = MISSING;
+            }
+        }
+        t.put_segment(dst, s, &encode_segment((s == 0).then_some(len), &slots))?;
+    }
+    Ok(Some(len))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

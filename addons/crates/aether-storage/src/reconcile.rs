@@ -24,8 +24,12 @@
 //! - a layer file row whose length differs from the store's (the row is
 //!   updated after the blocks, and only a durable point publishes it): the
 //!   row takes the store's length, which is what the data says;
-//! - a `b'L'` or `b'C'` store id no catalog row names (a create whose row
-//!   never became durable, or a delete that never reached the store): deleted;
+//! - a `b'L'`, `b'C'` or `b'F'` store id no catalog row names (a create or
+//!   freeze whose row never became durable, or a delete that never reached
+//!   the store): deleted;
+//! - a live row whose store file is missing (no write order produces one):
+//!   dropped, reported in [`ReconcileReport::lost_live`], and logged at
+//!   error level;
 //! - a cache row whose store file is missing: dropped, so the cache budget
 //!   counts only what the store holds; and a cache row that counts no bytes
 //!   (created by a fetch whose block write never landed): dropped, and its
@@ -46,7 +50,7 @@ use std::sync::RwLock;
 use aether_block_store::{BlockStore, CompactOptions};
 
 use crate::catalog::Catalog;
-use crate::ids::{StoreIdKind, cache_file_id, classify_store_id, layer_file_id};
+use crate::ids::{StoreIdKind, cache_file_id, classify_store_id, layer_file_id, live_file_id};
 use crate::layer_io::RUN_BLOCKS;
 use crate::storage::{Storage, StorageError};
 
@@ -67,6 +71,9 @@ pub struct ReconcileReport {
     /// Layer file rows whose length disagreed with the store's, now set to
     /// the store's: `(layer name, folded path)`.
     pub resized_rows: Vec<(String, String)>,
+    /// Live rows whose store file was missing, dropped: their keys (as
+    /// `live-<hex>` strings) now read as unknown.
+    pub lost_live: Vec<String>,
     /// Store files no catalog row referenced, deleted.
     pub orphans_deleted: u64,
     /// Cache rows whose store file was missing, or that counted no bytes,
@@ -123,9 +130,12 @@ pub(crate) fn reconcile(
 ) -> Result<ReconcileReport, StorageError> {
     let store_ids = store.file_ids()?;
     if !catalog.has_layer_history()?
-        && store_ids
-            .iter()
-            .any(|id| matches!(classify_store_id(id), StoreIdKind::Layer(_)))
+        && store_ids.iter().any(|id| {
+            matches!(
+                classify_store_id(id),
+                StoreIdKind::Layer(_) | StoreIdKind::Live(_)
+            )
+        })
     {
         let dir = catalog_path.parent().unwrap_or(catalog_path);
         tracing::error!(
@@ -248,12 +258,26 @@ pub(crate) fn reconcile(
         }
     }
 
+    for (k, _) in catalog.live_all()? {
+        let id = live_file_id(&k);
+        if store.stat(&id)?.is_some() {
+            known.insert(id);
+            continue;
+        }
+        let key = crate::LiveKey::from_bytes(k).to_string();
+        tracing::error!(key = %key, "live file missing from the store: its row is dropped");
+        match catalog.live_remove_many(&[k]) {
+            Ok(_) => report.lost_live.push(key),
+            Err(e) => repair_failed(&mut report, format!("dropping the row of {key}"), &e),
+        }
+    }
+
     for id in store_ids {
         match classify_store_id(&id) {
             StoreIdKind::Foreign => {
                 tracing::warn!(id = ?id, "store holds a file id aether-storage never writes; left alone");
             }
-            StoreIdKind::Layer(_) | StoreIdKind::Cache(_) => {
+            StoreIdKind::Layer(_) | StoreIdKind::Cache(_) | StoreIdKind::Live(_) => {
                 let key: [u8; 17] = id.as_slice().try_into().expect("classified as 17 bytes");
                 if known.contains(&key) {
                     continue;

@@ -11,6 +11,7 @@
 //!   root, and case-folded with [`vfs_core::fold`]; the original case is kept in
 //!   [`EntryRec::name`].
 //! - `cache_files`: cache identity hash → `(last access minute, logical bytes)`.
+//! - `live`: live key → `(len, mtime)` of a frozen file (module `crate::live`).
 //! - `meta`: counters, and `clean_close` (present only from a clean close to
 //!   the next open: see [`crate::Storage::open`]).
 //!
@@ -34,6 +35,7 @@ const LAYERS: TableDefinition<&str, u64> = TableDefinition::new("layers");
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
 const ENTRIES: TableDefinition<(u64, &str), &[u8]> = TableDefinition::new("entries");
 const CACHE_FILES: TableDefinition<[u8; 16], (u64, u64)> = TableDefinition::new("cache_files");
+const LIVE: TableDefinition<[u8; 16], (u64, i64)> = TableDefinition::new("live");
 
 const META_NEXT_LAYER_ID: &str = "next_layer_id";
 /// Present only between a clean close and the next open: the random token
@@ -94,6 +96,9 @@ impl EntryRec {
         })
     }
 }
+
+/// One `live` row: a live key and its `(len, mtime)`.
+pub(crate) type LiveRow = ([u8; 16], (u64, i64));
 
 /// One cached file's eviction bookkeeping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,6 +163,7 @@ impl Catalog {
             txn.open_table(META).map_err(db_err)?;
             txn.open_table(ENTRIES).map_err(db_err)?;
             txn.open_table(CACHE_FILES).map_err(db_err)?;
+            txn.open_table(LIVE).map_err(db_err)?;
             Ok(())
         })?;
         Ok(c)
@@ -486,6 +492,24 @@ impl Catalog {
         })
     }
 
+    /// Every row of `layer`, root included, as `(folded path, row)` in key
+    /// order (a directory before everything under it), from one read
+    /// transaction.
+    pub fn layer_rows(&self, layer: u64) -> Result<Vec<(String, EntryRec)>, StorageError> {
+        self.entries(|t| {
+            let mut out = Vec::new();
+            for e in t.range((layer, "")..).map_err(db_err)? {
+                let (k, v) = e.map_err(db_err)?;
+                let (l, path) = k.value();
+                if l != layer {
+                    break;
+                }
+                out.push((path.to_owned(), EntryRec::decode(v.value())?));
+            }
+            Ok(out)
+        })
+    }
+
     /// Every layer file, as `(layer id, folded path, GUID)`.
     pub fn all_layer_guids(&self) -> Result<Vec<(u64, String, Guid)>, StorageError> {
         self.entries(|t| {
@@ -555,6 +579,56 @@ impl Catalog {
         for e in t.iter().map_err(db_err)? {
             let (k, v) = e.map_err(db_err)?;
             out.push((k.value(), cache_rec(v.value())));
+        }
+        Ok(out)
+    }
+
+    /// Inserts live rows `(key, (len, mtime))`, in one non-durable commit.
+    pub fn live_put_many(&self, rows: &[LiveRow]) -> Result<(), StorageError> {
+        self.write(false, |txn| {
+            let mut t = txn.open_table(LIVE).map_err(db_err)?;
+            for (k, v) in rows {
+                t.insert(k, *v).map_err(db_err)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Removes the live rows of `keys`, in one non-durable commit, and
+    /// returns the keys that had one.
+    pub fn live_remove_many(&self, keys: &[[u8; 16]]) -> Result<Vec<[u8; 16]>, StorageError> {
+        self.write(false, |txn| {
+            let mut t = txn.open_table(LIVE).map_err(db_err)?;
+            let mut gone = Vec::new();
+            for k in keys {
+                if t.remove(k).map_err(db_err)?.is_some() {
+                    gone.push(*k);
+                }
+            }
+            Ok(gone)
+        })
+    }
+
+    /// The live row of each of `keys`, from one read transaction.
+    pub fn live_get_many(
+        &self,
+        keys: &[[u8; 16]],
+    ) -> Result<Vec<Option<(u64, i64)>>, StorageError> {
+        let txn = self.db.begin_read().map_err(db_err)?;
+        let t = txn.open_table(LIVE).map_err(db_err)?;
+        keys.iter()
+            .map(|k| Ok(t.get(k).map_err(db_err)?.map(|g| g.value())))
+            .collect()
+    }
+
+    /// Every live row, in key order.
+    pub fn live_all(&self) -> Result<Vec<LiveRow>, StorageError> {
+        let txn = self.db.begin_read().map_err(db_err)?;
+        let t = txn.open_table(LIVE).map_err(db_err)?;
+        let mut out = Vec::new();
+        for e in t.iter().map_err(db_err)? {
+            let (k, v) = e.map_err(db_err)?;
+            out.push((k.value(), v.value()));
         }
         Ok(out)
     }

@@ -174,6 +174,10 @@ pub struct Storage {
     /// durable point, after its catalog commit. A leaf lock, pushed to under
     /// a layer's `ns` right after the row's removal committed.
     pub(crate) doomed: Mutex<Vec<Guid>>,
+    /// Serializes a freeze's row-and-clone step with `delete_live`, which
+    /// holds it throughout. Outermost: a freeze takes it before the gate,
+    /// and nothing holding the gate, a layer lock or a cell's state takes it.
+    pub(crate) live_lock: Mutex<()>,
     /// Test hook: `import_layer` fails when it reaches this layer path.
     #[cfg(test)]
     pub(crate) fail_import_at: Mutex<Option<String>>,
@@ -290,6 +294,7 @@ impl Storage {
             clock,
             scratch,
             doomed: Mutex::new(Vec::new()),
+            live_lock: Mutex::new(()),
             #[cfg(test)]
             fail_import_at: Mutex::new(None),
             #[cfg(test)]
