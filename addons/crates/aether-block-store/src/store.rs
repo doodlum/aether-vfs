@@ -25,6 +25,9 @@ use crate::{crash, files};
 /// own clean shutdown.
 const CLEAN_PLAIN: u64 = 1;
 
+/// A file's length and content digest, as [`BlockStore::content_digests`] returns them.
+pub type ContentDigest = (u64, [u8; 32]);
+
 /// Metadata of a stored file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileInfo {
@@ -452,6 +455,56 @@ impl BlockStore {
         Ok(lens)
     }
 
+    /// A digest of each file's length and content, in order, or `None` for a file that does
+    /// not exist: BLAKE3 over the length and, slot by slot, the block's content hash (the
+    /// 128-bit dedup hash its `blocks` row keeps), with a fixed marker for a missing slot
+    /// (never written, or healed away). So equal digests mean equal lengths and equal bytes,
+    /// and any change of a file's bytes or length changes its digest; moving blocks between
+    /// packs (compaction) does not.
+    ///
+    /// One index read transaction; a manifest segment per 4096 blocks and a `blocks` row per
+    /// block are read, no pack I/O.
+    pub fn content_digests(&self, file_ids: &[&[u8]]) -> Result<Vec<Option<ContentDigest>>> {
+        for id in file_ids {
+            self.check_id(id)?;
+        }
+        let bs = self.cfg.block_size;
+        let r = self.index.read()?;
+        let mut out = Vec::with_capacity(file_ids.len());
+        for id in file_ids {
+            let Some(seg0) = r.segment(id, 0)? else {
+                out.push(None);
+                continue;
+            };
+            let len = file_len(&seg0);
+            drop(seg0);
+            let mut h = blake3::Hasher::new_derive_key("aether-block-store content digest v1");
+            h.update(&len.to_le_bytes());
+            for s in 0..segment_count(block_count(len, bs)) {
+                let value = r
+                    .segment(id, s)?
+                    .ok_or_else(|| Error::Corrupt(format!("manifest segment {s} missing")))?;
+                for bid in decode_ids(&value, s) {
+                    match (bid != MISSING)
+                        .then(|| r.block(bid))
+                        .transpose()?
+                        .flatten()
+                    {
+                        Some(loc) => {
+                            h.update(&[1]);
+                            h.update(&loc.hash);
+                        }
+                        None => {
+                            h.update(&[0]);
+                        }
+                    }
+                }
+            }
+            out.push(Some((len, *h.finalize().as_bytes())));
+        }
+        Ok(out)
+    }
+
     /// Cached byte ranges of a file, merged and in order.
     pub fn cached_ranges(&self, file_id: &[u8]) -> Result<Vec<Range<u64>>> {
         self.check_id(file_id)?;
@@ -770,6 +823,42 @@ pub(crate) mod tests {
         store.close().unwrap();
         let store = BlockStore::open(dir.path(), test_config()).unwrap();
         assert_eq!(read_all(&store, b"a2"), a);
+    }
+
+    /// Digests follow bytes and length, not file ids, block ids or packs.
+    #[test]
+    fn content_digests_follow_content() {
+        let dir = vfs_testkit::tempdir().unwrap();
+        let store = BlockStore::open(dir.path(), test_config()).unwrap();
+        let a = random_bytes(7, 3 * BS + 9);
+        put(&store, b"a", &a).unwrap();
+        store.clone_files(&[(b"a", b"a2")]).unwrap();
+        put(&store, b"b", &a).unwrap();
+        let d = |ids: &[&[u8]]| store.content_digests(ids).unwrap();
+        let first = d(&[b"a", b"a2", b"b", b"nope"]);
+        assert_eq!(first[0].unwrap().0, a.len() as u64);
+        assert_eq!(first[0], first[1], "a clone");
+        assert_eq!(first[0], first[2], "equal bytes written separately");
+        assert_eq!(first[3], None);
+        // A write in place, a shrink and a missing slot each change it.
+        store.write_blocks(b"b", 1, &random_bytes(8, BS)).unwrap();
+        let after_write = d(&[b"b"])[0];
+        assert_ne!(after_write, first[0]);
+        store.write_blocks(b"b", 1, &a[BS..2 * BS]).unwrap();
+        assert_eq!(d(&[b"b"])[0], first[0], "the old bytes back");
+        store.set_len(b"b", 2 * BS as u64).unwrap();
+        assert_ne!(d(&[b"b"])[0], first[0]);
+        store.set_len(b"c", 2 * BS as u64).unwrap();
+        assert_ne!(d(&[b"c"])[0], d(&[b"b"])[0], "missing is not data");
+        // Compaction moves blocks, not content.
+        store.delete(b"b").unwrap();
+        store
+            .compact(crate::CompactOptions {
+                min_garbage_ratio: 0.0,
+                max_bytes: u64::MAX,
+            })
+            .unwrap();
+        assert_eq!(d(&[b"a"])[0], first[0]);
     }
 
     /// A refused batch commits nothing.
