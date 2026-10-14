@@ -21,6 +21,7 @@ use windows_sys::Win32::System::Threading::{
     STARTUPINFOW,
 };
 
+use crate::tree::{finish_code, Job, ProcessTree};
 use crate::{InjectError, RunConfig};
 
 /// The primary thread's stack for a virtualised process. The shim adds frames
@@ -362,16 +363,81 @@ unsafe fn fail_closed(pi: &PROCESS_INFORMATION, e: InjectError) -> InjectError {
     e
 }
 
-/// Launch the target with the shim.
+/// Launch the target with the shim, and wait for it (unless `cfg.detach`).
 ///
 /// A target exe that imports the shim first (staging patched it) is started
-/// normally ([`run_import_activated`]). Any other is injected, the
+/// normally ([`start_import_activated`]). Any other is injected, the
 /// way SKSE injects its DLL: created suspended, its primary stack grown to
 /// [`PRIMARY_STACK_BYTES`], the shim `LoadLibrary`'d on a remote thread (which
 /// runs process initialisation and then the shim's bootstrap), and resumed
 /// only once the shim's ready file says it is up. Any failure kills it before
 /// it has run.
+///
+/// **Waits for the first process only.** This is what `vfs-injector.exe` runs
+/// inside Wine, where the Proton launch watches the whole prefix instead; a
+/// host that needs the whole process tree uses [`spawn_target_with_shim`].
 pub fn run_target_with_shim(cfg: RunConfig) -> Result<i32, InjectError> {
+    publish_launch_env(&cfg);
+    let started = start_target(&cfg, None)?;
+    // SAFETY: `started.process` is the live handle `start_target` handed over;
+    // it is closed on every path below.
+    unsafe {
+        if cfg.detach {
+            CloseHandle(started.process);
+            return Ok(0);
+        }
+        if WaitForSingleObject(started.process, INFINITE) != 0 {
+            CloseHandle(started.process);
+            return Err(InjectError::Wait);
+        }
+        let code = exited(started.process);
+        CloseHandle(started.process);
+        match code {
+            Some(c) => finish_code(started.import_activated, c),
+            None => Err(InjectError::ExitCode),
+        }
+    }
+}
+
+/// Launch the target with the shim, exactly as [`run_target_with_shim`]
+/// does, inside a Job Object, and return once it is running.
+///
+/// The target is assigned to the job while it is still suspended, before any
+/// of its code (or the shim's) has run, so everything it starts inherits the
+/// job: the returned [`ProcessTree`] ends when the last of them exits, and
+/// reports the first process's exit code. `cfg.detach` is ignored.
+///
+/// A target that cannot be put in a job (the host is in one that forbids
+/// nesting) is launched anyway and tracked alone: see
+/// [`ProcessTree::untracked_reason`].
+pub fn spawn_target_with_shim(cfg: RunConfig) -> Result<ProcessTree, InjectError> {
+    publish_launch_env(&cfg);
+    let (mut job, no_job) = match Job::new() {
+        Ok(j) => (Some(j), None),
+        Err(e) => (
+            None,
+            Some(format!(
+                "no job for the launch ({e}), so it ends when the launched process exits, \
+                 not when everything it started has"
+            )),
+        ),
+    };
+    let started = start_target(&cfg, job.as_mut())?;
+    // SAFETY: `started.process` is live and owned; the tree takes it over.
+    Ok(unsafe {
+        ProcessTree::new(
+            started.process,
+            started.pid,
+            started.import_activated,
+            job,
+            no_job,
+        )
+    })
+}
+
+/// The process-wide environment a launched target inherits, and a clean
+/// slate for its ready file.
+fn publish_launch_env(cfg: &RunConfig) {
     std::env::set_var(vfs_env::SHIM_CONFIG, &cfg.config_path);
     std::env::set_var(vfs_env::SHIM_READY, &cfg.ready_path);
     // Where the shim says which children it killed; descendants inherit it.
@@ -395,9 +461,22 @@ pub fn run_target_with_shim(cfg: RunConfig) -> Result<i32, InjectError> {
         }
     }
     let _ = std::fs::remove_file(&cfg.ready_path);
+}
 
+/// A target that is running with its shim up.
+struct Started {
+    /// Its process handle, owned by the receiver. The thread handle is closed.
+    process: HANDLE,
+    pid: u32,
+    /// It imported the shim itself — see [`finish_code`].
+    import_activated: bool,
+}
+
+/// Start the target with the shim (see [`run_target_with_shim`]) and, when
+/// `job` is given, assign it to the job before it runs.
+fn start_target(cfg: &RunConfig, job: Option<&mut Job>) -> Result<Started, InjectError> {
     if crate::exe_imports_shim(&cfg.target_exe) {
-        return run_import_activated(&cfg);
+        return start_import_activated(cfg, job);
     }
 
     let timeout_ms = u32::try_from(cfg.ready_timeout.as_millis()).unwrap_or(u32::MAX - 1);
@@ -406,12 +485,8 @@ pub fn run_target_with_shim(cfg: RunConfig) -> Result<i32, InjectError> {
         let mut pi: PROCESS_INFORMATION = zeroed();
         // Staging puts the EXE and its import closure on disk, so the loader
         // resolves everything itself — see `vfs-director::stage`.
-        let mut cmdline = format!("\"{}\"", cfg.target_exe);
-        for a in &cfg.args {
-            cmdline.push_str(&format!(" \"{a}\""));
-        }
+        let mut cmd_w = wide(&command_line(cfg));
         let app_w = wide(&cfg.target_exe);
-        let mut cmd_w = wide(&cmdline);
         let cwd_w = cfg.current_dir.as_ref().map(|s| wide(s));
         let mut si: STARTUPINFOW = zeroed();
         si.cb = size_of::<STARTUPINFOW>() as u32;
@@ -432,6 +507,12 @@ pub fn run_target_with_shim(cfg: RunConfig) -> Result<i32, InjectError> {
         );
         if ok == 0 {
             return Err(InjectError::CreateProcess);
+        }
+
+        // Before anything of the target runs — the remote thread below runs
+        // its process initialisation — so nothing it starts escapes the job.
+        if let Some(job) = job {
+            job.adopt(pi.hProcess);
         }
 
         // Best-effort — a failure resumes with the stock stack rather than
@@ -477,43 +558,40 @@ pub fn run_target_with_shim(cfg: RunConfig) -> Result<i32, InjectError> {
         }
 
         ResumeThread(pi.hThread);
-
-        if cfg.detach {
-            CloseHandle(pi.hThread);
-            CloseHandle(pi.hProcess);
-            return Ok(0);
-        }
-
-        if WaitForSingleObject(pi.hProcess, INFINITE) != 0 {
-            CloseHandle(pi.hThread);
-            CloseHandle(pi.hProcess);
-            return Err(InjectError::Wait);
-        }
-        let mut code: u32 = 0;
-        let got = GetExitCodeProcess(pi.hProcess, &mut code);
         CloseHandle(pi.hThread);
-        CloseHandle(pi.hProcess);
-        if got == 0 {
-            return Err(InjectError::ExitCode);
-        }
-        Ok(code as i32)
+        Ok(Started {
+            process: pi.hProcess,
+            pid: pi.dwProcessId,
+            import_activated: false,
+        })
     }
 }
 
-/// Start a target whose exe imports the shim first. No suspend, no
-/// payload, no remote thread: the loader runs the shim's `DllMain` before any
-/// other import initialises, and a failed bootstrap fails process start there.
-/// This only starts the process and reports how it ended.
-fn run_import_activated(cfg: &RunConfig) -> Result<i32, InjectError> {
+/// The target's command line: its path and each argument, quoted.
+fn command_line(cfg: &RunConfig) -> String {
     let mut cmdline = format!("\"{}\"", cfg.target_exe);
     for a in &cfg.args {
         cmdline.push_str(&format!(" \"{a}\""));
     }
+    cmdline
+}
+
+/// Start a target whose exe imports the shim first. No payload, no remote
+/// thread: the loader runs the shim's `DllMain` before any other import
+/// initialises, and a failed bootstrap fails process start there. Returns
+/// once the shim has said something in its ready file, or the target has
+/// exited.
+///
+/// Created suspended only to be assigned to `job` before it runs, then
+/// resumed at once; without a job it is started running, as it always was.
+fn start_import_activated(cfg: &RunConfig, job: Option<&mut Job>) -> Result<Started, InjectError> {
+    let mut cmd_w = wide(&command_line(cfg));
     let app_w = wide(&cfg.target_exe);
-    let mut cmd_w = wide(&cmdline);
     let cwd_w = cfg.current_dir.as_ref().map(|s| wide(s));
     let started = Instant::now();
-    // SAFETY: CreateProcessW with valid, NUL-terminated buffers; handles closed below.
+    let flags = if job.is_some() { CREATE_SUSPENDED } else { 0 };
+    // SAFETY: CreateProcessW with valid, NUL-terminated buffers; the thread
+    // handle is closed here and the process handle handed to the caller.
     unsafe {
         let mut pi: PROCESS_INFORMATION = zeroed();
         let mut si: STARTUPINFOW = zeroed();
@@ -524,7 +602,7 @@ fn run_import_activated(cfg: &RunConfig) -> Result<i32, InjectError> {
             core::ptr::null(),
             core::ptr::null(),
             0,
-            0,
+            flags,
             core::ptr::null(),
             cwd_w
                 .as_ref()
@@ -535,6 +613,10 @@ fn run_import_activated(cfg: &RunConfig) -> Result<i32, InjectError> {
         );
         if ok == 0 {
             return Err(InjectError::CreateProcess);
+        }
+        if let Some(job) = job {
+            job.adopt(pi.hProcess);
+            ResumeThread(pi.hThread);
         }
         CloseHandle(pi.hThread);
         // Report when the shim said ready, for the timing comparison.
@@ -553,20 +635,11 @@ fn run_import_activated(cfg: &RunConfig) -> Result<i32, InjectError> {
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        if cfg.detach {
-            CloseHandle(pi.hProcess);
-            return Ok(0);
-        }
-        WaitForSingleObject(pi.hProcess, INFINITE);
-        let code = exited(pi.hProcess);
-        CloseHandle(pi.hProcess);
-        match code {
-            // The loader refused to start it: the shim was missing or its
-            // DllMain failed. Nothing of the program ran.
-            Some(c @ (0xC000_0135 | 0xC000_0142)) => Err(InjectError::TargetExited(c)),
-            Some(c) => Ok(c as i32),
-            None => Err(InjectError::ExitCode),
-        }
+        Ok(Started {
+            process: pi.hProcess,
+            pid: pi.dwProcessId,
+            import_activated: true,
+        })
     }
 }
 

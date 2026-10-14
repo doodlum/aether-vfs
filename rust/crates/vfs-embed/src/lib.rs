@@ -124,7 +124,7 @@ pub use session::{
     compose_root, Activation, LaunchExit, LaunchOpts, RegistrySync, Session, StageOpts,
     STOPPED_EXIT_CODE,
 };
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub use session::{LaunchHandle, LaunchStopper};
 /// How a Proton launch sets up its Wine prefix — see [`Session::set_prefix_init`].
 #[cfg(unix)]

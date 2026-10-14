@@ -368,6 +368,13 @@ pub const FIXTURE_LINGER_MS: &str = "VFS_FIXTURE_LINGER_MS";
 /// `vfs-fixture-read`: after the first read, run a second copy of the fixture
 /// and fail unless it succeeds (it can only if the shim injected it).
 pub const FIXTURE_SPAWN_CHILD: &str = "VFS_FIXTURE_SPAWN_CHILD";
+/// `vfs-fixture-read`: after the first read, start a copy of the fixture that
+/// outlives it (the process-tree e2e), signalling through files in this
+/// directory: `parent-gone`, `release`, `child-released`.
+pub const FIXTURE_ORPHAN_DIR: &str = "VFS_FIXTURE_ORPHAN_DIR";
+/// `vfs-fixture-read`: set by the fixture on its orphan copy, to the parent's
+/// pid; never set by a host.
+pub const FIXTURE_ORPHAN_OF: &str = "VFS_FIXTURE_ORPHAN_OF";
 /// `vfs-fixture-read`: a file read on slow threads while others read
 /// `FIXTURE_PATH` (the concurrent-read e2e).
 pub const FIXTURE_SLOW_PATH: &str = "VFS_FIXTURE_SLOW_PATH";
@@ -793,6 +800,16 @@ pub const ALL: &[Var] = &[
         name: FIXTURE_SPAWN_CHILD,
         kind: Kind::Fixture,
         default: "unset: no child",
+    },
+    Var {
+        name: FIXTURE_ORPHAN_DIR,
+        kind: Kind::Fixture,
+        default: "unset: no orphan",
+    },
+    Var {
+        name: FIXTURE_ORPHAN_OF,
+        kind: Kind::Fixture,
+        default: "unset: not the orphan",
     },
     Var {
         name: FIXTURE_SLOW_PATH,

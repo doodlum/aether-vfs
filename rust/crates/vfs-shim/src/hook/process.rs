@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 use windows_sys::Win32::Foundation::{CloseHandle, SetLastError, ERROR_PROCESS_ABORTED, HANDLE};
 use windows_sys::Win32::System::Threading::{
     QueryFullProcessImageNameW, ResumeThread, TerminateProcess, WaitForSingleObject,
-    CREATE_SUSPENDED, PROCESS_INFORMATION, STARTUPINFOW,
+    CREATE_BREAKAWAY_FROM_JOB, CREATE_SUSPENDED, PROCESS_INFORMATION, STARTUPINFOW,
 };
 
 /// `kernelbase!CreateProcessInternalW` — the funnel under all CreateProcess*.
@@ -34,7 +34,8 @@ pub(super) static SELF_DLL: OnceLock<String> = OnceLock::new();
 
 /// `CreateProcessInternalW` hook: force the child to start suspended, inject
 /// the shim (which bootstraps inside its `LoadLibrary`), then resume, unless the
-/// caller asked for a suspended child, which it gets still suspended.
+/// caller asked for a suspended child, which it gets still suspended. The child
+/// is never let out of the launch's job: see [`child_creation_flags`].
 ///
 /// **Fails closed.** Every child this hook creates is injected, and if that
 /// fails for any reason (no shim DLL path, a LoadLibrary failure, the child's shim reporting failure, the child dying, or no ready
@@ -81,7 +82,7 @@ pub(super) unsafe fn cpiw_hook_body(
         None => cur_dir,
     };
 
-    let forced = flags | CREATE_SUSPENDED;
+    let forced = child_creation_flags(flags);
     // SAFETY: the original NT function, called with valid NT arguments.
     let r = unsafe {
         tramp(
@@ -139,6 +140,25 @@ pub(super) unsafe fn cpiw_hook_body(
         }
     }
     r
+}
+
+/// The creation flags the hook creates a child with: the caller's, plus
+/// `CREATE_SUSPENDED` (the child is injected before it runs), minus
+/// `CREATE_BREAKAWAY_FROM_JOB`.
+///
+/// A Windows launch is a Job Object (`vfs_inject::spawn_target_with_shim`)
+/// that every process of the session inherits, and the launch ends when the
+/// job is empty. A child that broke away would be neither waited for nor
+/// stopped, yet it is injected and would go on doing file I/O through the VFS
+/// after the host has seen the launch end, and outlive the host. So the flag
+/// is dropped, and the child stays in the job like any other. The job does not
+/// allow breakaway (no `JOB_OBJECT_LIMIT_BREAKAWAY_OK`), so a request that got
+/// through would fail with `ERROR_ACCESS_DENIED`; without the flag nothing is
+/// asked of the job and creation cannot fail on its account. Outside a job of
+/// the launch's (one that could not get a job, or under Wine) the child stays
+/// in whatever job its parent is in, as every other child does. See docs/shim-invariants.md, "Children stay in the launch's job".
+fn child_creation_flags(flags: u32) -> u32 {
+    (flags | CREATE_SUSPENDED) & !CREATE_BREAKAWAY_FROM_JOB
 }
 
 /// Whether the child's EXE imports the shim first (staging patched it).
@@ -257,4 +277,24 @@ unsafe fn child_image(app: *const u16, cmd: *const u16) -> String {
         };
     }
     String::from_utf16_lossy(&w).replace(['\r', '\n'], " ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::System::Threading::{CREATE_NEW_CONSOLE, CREATE_UNICODE_ENVIRONMENT};
+
+    #[test]
+    fn a_child_is_always_created_suspended_and_never_breaks_away_from_the_job() {
+        let caller = CREATE_UNICODE_ENVIRONMENT | CREATE_NEW_CONSOLE;
+        assert_eq!(child_creation_flags(caller), caller | CREATE_SUSPENDED);
+        assert_eq!(
+            child_creation_flags(caller | CREATE_BREAKAWAY_FROM_JOB),
+            caller | CREATE_SUSPENDED
+        );
+        assert_eq!(
+            child_creation_flags(CREATE_SUSPENDED | CREATE_BREAKAWAY_FROM_JOB),
+            CREATE_SUSPENDED
+        );
+    }
 }
