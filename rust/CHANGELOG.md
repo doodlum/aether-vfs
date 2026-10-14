@@ -4,6 +4,18 @@ Changes to the host-facing API of `vfs-embed`, `vfs-proton`, `vfs-provider`
 and `vfs-env` that a host (Haskill) has to adapt to or can start using. Newest
 first. Internal refactors are in the git history, not here.
 
+## Unreleased (path identity)
+
+### Added
+
+- `vfs_embed::{fold_path, paths_equal, fold_segment}`: "are these two paths
+  the same file?", answered by the Director's own normalisation and the
+  engine's own fold (`vfs_core::fold`), for a host that stores vpaths.
+  `PathEscapesRoot` is the error for a `..` above the root.
+  `FOLD_VERSION` (now `1`) and `fold_unicode_version()` let a host that
+  persists folded keys detect a change in the fold. Contract:
+  `docs/superpowers/specs/2026-10-13-export-case-fold-design.md`.
+
 ## Unreleased (add-ons)
 
 ### Removed

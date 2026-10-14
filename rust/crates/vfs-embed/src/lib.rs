@@ -80,6 +80,16 @@
 //! enough. [`Session::stage_launch`] is the same sequence exposed, for seeding
 //! staging from something other than this session's graph.
 //!
+//! ## Path identity
+//!
+//! A host that keeps its own records of vpaths must decide "same file?" the
+//! way the graph does. [`fold_path`] and [`paths_equal`] are that decision,
+//! built from the Director's own normalisation and the engine's own fold
+//! rather than a copy of either; [`fold_segment`] is the fold of one name.
+//! Their docs state the contract, including the stability promise
+//! ([`FOLD_VERSION`], [`fold_unicode_version`]) a host storing folded keys
+//! depends on.
+//!
 //! ## What a host still has to build for itself
 //!
 //! Written down because the alternative is each new host rediscovering it.
@@ -114,12 +124,19 @@
 
 #![deny(unsafe_code)]
 
+mod fold;
 pub mod image;
 mod session;
 mod sources;
 #[cfg(test)]
 mod test_scratch;
 
+// Path identity — "are these two paths the same file?" — answered by the
+// engine's own normalise and fold, for a host that keeps its own records of
+// vpaths. See the module docs for the contract and its stability.
+pub use fold::{
+    fold_path, fold_segment, fold_unicode_version, paths_equal, PathEscapesRoot, FOLD_VERSION,
+};
 pub use session::{
     compose_root, Activation, LaunchExit, LaunchOpts, RegistrySync, Session, StageOpts,
     STOPPED_EXIT_CODE,
