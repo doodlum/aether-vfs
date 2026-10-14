@@ -27,7 +27,7 @@ mod stage;
 #[cfg(windows)]
 mod windows;
 
-pub use compose::compose_root;
+pub use compose::{compose_root, compose_root_routed};
 pub use opts::{Activation, LaunchOpts, StageOpts};
 #[cfg(unix)]
 pub use proton::{LaunchHandle, LaunchStopper};

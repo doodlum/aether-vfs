@@ -354,6 +354,11 @@ exercises the case the asymmetry describes. `vfs-embed/src/session.rs` records
 the gap. Treat the `readdir` union as design intent awaiting implementation, not
 as behaviour a host can rely on.
 
+**Implemented 2026-10-13** (`2026-10-13-write-routes-design.md`): `readdir` is
+now the union, each entry kept from the child that owns its full path; a
+rename between two routes' owners is a move; and the router reports the
+strongest access of its children, refusing writes per path.
+
 ### Registry
 
 `type` maps to a factory function. Built-ins (`disk`, `zip`, `memory`,

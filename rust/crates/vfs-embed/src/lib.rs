@@ -60,6 +60,11 @@
 //! getting that wrong produces a session that reads correctly and silently
 //! cannot be written to.
 //!
+//! [`compose_root_routed`] adds **write routes** above the write layer
+//! ([`Session::route_at`]): paths a provider owns outright, so a writable
+//! synthesized file (a memory `plugins.txt`) takes the game's writes instead
+//! of being copied up into the write layer.
+//!
 //! [`RootSources`] is the incremental form of the same rule, for a host that
 //! learns about its sources one at a time (a config being applied, an RPC
 //! stream, a UI) and must rebuild a root's mount list from scratch each time.
@@ -121,8 +126,8 @@ mod sources;
 mod test_scratch;
 
 pub use session::{
-    compose_root, Activation, LaunchExit, LaunchOpts, RegistrySync, Session, StageOpts,
-    STOPPED_EXIT_CODE,
+    compose_root, compose_root_routed, Activation, LaunchExit, LaunchOpts, RegistrySync, Session,
+    StageOpts, STOPPED_EXIT_CODE,
 };
 #[cfg(unix)]
 pub use session::{LaunchHandle, LaunchStopper};
