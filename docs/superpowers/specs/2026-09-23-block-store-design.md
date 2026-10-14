@@ -142,6 +142,7 @@ store.read(file_id, offset, &mut buf)?;              // -> ReadResult { bytes: u
 store.stat(file_id)?;                                // -> Option<FileInfo { len }>
 store.cached_ranges(file_id)?;                       // -> Vec<Range<u64>>
 store.delete(file_id)?;
+store.clone_files(&[(src, dst)])?;                   // -> Vec<u64> lengths; shares blocks (amendment 16)
 store.flush()?;
 store.compact(CompactOptions { min_garbage_ratio: 0.5, max_bytes })?;
 store.stats()?;                                      // per-pack size, live bytes, garbage ratio; healed-block count
@@ -447,3 +448,12 @@ Each was found while building and testing the design in full before writing the 
     `tracing::warn!` and retried on the next open, as retired packs already were. The next pack id
     is past every registered pack and every pack file on disk. `delete_retired` also requeues every
     unprocessed entry if removing a retired row fails.
+
+### Amendments after implementation
+
+16. **`clone_files(&[(src, dst)])`** (2026-10-13, for `aether-storage`'s live keys,
+    `2026-10-13-live-freeze-design.md`): makes each `dst` a new file whose manifest names
+    `src`'s block ids, increfing each, in one non-durable commit; no pack I/O. Missing `src` is
+    `NotFound`; an existing or repeated `dst` is the new `Error::AlreadyExists`; either commits
+    nothing. A healed slot is copied as missing. The two files are independent afterwards
+    (copy-on-write per slot, as for any shared block).

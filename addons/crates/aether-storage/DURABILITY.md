@@ -66,6 +66,7 @@ possible.
 | Same, and a durable point is **due** | durable point now | durable point now |
 | `Storage::sync`, `Storage::close`, last provider of a layer dropped | durable point | durable point |
 | Layer create, `import_layer`, `delete_layer` | durable point | durable point |
+| `Storage::freeze`, `freeze_layer`, `delete_live` | durable point | durable point |
 | Reconciliation at open (when it runs) | flush + durable commit | flush + durable commit |
 
 A durable point is **due** when the last one is at least `max_interval` old
@@ -166,12 +167,34 @@ crash between the two halves' commits left. It is skipped after a clean close:
 - The `layers` registry, then `gate` (a new layer is made durable while the
   registry is held; nothing holding the gate takes the registry).
 - Cache: `gate`, then `open_counts`, then `access`.
+- **The one exception: a freeze** (`layer/freeze.rs`) holds `gate` (shared) and
+  `ns`, then takes selected cells' `state` — but only with `try_read`, which
+  never waits, so it adds no wait-for edge. A `try_read` that fails sends the
+  freeze back out (everything released) to commit and retry.
 
 The gate is never taken recursively (shared or exclusive) by a thread that holds
 it. The exclusive holder takes nothing else during the fsyncs: a durable point
 takes `doomed` only briefly, before them, and no layer lock at all. A panic while
 the shared gate is held may leave a write pair half done, so the guard marks the
 session dirty (an `RwLock` reader's panic does not poison it).
+
+## Live files (freeze)
+
+A live file (`b'F'` + key, module `live`) is a layer file's store file cloned
+into one of its own: its manifest names the same blocks, each with one more
+reference, so nothing done to the layer afterwards reaches it. Its catalog row
+(`live`: key → length, mtime) plays the part of a layer row in the invariants:
+
+- A freeze writes the rows, then clones the store files (invariant 3), both under
+  one shared hold of the gate, then runs a durable point **before returning the
+  keys**. A crash before it returns loses the whole freeze (no row was durable; a
+  clone the store's auto-flush made durable is an orphan that reconciliation
+  deletes). A crash after it loses nothing.
+- `delete_live` removes the rows, runs a durable point, then deletes the store
+  files (invariant 2). It does not wait for open `LiveFile`s.
+- Reconciliation deletes `b'F'` ids without a row, and drops (and reports in
+  `ReconcileReport::lost_live`) a row whose store file is missing, which no write
+  order above produces. The "catalog lost" refusal counts `b'F'` ids as data.
 
 ## What a crash leaves
 

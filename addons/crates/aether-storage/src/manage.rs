@@ -43,6 +43,8 @@ pub struct StorageStats {
     /// what compaction can reclaim.
     pub live_bytes: u64,
     pub layer_count: u64,
+    /// Live (frozen) files: see [`Storage::freeze`].
+    pub live_files: u64,
 }
 
 /// Stored against logical bytes, per kind of store file:
@@ -53,6 +55,8 @@ pub struct SpaceUsage {
     pub cache: Usage,
     /// Every layer's files, by layer name.
     pub layers: std::collections::BTreeMap<String, Usage>,
+    /// Every live (frozen) file: see [`Storage::freeze`].
+    pub live: Usage,
     /// Store files that belong to no catalog row (layer files waiting for
     /// deletion at the next durable point, orphans).
     pub unlisted: Usage,
@@ -243,12 +247,14 @@ impl Storage {
         #[derive(Clone, PartialEq, Eq, Hash)]
         enum Kind {
             Cache,
+            Live,
             Layer(String),
             Unlisted,
         }
         let by = self.store.usage_by(|id| {
             Some(match classify_store_id(id) {
                 StoreIdKind::Cache(_) => Kind::Cache,
+                StoreIdKind::Live(_) => Kind::Live,
                 StoreIdKind::Layer(g) => owner.get(&g).cloned().map_or(Kind::Unlisted, Kind::Layer),
                 StoreIdKind::Foreign => Kind::Unlisted,
             })
@@ -257,6 +263,7 @@ impl Storage {
         for (k, u) in by {
             match k {
                 Kind::Cache => out.cache = u,
+                Kind::Live => out.live = u,
                 Kind::Layer(n) => {
                     out.layers.insert(n, u);
                 }
@@ -283,7 +290,8 @@ impl Storage {
         self.store.compression(class)
     }
 
-    /// Cache counters, the store's pack space, and the number of layers.
+    /// Cache counters, the store's pack space, and the numbers of layers and
+    /// live files.
     /// A failure to read the store's or catalog's figures is logged and
     /// reported as zero.
     pub fn stats(&self) -> StorageStats {
@@ -294,6 +302,13 @@ impl Storage {
             Err(e) => {
                 tracing::warn!(error = %e, "block store stats failed");
                 (0, 0)
+            }
+        };
+        let live_files = match self.catalog.live_all() {
+            Ok(v) => v.len() as u64,
+            Err(e) => {
+                tracing::warn!(error = %e, "catalog live list failed");
+                0
             }
         };
         let layer_count = match self.catalog.layer_names() {
@@ -308,6 +323,7 @@ impl Storage {
             pack_bytes,
             live_bytes,
             layer_count,
+            live_files,
         }
     }
 }

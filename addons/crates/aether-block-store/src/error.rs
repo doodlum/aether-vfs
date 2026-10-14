@@ -9,6 +9,9 @@ pub enum Error {
     Index(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("file not found")]
     NotFound,
+    /// The target of [`crate::BlockStore::clone_files`] exists already.
+    #[error("file already exists")]
+    AlreadyExists,
     #[error("write is not block-aligned")]
     Unaligned,
     #[error("block index out of range")]

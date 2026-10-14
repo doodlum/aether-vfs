@@ -34,6 +34,7 @@ use vfs_provider::{
 };
 
 mod batch;
+mod freeze;
 mod namespace;
 mod path;
 mod provider;
@@ -45,6 +46,7 @@ use crate::layer_io::{FileCell, FileState};
 use crate::storage::{Storage, StorageError};
 
 use crate::util::lock_status;
+pub(crate) use freeze::Select;
 use path::{LPath, folded_path};
 
 /// A file cell's state, shared: a read (see `layer_io`'s locking notes).
