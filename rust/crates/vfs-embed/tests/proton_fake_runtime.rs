@@ -109,6 +109,13 @@ echo "$@" > "$WINEPREFIX/fake-wine.args"
 echo $$ > "$WINEPREFIX/fake-wine.pid"
 case "$FAKE_WINE_MODE" in
   sleep) exec sleep 30 ;;
+  shared)
+    # What a game looks like from the host under Wine: its Windows image
+    # path as argv[0], working in its root (C:\Games\Fake links there).
+    ( cd "$WINEPREFIX/drive_c/Games/Fake" && exec bash -c 'exec -a "C:\Games\Fake\game.exe" sleep 30' ) </dev/null >/dev/null 2>&1 &
+    echo $! > "$WINEPREFIX/fake-game.pid"
+    touch "$WINEPREFIX/fake-wine.exited"
+    exit 0 ;;
   fail) echo "target-exited:0xc0000135" > "$5.injector-error"; exit 3 ;;
   game)
     touch "$WINEPREFIX/fake-game.run"
@@ -1209,4 +1216,91 @@ fn protons_own_prefix_setup_is_refused_under_crossover() {
     });
     let e = s.prepare_prefix().unwrap_err();
     assert!(e.contains("needs a GE-Proton runtime"), "{e}");
+}
+
+/// A fake Windows Steam client running in `pfx`, as Wine shows one: its
+/// image path as argv[0], working in the prefix. Killed on drop.
+struct FakeWindowsSteam(std::process::Child);
+
+impl FakeWindowsSteam {
+    fn start(pfx: &Path) -> Self {
+        let child = std::process::Command::new("bash")
+            .args([
+                "-c",
+                r#"exec -a "C:\Program Files (x86)\Steam\steam.exe" sleep 60"#,
+            ])
+            .current_dir(pfx)
+            .spawn()
+            .unwrap();
+        FakeWindowsSteam(child)
+    }
+
+    fn alive(&self) -> bool {
+        alive(self.0.id())
+    }
+}
+
+impl Drop for FakeWindowsSteam {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// A served session whose launches share their prefix, the prefix booted,
+/// and a fake Windows Steam running in it.
+fn shared_session(tag: &str) -> (Session, PathBuf, String, FakeWindowsSteam) {
+    let home = fake_home(tag);
+    let (mut s, pfx, shim) = session(tag, &home);
+    s.set_prefix_shared(true);
+    s.prepare_prefix().unwrap();
+    let steam = FakeWindowsSteam::start(&pfx);
+    (s, pfx, shim, steam)
+}
+
+fn game_pid(pfx: &Path) -> u32 {
+    wait_for(&pfx.join("fake-game.pid"));
+    let pid: u32 = std::fs::read_to_string(pfx.join("fake-game.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // Until it has exec'd it is still the subshell, not yet the "game".
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while vfs_unix::process_argv0(pid).as_deref() != Some(r"C:\Games\Fake\game.exe") {
+        assert!(Instant::now() < deadline, "the fake game never started");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    pid
+}
+
+#[test]
+fn a_shared_prefix_launch_runs_as_long_as_its_game_not_its_steam() {
+    let (s, pfx, shim, steam) = shared_session("shared-run");
+    let mut h = s.launch_detached(&opts(&shim, "shared", false)).unwrap();
+    let game = game_pid(&pfx);
+    wait_for(&pfx.join("fake-wine.exited"));
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(h.is_running(), "the game runs, so the launch does");
+
+    vfs_unix::signal(game, vfs_unix::Signal::Kill);
+    wait_gone(game);
+    ended(&mut h);
+    assert_eq!(h.try_wait().unwrap(), Some(LaunchExit::Exited(0)));
+    assert!(steam.alive(), "Steam is not the launch's");
+    assert!(!wineserver_was_killed(&pfx));
+}
+
+#[test]
+fn stopping_a_shared_prefix_launch_stops_its_game_and_leaves_steam() {
+    let (s, pfx, shim, steam) = shared_session("shared-stop");
+    let h = s.launch_detached(&opts(&shim, "shared", false)).unwrap();
+    let game = game_pid(&pfx);
+    assert_eq!(h.stop().unwrap(), LaunchExit::Stopped);
+    wait_gone(game);
+    assert!(steam.alive(), "stopping the game left Steam running");
+    assert!(
+        !wineserver_was_killed(&pfx),
+        "a shared prefix's wineserver is not the launch's to stop"
+    );
 }

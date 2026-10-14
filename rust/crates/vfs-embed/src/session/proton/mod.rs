@@ -60,6 +60,9 @@ pub(in crate::session) struct ProtonState {
     /// The Wine install [`Session::set_wine_host`] chose; `None` is this
     /// platform's default, resolved at launch.
     wine_host: Option<WineHost>,
+    /// Whether launches share the prefix — see
+    /// [`Session::set_prefix_shared`].
+    prefix_shared: bool,
     /// Whether `launch` starts Proton's Steam helper — see
     /// [`Session::set_steam_helper`].
     steam_helper: bool,
@@ -105,6 +108,7 @@ impl Default for ProtonState {
             home: None,
             prefix_init: PrefixInit::default(),
             wine_host: None,
+            prefix_shared: false,
             steam_helper: true,
             steam_state_dir: None,
             waiting: Mutex::new(None),
@@ -187,6 +191,38 @@ impl Session {
     #[cfg(unix)]
     pub fn set_wine_host(&mut self, host: WineHost) {
         self.proton.wine_host = Some(host);
+    }
+
+    /// Unix: whether a launch shares its prefix with programs it did not
+    /// start — above all a Windows Steam client, which a SteamStub-wrapped
+    /// game checks with and which must run in the game's own prefix (as it
+    /// does under CrossOver, which has no bridge to a native client). Off by
+    /// default: the launch has the prefix to itself, runs until the prefix
+    /// is quiet and is stopped with `wineserver -k`.
+    ///
+    /// Shared, the launch is its own processes only — Wine processes whose
+    /// image is under one of the session's locations and whose working
+    /// directory is the prefix's or the session's
+    /// (`vfs_proton::launch::LaunchProcesses`). It runs until the injector and
+    /// all of them have exited, and stopping it signals them, never the
+    /// prefix's `wineserver`, so a Steam client there keeps running. The
+    /// prefix is still locked to one launch at a time.
+    #[cfg(unix)]
+    pub fn set_prefix_shared(&mut self, shared: bool) {
+        self.proton.prefix_shared = shared;
+    }
+
+    /// The launch's own processes in `prefix`, for a shared prefix: under
+    /// the session's root locations or `C:\vfs-session`, working in the
+    /// prefix, the state directory or a root's backing directory.
+    #[cfg(unix)]
+    fn launch_processes(&self, prefix: &Prefix) -> vfs_proton::launch::LaunchProcesses {
+        let roots = self.root_locations();
+        let mut locations: Vec<String> = roots.iter().map(|r| r.location.clone()).collect();
+        locations.push(format!(r"C:\{WINE_LINK_DIR}"));
+        let mut dirs = vec![prefix.dir.clone(), self.state_dir().to_path_buf()];
+        dirs.extend(roots.iter().filter_map(|r| self.root_backing_dir(r.id)));
+        vfs_proton::launch::LaunchProcesses::new(locations, dirs)
     }
 
     /// The Wine install a launch uses: [`Session::set_wine_host`]'s, else
@@ -612,16 +648,22 @@ impl Session {
             })?;
         let wine = self.wine_launch(opts, ipc, &ring, resolved, &booted)?;
 
+        let shared = self
+            .proton
+            .prefix_shared
+            .then(|| self.launch_processes(&booted.prefix));
         let child = vfs_proton::launch::spawn(&wine).map_err(|e| format!("launch: {e}"))?;
         let BootedPrefix { host, prefix, lock } = booted;
         let handle = LaunchHandle {
-            child,
             stopper: LaunchStopper(Arc::new(StopInner {
                 prefix,
                 host,
+                shared,
+                wine_pid: child.id(),
                 requested: AtomicBool::new(false),
                 ended: Mutex::new(false),
             })),
+            child,
             wine,
             wine_status: None,
             quiet: None,

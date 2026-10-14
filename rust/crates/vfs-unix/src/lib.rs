@@ -13,6 +13,6 @@ pub use mapping::FileMapping;
 #[cfg(unix)]
 mod process;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub use process::process_name;
+pub use process::{all_pids, process_argv0, process_cwd, process_name};
 #[cfg(unix)]
-pub use process::{effective_uid, process_alive};
+pub use process::{effective_uid, process_alive, signal, Signal};
