@@ -367,7 +367,10 @@ fn reads_that_timed_out_keep_their_permits_until_the_director_is_done() {
     let gate = DataGate::new(vfs_ipc::data_limit(4, 8));
     let plan = fx.plan();
     fx.with_workers(4, || {
-        let impatient = fx.client().with_deadline(Duration::from_millis(40));
+        // Long enough for a worker to take each read before it times out,
+        // even on a loaded box: one that times out still queued never puts
+        // the director inside it.
+        let impatient = fx.client().with_deadline(Duration::from_millis(200));
         let mut buf = vec![0u8; 100];
         for sent in 1..=3u32 {
             let r = read_fragmented(&impatient, &gate, &plan, FH_HELD, 0, &mut buf);
@@ -491,7 +494,7 @@ fn a_timed_out_request_retires_its_slot_until_the_late_reply_is_drained() {
     let gate = DataGate::new(8);
     let plan = fx.plan();
     fx.with_workers(2, || {
-        let impatient = fx.client().with_deadline(Duration::from_millis(40));
+        let impatient = fx.client().with_deadline(Duration::from_millis(100));
         let mut buf = vec![0u8; BANK];
         let t = Instant::now();
         let r = read_fragmented(&impatient, &gate, &plan, FH_SLOW, 0, &mut buf);
@@ -564,7 +567,7 @@ fn a_request_nobody_serves_times_out_and_frees_its_slot() {
 fn a_batch_that_times_out_gives_every_slot_back() {
     let fx = Fixture::new(4);
     fx.with_workers(3, || {
-        let c = fx.client().with_deadline(Duration::from_millis(40));
+        let c = fx.client().with_deadline(Duration::from_millis(100));
         let r = c.submit_many_held(&[
             (OP_ECHO, 0, b"a".to_vec()),
             (OP_SLEEP, 0, 250u64.to_le_bytes().to_vec()),
@@ -658,15 +661,21 @@ fn a_full_ring_is_waited_for_off_the_processor_and_not_for_ever() {
 }
 
 /// One deadline for a whole batch. Three requests served one after another,
-/// each taking 25 ms, against a 60 ms deadline: the third answers at 75 ms.
+/// each taking 100 ms, against a 150 ms deadline: the third answers at 300 ms.
 /// With a clock per request, started when its turn to be awaited came, each
 /// was "on time" and the call ran past its deadline without noticing.
+///
+/// The margins are wide on purpose. A reply already there is taken without
+/// looking at the clock, so a client descheduled from before the deadline
+/// until after the last reply sees none of the wait: with 25 ms naps and a
+/// 60 ms deadline that took only a 15 ms oversleep, which a loaded macOS box
+/// gives.
 #[test]
 fn a_batch_has_one_deadline_not_one_per_request() {
     let fx = Fixture::new(4);
     fx.with_workers(1, || {
-        let c = fx.client().with_deadline(Duration::from_millis(60));
-        let nap = 25u64.to_le_bytes().to_vec();
+        let c = fx.client().with_deadline(Duration::from_millis(150));
+        let nap = 100u64.to_le_bytes().to_vec();
         let r = c.submit_many_held(&[
             (OP_SLEEP, 0, nap.clone()),
             (OP_SLEEP, 0, nap.clone()),

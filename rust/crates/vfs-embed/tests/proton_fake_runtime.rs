@@ -329,12 +329,25 @@ struct FakeSteam {
 impl FakeSteam {
     fn start(tag: &str) -> Self {
         let dir = tmp(&format!("{tag}-fake-steam"));
-        // A script's process is named after the script, and `read` holds it
-        // on the pipe this keeps open.
+        // A process is named after the file it executes, so this is a copy
+        // of this test binary named `steam`, running only
+        // [`fake_steam_client`], which holds it on the pipe this keeps open.
+        // Not a script — macOS names that after its interpreter — nor a
+        // symlink, which macOS names after its target, nor a copy of a
+        // system binary such as `cat`, which macOS kills on launch from
+        // outside the system volume.
         let exe = dir.join("steam");
-        script(&exe, "read _");
+        std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
         let mut cmd = std::process::Command::new(&exe);
-        cmd.stdin(std::process::Stdio::piped());
+        cmd.args([
+            "--exact",
+            "fake_steam_client",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env(FAKE_STEAM, "1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null());
         let child = spawn_retrying_busy(&mut cmd);
         let state = dir.join("state");
         std::fs::create_dir_all(&state).unwrap();
@@ -347,6 +360,18 @@ impl Drop for FakeSteam {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+/// Set in [`FakeSteam`]'s process, and only there.
+const FAKE_STEAM: &str = "VFS_TEST_FAKE_STEAM_CLIENT";
+
+/// The body of [`FakeSteam`]'s process: wait for stdin to close. Does nothing
+/// in an ordinary test run.
+#[test]
+fn fake_steam_client() {
+    if std::env::var_os(FAKE_STEAM).is_some() {
+        let _ = std::io::copy(&mut std::io::stdin(), &mut std::io::sink());
     }
 }
 
@@ -658,10 +683,7 @@ fn a_second_launch_while_one_is_running_is_refused_before_staging_can_clobber_it
 
     let e = s.launch(&opts(&shim, "ok", true)).unwrap_err();
     assert!(e.contains("already running"), "{e}");
-    assert!(
-        Path::new(&format!("/proc/{pid}")).exists(),
-        "the first launch is still running"
-    );
+    assert!(alive(pid), "the first launch is still running");
     assert!(
         staged.is_file(),
         "the refused second launch must not delete the running one's staging"
@@ -701,10 +723,7 @@ fn a_launch_handle_reports_its_end_and_stops_when_dropped() {
     assert_eq!(h.try_wait().unwrap(), None);
     let pid = h.pid();
     drop(h);
-    assert!(
-        !Path::new(&format!("/proc/{pid}")).exists(),
-        "dropping a running handle stops it"
-    );
+    assert!(!alive(pid), "dropping a running handle stops it");
 
     // Remove the stale pid file and wait for the *new* launch's own pid
     // before stopping it — otherwise `stop` could observe the old (already
@@ -765,7 +784,7 @@ fn launcher_exited(pfx: &Path) -> u32 {
 }
 
 fn alive(pid: u32) -> bool {
-    Path::new(&format!("/proc/{pid}")).exists()
+    vfs_unix::process_alive(pid)
 }
 
 fn wait_gone(pid: u32) {
