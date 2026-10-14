@@ -142,7 +142,7 @@ impl ProtonState {
 /// The start of the error for "no runtime installed", shared by `launch` and
 /// `prepare_prefix`; `launch` appends the install hint.
 #[cfg(unix)]
-const NO_RUNTIME: &str = "no verified GE-Proton runtime under";
+const NO_RUNTIME: &str = vfs_proton::host::NO_RUNTIME;
 
 impl Session {
     /// Unix: the aether-vfs home `launch` takes GE-Proton runtimes
@@ -198,20 +198,7 @@ impl Session {
                 .map_err(|e| format!("{}: {e}", host.describe()))?;
             return Ok(host.clone());
         }
-        if cfg!(target_os = "macos") {
-            return vfs_proton::crossover::installed()
-                .map(WineHost::CrossOver)
-                .map_err(|e| {
-                    format!(
-                        "{e} (install CrossOver, or name it with {})",
-                        vfs_proton::crossover::APP_ENV
-                    )
-                });
-        }
-        vfs_proton::runtime::newest_installed(home)
-            .map_err(|e| format!("reading {}: {e}", home.runtimes().display()))?
-            .map(WineHost::Proton)
-            .ok_or_else(|| format!("{NO_RUNTIME} {}", home.runtimes().display()))
+        vfs_proton::host::default_host(home)
     }
 
     /// Unix: whether a launch in a [`PrefixInit::Proton`] prefix starts

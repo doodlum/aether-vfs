@@ -97,6 +97,29 @@ impl WineHost {
         }
     }
 
+    /// A `wine` command that runs a program in `prefix` — an installer, a
+    /// launcher, a tool — with this install's own environment: `WINEPREFIX`
+    /// and the runtime's library paths for Proton, `CX_ROOT` and the bottle
+    /// arguments for CrossOver. The program and its arguments are the
+    /// caller's to add. Unlike a launch, nothing is injected.
+    pub fn wine_command(&self, prefix: &Path) -> std::process::Command {
+        let mut cmd = std::process::Command::new(self.wine());
+        cmd.args(self.prefix_args(prefix))
+            .env("WINEDLLOVERRIDES", crate::launch::BASE_DLL_OVERRIDES)
+            .env("WINEDEBUG", crate::launch::DEFAULT_WINEDEBUG);
+        match self {
+            WineHost::Proton(rt) => {
+                let rt = std::path::absolute(rt).unwrap_or_else(|_| rt.clone());
+                cmd.env("WINEPREFIX", prefix)
+                    .envs(crate::runtime::runtime_lib_env_host(&rt));
+            }
+            WineHost::CrossOver(dir) => {
+                cmd.env("CX_ROOT", dir);
+            }
+        }
+        cmd
+    }
+
     /// One line naming the install, for errors and logs.
     pub fn describe(&self) -> String {
         match self {
@@ -108,6 +131,30 @@ impl WineHost {
         }
     }
 }
+
+/// This platform's default Wine host: CrossOver on macOS
+/// ([`crate::crossover::installed`]), the newest verified GE-Proton under
+/// `root`'s `runtimes/` elsewhere. `Err` says what is missing.
+pub fn default_host(root: &crate::Root) -> Result<WineHost, String> {
+    if cfg!(target_os = "macos") {
+        return crate::crossover::installed()
+            .map(WineHost::CrossOver)
+            .map_err(|e| {
+                format!(
+                    "{e} (install CrossOver, or name it with {})",
+                    crate::crossover::APP_ENV
+                )
+            });
+    }
+    crate::runtime::newest_installed(root)
+        .map_err(|e| format!("reading {}: {e}", root.runtimes().display()))?
+        .map(WineHost::Proton)
+        .ok_or_else(|| format!("{NO_RUNTIME} {}", root.runtimes().display()))
+}
+
+/// The start of [`default_host`]'s error when no GE-Proton runtime is
+/// installed.
+pub const NO_RUNTIME: &str = "no verified GE-Proton runtime under";
 
 #[cfg(test)]
 mod tests {
