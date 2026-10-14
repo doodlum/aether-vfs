@@ -23,7 +23,7 @@ doc has one row. Written for the 2026-10-07 cleanup pass (finding E12).
   host used it. Its two specs were archived; its e2e tests moved to `vfs-embed/tests/`. Older
   docs that mention it describe removed code.
 
-## Current (17)
+## Current (18)
 
 | Date | Doc | Kind | Status | Summary |
 |---|---|---|---|---|
@@ -44,6 +44,7 @@ doc has one row. Written for the 2026-10-07 cleanup pass (finding E12).
 | 2026-10-07 | [aether-vfs cleanup pass: implementation plan](plans/2026-10-07-cleanup.md) | plan | current | Task-by-task plan for the cleanup pass (in progress). |
 | 2026-10-07 | [Cleanup audit reports (director, embed, shim, storage)](specs/2026-10-07-cleanup-audit/) | audit | current | Four audit reports (director, embed, shim, storage) holding the detail behind every cleanup finding ID. |
 | 2026-10-07 | [aether-vfs: code cleanup pass](specs/2026-10-07-cleanup-design.md) | spec | current | The 2026-10 code cleanup pass: scope, streams, rules. |
+| 2026-10-13 | [`aether-storage`: freezing layer files into immutable live keys](specs/2026-10-13-live-freeze-design.md) | spec | current | Live keys: zero-copy freeze of layer files (`BlockStore::clone_files`), reads by key, enumeration; for Mauvi's per-session scratch layers. |
 
 ## Historical (79 rows, in `archive/`)
 
