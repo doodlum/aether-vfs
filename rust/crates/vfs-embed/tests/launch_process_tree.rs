@@ -231,6 +231,50 @@ fn stop_launch_stops_a_detached_launchs_whole_tree() {
     );
 }
 
+/// One launch per session, as on Proton: while a launch runs (here only its
+/// launcher's child is left), every way of starting another is refused, and
+/// once it has been stopped the session launches again.
+#[cfg(windows)]
+#[test]
+fn a_second_launch_is_refused_while_the_first_runs() {
+    let _guard = lock_launches();
+    ensure_inject_artifacts();
+    let o = Orphan::new("tree-one-launch");
+
+    let mut handle = o.session.launch_detached(&o.opts).expect("launch");
+    o.await_parent_gone();
+    for wait in [true, false] {
+        let opts = LaunchOpts {
+            wait,
+            ..o.opts.clone()
+        };
+        let e = o.session.launch(&opts).unwrap_err();
+        assert!(e.contains("already running"), "wait: {wait}: {e}");
+    }
+    let e = o
+        .session
+        .launch_detached(&o.opts)
+        .err()
+        .expect("a second launch_detached is refused");
+    assert!(e.contains("already running"), "{e}");
+    assert_eq!(handle.try_wait().expect("try_wait"), None, "still running");
+
+    // A kept handle is the session's running launch too: `stop_launch`
+    // reaches it.
+    assert!(o.session.stop_launch().unwrap(), "the child was running");
+    assert_eq!(await_end(&mut handle), LaunchExit::Stopped);
+    drop(handle);
+
+    for f in ["parent-gone", "release", "child-released"] {
+        let _ = std::fs::remove_file(o.signal(f));
+    }
+    let again = o
+        .session
+        .launch_detached(&o.opts)
+        .expect("the session launches again once the first launch has ended");
+    assert_eq!(again.stop().expect("stop"), LaunchExit::Stopped);
+}
+
 /// The handle is part of the surface on every target, and can be moved to
 /// (and stopped from) another thread.
 #[test]

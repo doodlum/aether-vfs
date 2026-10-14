@@ -888,6 +888,15 @@ changes the child's working directory, not whether it is injected. A child that
 cannot be injected (a 32-bit image, for instance) therefore fails to start; if a case like that needs to run, it needs
 an explicit, named exemption, not a silent resume.
 
+**Children stay in the launch's job.** The hook creates every child with
+`CREATE_BREAKAWAY_FROM_JOB` removed (`child_creation_flags`), so on Windows a
+child stays in the launch's Job Object even when it asked to leave, and the
+launch waits for it and stops it like any other. A child that escaped would
+keep doing file I/O through the VFS after the host saw the launch end. The job
+allows no breakaway, so the flag would otherwise make the `CreateProcess` fail
+with `ERROR_ACCESS_DENIED`; stripped, it cannot. Under Wine, or for a launch
+with no job, the child simply stays in its parent's job, if any.
+
 **What the child inherits.** After a shim has written its own ready state it
 drops `VFS_SHIM_READY` from its environment (`finish_ready_handshake`), so
 descendants do not overwrite the top-level ready file and boot log. A child does

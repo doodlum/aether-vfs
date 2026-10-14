@@ -82,7 +82,7 @@ pub struct Session {
     /// Everything the session holds only for the Proton (Wine) delivery.
     #[cfg(unix)]
     proton: ProtonState,
-    /// The launches a Windows session started, for `stop_launch` and `Drop`.
+    /// The launch a Windows session runs (one at a time), for `stop_launch` and `Drop`.
     #[cfg(windows)]
     windows: WindowsState,
     /// The most recent staged launch directory, held here because
@@ -409,7 +409,7 @@ impl Drop for Session {
     /// ([`Session::set_prefix_name`]) is persistent and left alone. Best
     /// effort — a destructor has nowhere to report a failure.
     ///
-    /// On Windows: stop every launch that is still running (the program and
+    /// On Windows: stop the launch if it is still running (the program and
     /// everything it started, by terminating its job), then stop serving.
     fn drop(&mut self) {
         // Unix flushes inside `stop_serve`, below.
@@ -420,6 +420,29 @@ impl Drop for Session {
         }
         #[cfg(unix)]
         self.drop_proton();
+    }
+}
+
+/// Resets a session's "a `launch_detached` is in flight" flag to `false` when
+/// a [`Session::launch_detached`] call ends, on every path — success or an
+/// early `?` return alike — on both targets (`ProtonState::starting`,
+/// `WindowsState::starting`). Clears the matching `stop_pending` flag the same
+/// way: a `stop_launch` landing while this call is in flight but before it
+/// reaches the spawn checkpoint (an early error — a bad image, a prefix that
+/// won't `ensure`) would otherwise leave that flag set with nothing left to
+/// consume it, and the *next*, unrelated `launch_detached` would spawn its
+/// program only to stop it immediately.
+pub(in crate::session) struct StartingGuard<'a> {
+    pub(in crate::session) starting: &'a std::sync::atomic::AtomicBool,
+    pub(in crate::session) stop_pending: &'a std::sync::atomic::AtomicBool,
+}
+
+impl Drop for StartingGuard<'_> {
+    fn drop(&mut self) {
+        self.starting
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.stop_pending
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
 

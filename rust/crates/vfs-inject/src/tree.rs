@@ -25,8 +25,7 @@ use windows_sys::Win32::System::JobObjects::{
     JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
     QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
     JOBOBJECT_ASSOCIATE_COMPLETION_PORT, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows_sys::Win32::System::Threading::{
     GetExitCodeProcess, TerminateProcess, WaitForSingleObject,
@@ -56,9 +55,15 @@ pub(crate) struct Job {
 impl Job {
     /// A job that kills what is left in it when its last handle closes (the
     /// handle never leaves this process, so that is when the host is gone),
-    /// that lets a child which asks for `CREATE_BREAKAWAY_FROM_JOB` break
-    /// away rather than fail to start, and that posts its notifications to a
+    /// that no process can leave, and that posts its notifications to a
     /// completion port of its own.
+    ///
+    /// No process can leave: neither `JOB_OBJECT_LIMIT_BREAKAWAY_OK` nor
+    /// `JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK` is set. A process that escaped
+    /// would be neither waited for nor stopped, yet still do file I/O through
+    /// the VFS after the launch has ended. The shim's process hook drops
+    /// `CREATE_BREAKAWAY_FROM_JOB` from every child it creates, so a child
+    /// that asks to break away stays in the job rather than fail to start.
     pub(crate) fn new() -> Result<Job, String> {
         // SAFETY: plain Win32 object creation; every handle is checked and
         // owned by the returned `Job` (closed in `Drop`), or closed here.
@@ -83,8 +88,7 @@ impl Job {
             };
 
             let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = zeroed();
-            limits.BasicLimitInformation.LimitFlags =
-                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
             if SetInformationJobObject(
                 job.job,
                 JobObjectExtendedLimitInformation,
@@ -420,6 +424,36 @@ mod tests {
         );
         assert_eq!(finish_code(true, 0).unwrap(), 0);
         assert_eq!(finish_code(true, 7).unwrap(), 7);
+    }
+
+    /// The job kills on close and lets no process leave it: a child that
+    /// asked to break away would otherwise outlive the launch (the shim drops
+    /// the request, so it never fails on that account either).
+    #[test]
+    fn a_launch_job_kills_on_close_and_allows_no_breakaway() {
+        use windows_sys::Win32::System::JobObjects::{
+            JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
+        };
+        let job = Job::new().expect("a job");
+        // SAFETY: a correctly sized out-buffer for this information class.
+        let limits = unsafe {
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = zeroed();
+            assert_ne!(
+                QueryInformationJobObject(
+                    job.job,
+                    JobObjectExtendedLimitInformation,
+                    &mut info as *mut _ as *mut c_void,
+                    size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                    core::ptr::null_mut(),
+                ),
+                0,
+                "querying the job's limits"
+            );
+            info.BasicLimitInformation.LimitFlags
+        };
+        assert_ne!(limits & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, 0);
+        assert_eq!(limits & JOB_OBJECT_LIMIT_BREAKAWAY_OK, 0);
+        assert_eq!(limits & JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK, 0);
     }
 
     #[test]

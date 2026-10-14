@@ -30,8 +30,11 @@ const STOP_WAIT: Duration = Duration::from_secs(30);
 /// [`LaunchExit::Stopped`] when a stop was requested. This is the Proton
 /// handle's contract, with the job in place of the Wine prefix.
 ///
-/// A child started with `CREATE_BREAKAWAY_FROM_JOB` leaves the job by its own
-/// request: it is neither waited for nor stopped. A child the shim refuses
+/// No process leaves the job: the job does not allow breakaway, and the
+/// shim's process hook drops `CREATE_BREAKAWAY_FROM_JOB` from every child it
+/// creates, so a child that asks to break away is waited for and stopped like
+/// any other (an escaped one could go on doing file I/O through the VFS after
+/// the launch has ended). A child the shim refuses
 /// (it could not inject it) is killed at once and never holds the launch
 /// open; [`LaunchHandle::notes`] lists it. A program that could not be put in
 /// a job at all is tracked alone, and the notes say so.
@@ -77,8 +80,7 @@ impl LaunchStopper {
     }
 
     /// Stops the launch: terminates its job, which ends the program and
-    /// every process it started (except one that broke away from the job by
-    /// its own request). Does not wait; [`LaunchHandle::stop`] does.
+    /// every process it started. Does not wait; [`LaunchHandle::stop`] does.
     ///
     /// A no-op, `Ok(())`, once the launch has already ended.
     pub fn stop(&self) -> Result<(), String> {

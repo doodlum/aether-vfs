@@ -469,11 +469,12 @@ launch reports `LaunchExit::Stopped` (`Session::launch` returns
 `stopper`, `is_running`, `try_wait`, `wait`, `stop`), `Session::stop_launch`
 and `LaunchStopper`. Dropping a running `LaunchHandle` stops it, and dropping
 the session stops the launches it holds or that are still live before the ring
-goes. On Proton "the tree" is the session's Wine prefix (`wineserver -w`) and
-the session runs one launch at a time. On Windows it is a Job Object per launch
-(`vfs_inject::spawn_target_with_shim`, `ProcessTree`): the session does not
-refuse a second launch, and `stop_launch` stops every launch it started that is
-still running. `LaunchHandle::pid` is the launched program's pid on Windows and
+goes. A session runs **one launch at a time** on both targets: while one runs,
+`launch` and `launch_detached` are refused ("a launch is already running in
+this session — stop_launch() first"), before anything is resolved or staged.
+On Proton "the tree" is the session's Wine prefix (`wineserver -w`). On Windows
+it is a Job Object per launch (`vfs_inject::spawn_target_with_shim`,
+`ProcessTree`) that no process can leave (§4.3). `LaunchHandle::pid` is the launched program's pid on Windows and
 the `wine` process's on Proton; the Steam helper accessors are Proton-only.
 
 ---
@@ -627,15 +628,19 @@ job's `ActiveProcesses` count is zero. The completion port's
 not guaranteed), so the wait re-reads the count every 500 ms at most. Stopping
 is `TerminateJobObject`. The job has `KILL_ON_JOB_CLOSE` (its handle lives only
 in the host, so the game does not outlive the director it reads through) and
-`BREAKAWAY_OK`: a child that asks for `CREATE_BREAKAWAY_FROM_JOB` leaves the
-job and is neither waited for nor stopped. A child the shim refuses dies at once
+no breakaway limit (neither `BREAKAWAY_OK` nor `SILENT_BREAKAWAY_OK`): a process
+that left the job would be neither waited for nor stopped, yet still do file
+I/O through the VFS after the host saw the launch end. The shim's process hook
+drops `CREATE_BREAKAWAY_FROM_JOB` from every child it creates
+(`child_creation_flags`), so a child that asks to break away stays in the job
+instead of failing with `ERROR_ACCESS_DENIED`. A child the shim refuses dies at once
 and never holds the launch open. If the target cannot be put in a job (a host
 job that forbids nesting), the launch falls back to tracking the first process
 alone and says so as the first `LaunchHandle::notes()` line. The injector's
 `run_target_with_shim`, used under Wine, keeps first-process tracking. (Design:
-`docs/superpowers/specs/2026-10-13-windows-process-tree-wait-design.md`; its
-open questions are breakaway, several launches per Windows session, and
-kill-on-close.)
+`docs/superpowers/specs/2026-10-13-windows-process-tree-wait-design.md`; §9
+records the owner's decisions: children are tracked, one launch per session,
+kill-on-close stays.)
 
 Verified 2026-08-13: launched via SKSE, the hook-stats file is written by the
 *child* pid, `getskseversion` reports `2.2.6` in-game, and `coc riverwood` loads

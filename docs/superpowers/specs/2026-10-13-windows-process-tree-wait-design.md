@@ -1,7 +1,7 @@
 # Windows launches wait for the whole process tree — Design Spec
 
-**Status:** Implemented on branch `windows-process-tree-wait` (Windows runtime behaviour
-compile-checked only, see §8).
+**Status:** Implemented on branch `windows-process-tree-wait`, with the §9 decisions applied
+(Windows runtime behaviour compile-checked only, see §8).
 **Date:** 2026-10-13
 **Consumers:** Mauvi (mod manager), any host of `vfs-embed` on Windows.
 
@@ -45,7 +45,8 @@ an unnamed Job Object per launch, configured with
 
 - `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` — the job handle lives only in the host process (never
   inherited), so if the host dies the game does not outlive the director it reads through;
-- `JOB_OBJECT_LIMIT_BREAKAWAY_OK` — see §4.1;
+- **no** breakaway limit (neither `JOB_OBJECT_LIMIT_BREAKAWAY_OK` nor
+  `JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK`): no process can leave the job — see §4.1;
 
 and an I/O completion port associated with it (`JobObjectAssociateCompletionPortInformation`).
 
@@ -82,13 +83,30 @@ target exited" for no gain.
 
 ### 4.1 Breakaway
 
-A child created with `CREATE_BREAKAWAY_FROM_JOB` fails with `ERROR_ACCESS_DENIED` unless the job
-allows breakaway. Refusing would turn "the game starts a detached crash reporter or updater" into a
-broken game, so the job sets `JOB_OBJECT_LIMIT_BREAKAWAY_OK` (but **not**
-`JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK`): a child that *asks* to break away does, is not counted, and
-is not stopped by `stop`. Every ordinary child stays in the job. The shim still injects a broken-away
-child; breakaway is about job membership, not about the hook. This is an open question for the
-owner (§9): the alternative is to strip the flag in the shim's process hook.
+Decided (§9.1): **every child stays in the job.** A process that escaped it would not be waited
+for or stopped, yet it is injected and could still do VFS file I/O after the host has seen the
+launch end (and captured its writes), and it would outlive the host. Two pieces together:
+
+- **The job allows no breakaway.** Neither `JOB_OBJECT_LIMIT_BREAKAWAY_OK` nor
+  `JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK` is set, so neither an explicit request nor a silent one
+  takes a process out (`vfs-inject/src/tree.rs`, `Job::new`).
+- **The shim strips the request.** The process hook (`vfs-shim/src/hook/process.rs`,
+  `child_creation_flags`) creates every child with `(flags | CREATE_SUSPENDED) &
+  !CREATE_BREAKAWAY_FROM_JOB`. Without the job's permission, a `CreateProcess` that *asked* to
+  break away would fail with `ERROR_ACCESS_DENIED`. With the flag gone, nothing is asked of the
+  job, so creation cannot fail on its account: the child is simply created in the job, like any
+  other. "The game starts a detached crash reporter or updater" therefore still works; that
+  process is now part of the launch, is waited for, and is stopped by `stop`.
+
+The strip is unconditional: under Wine, and for a launch that could not get a job (§4.3), it only
+means the child stays in whatever job its parent is in, as every other child does.
+
+What this does not reach: a process created outside the shim's hook. A `NtCreateUserProcess`
+call that bypasses `CreateProcessInternalW` is not injected either (a gap the hook already has);
+if it asks to break away it fails with `ERROR_ACCESS_DENIED` instead of escaping. A process
+started on the game's behalf by another process (a service, WMI, the task scheduler, a COM
+out-of-process server) is not the game's child, is in no job of ours and is not virtualised; that
+was true before and is unchanged.
 
 ### 4.2 Children the shim refuses
 
@@ -134,9 +152,19 @@ The same names on both targets:
 `LaunchHandle::pid` is the launched program's pid on Windows (on Proton it is the `wine` process's;
 both are documented).
 
-**One deliberate difference:** a Proton session runs one launch at a time (the prefix is locked to
-it). A Windows session never refused a second launch, and still does not; `stop_launch` stops every
-launch the session started that is still running.
+**One launch per session on both targets** (decided, §9.2). A Proton session runs one launch at a
+time because the prefix is locked to it; a Windows session now refuses a second one the same way.
+While a launch is running (waited on by `launch`, held for a `wait: false` launch, or a
+`LaunchHandle` a caller of `launch_detached` kept and has not seen end), `launch` and
+`launch_detached` return `Err("launch: a launch is already running in this session — stop_launch()
+first")`. The Windows code mirrors Proton's `begin_launch`: the refusal happens before the image is
+resolved or staged (staging replaces the session's staged directory, whose `Drop` would delete the
+running launch's files), a `starting` flag claimed with one atomic swap makes two racing calls
+unable to both pass, and a `stop_launch` that lands while a launch is between spawning and being
+recorded leaves a pending-stop flag that `launch_detached` honours. The guard that resets both
+flags (`StartingGuard`) is shared by the two targets. `stop_launch` stops the one running launch;
+for a held `wait: false` launch it also waits for the job to empty (up to 30 s), as Proton's waits
+for the prefix, so the next launch does not overlap it.
 
 **Behaviour changes on Windows** a host should know about:
 
@@ -163,6 +191,13 @@ copy waits until its parent has exited, writes `<dir>/parent-gone`, waits for `<
 3. **`stop` ends the whole tree**: after `parent-gone`, `stop()` returns `Stopped`; creating `release`
    afterwards produces no `child-released`.
 4. **`stop_launch` stops a `wait: false` launch the session holds.**
+5. **A second launch is refused while the first runs**: with the orphan's child still running,
+   `launch` (`wait: true` and `false`) and `launch_detached` are refused with "already running";
+   `stop_launch` stops the kept handle (`Stopped`), and the session then launches again.
+
+Unit tests (Windows): `vfs-inject` `tree.rs` checks the job's limits (`KILL_ON_JOB_CLOSE` set,
+neither breakaway limit); `vfs-shim` `hook/process.rs` checks that `child_creation_flags` adds
+`CREATE_SUSPENDED` and removes `CREATE_BREAKAWAY_FROM_JOB`, keeping the caller's other flags.
 
 ## 7. Docs
 
@@ -176,15 +211,17 @@ This machine is Linux. The Windows code is checked with
 been run. The Linux suite for the affected crates is run to show nothing regressed. The Windows tests
 must be run on Windows before merge.
 
-## 9. Open questions
+## 9. Decisions (formerly open questions)
 
-1. **Breakaway** (§4.1): allow explicit breakaway (current choice), or strip
-   `CREATE_BREAKAWAY_FROM_JOB` in the shim's process hook so even those children are tracked and
-   stopped?
-2. **Concurrent Windows launches** (§5): keep allowing several per session, or refuse a second one as
-   Proton does?
-3. **Kill on host exit** (§3.1): `KILL_ON_JOB_CLOSE` ends the game if the host crashes. The director
-   is in the host, so the game cannot work past that point anyway, but a host may prefer otherwise.
+Decided by the owner side (Mauvi, DEC-054), 2026-10-13:
+
+1. **Breakaway: children are tracked.** The shim's process hook strips `CREATE_BREAKAWAY_FROM_JOB`
+   and the job allows no breakaway (§4.1). An escaped process could do VFS file I/O after the host
+   thinks the session has ended, and would survive the host exiting.
+2. **One launch per Windows session,** matching Proton: a second `launch` or `launch_detached`
+   while one runs is refused with the Proton error (§5).
+3. **Kill on job close stays** (§3.1): the director is in the host, so the game cannot work past
+   the host's exit anyway.
 
 ## 10. Status (2026-10-13)
 
@@ -203,4 +240,23 @@ Checked on Linux:
 
 **Not verified:** any Windows runtime behaviour. The four process-tree tests in
 `vfs-embed/tests/launch_process_tree.rs` compile but have never run (no Windows or Wine here). Run
-them on Windows before merge. The open questions in §9 are still open, and the current choices stand.
+them on Windows before merge.
+
+### Follow-up (2026-10-13): §9 decisions
+
+Breakaway children tracked (shim strips the flag; job has no breakaway limit), one launch per
+Windows session, kill-on-close unchanged. Checked on Linux:
+
+- `cargo check --target x86_64-pc-windows-gnu -p vfs-embed -p vfs-inject -p vfs-shim --tests`:
+  passes.
+- `cargo clippy --target x86_64-pc-windows-gnu -p vfs-inject -p vfs-embed -p vfs-shim
+  --all-targets`: no warnings in the changed code (the warnings left are newer-toolchain lints in
+  `vfs-shim/src/regquery.rs`, its registry tests, `vfs-pe`, `vfs-ntlayout` and `vfs-ipc`, which this
+  change does not touch).
+- `cargo test -p vfs-embed` and `cargo clippy -p vfs-embed --all-targets` on Linux: pass, including
+  `proton_fake_runtime.rs`, whose second-launch refusal tests exercise the now-shared
+  `StartingGuard`. `vfs-inject` and `vfs-shim` are Windows-only and not built for Linux.
+- `cargo fmt --all -- --check`: clean.
+
+**Not verified:** Windows runtime behaviour. The new process-tree test, the job-limits unit test
+and the creation-flags unit test compile but have not run.

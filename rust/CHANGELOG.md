@@ -39,10 +39,18 @@ have not been run on Windows.
 - The process-wide launch environment lock is released once the target is
   running, not held for the whole wait, so another session in the same host
   can launch while one launch is being waited on.
-- Unlike Proton, a Windows session still allows several launches at once;
-  `stop_launch` stops all of them that are running.
-- A child that asks for `CREATE_BREAKAWAY_FROM_JOB` leaves the job and is
-  neither waited for nor stopped. If the host's own job forbids nesting, the
+- **One launch per session, as on Proton.** While a launch runs (waited on,
+  held for `wait: false`, or a `LaunchHandle` from `launch_detached` that has
+  not been seen to end), `launch` and `launch_detached` return
+  `Err("launch: a launch is already running in this session — stop_launch() first")`.
+  Before, a Windows session allowed several launches at once. `stop_launch`
+  stops the one running launch, and for a held `wait: false` launch waits up
+  to 30 s for its job to empty.
+- **Every child stays in the launch.** The shim removes
+  `CREATE_BREAKAWAY_FROM_JOB` from every child it creates and the job allows no
+  breakaway, so a child that asks to break away (a crash reporter, an updater)
+  is waited for and stopped like any other, and its `CreateProcess` does not
+  fail on that account. If the host's own job forbids nesting, the
   launch falls back to first-process tracking and says so in
   `LaunchHandle::notes()`. The job is killed when its handle closes, so a
   crashed host takes the game with it.
