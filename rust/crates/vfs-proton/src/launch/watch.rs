@@ -23,7 +23,9 @@
 //! - a launch in a **shared** prefix ([`LaunchProcesses`]), whose
 //!   `wineserver` is not the launch's to stop: `SIGTERM`, then `SIGKILL` two
 //!   seconds later, to the pids of the launch's own processes, which the host
-//!   keeps current in a file once a second ([`PID_REFRESH`]).
+//!   keeps current in a file once a second ([`PID_REFRESH`]), and to `wine`'s
+//!   process group while `wine` is unreaped, which reaches a process started
+//!   since the last refresh unless Wine gave it a session of its own.
 //!
 //! The watcher runs in a process group of its own, ignoring `SIGHUP` and
 //! `SIGINT`, so whatever takes down the host's group does not take it too.
@@ -69,19 +71,19 @@ case "$1" in
   pids)
     pids=$(cat "$2" 2>/dev/null)
     [ -n "$pids" ] || exit 0
-    kill -TERM $pids </dev/null >/dev/null 2>&1
+    kill -TERM -- $pids </dev/null >/dev/null 2>&1
     i=0
     while [ "$i" -lt 20 ]; do
       left=
       for p in $pids; do
-        kill -0 "$p" 2>/dev/null && left="$left $p"
+        kill -0 -- "$p" 2>/dev/null && left="$left $p"
       done
       [ -n "$left" ] || exit 0
       pids=$left
       i=$((i + 1))
       sleep 0.1
     done
-    kill -KILL $pids </dev/null >/dev/null 2>&1 ;;
+    kill -KILL -- $pids </dev/null >/dev/null 2>&1 ;;
 esac
 "#;
 
@@ -265,11 +267,18 @@ fn write_pids(
     wine_pid: u32,
     wine_reaped: &AtomicBool,
 ) -> io::Result<()> {
-    let mut pids = procs.running();
-    if !wine_reaped.load(Ordering::SeqCst) && !pids.contains(&wine_pid) {
-        pids.push(wine_pid);
+    let mut text: String = procs.running().iter().map(|p| format!("{p}\n")).collect();
+    if !wine_reaped.load(Ordering::SeqCst) {
+        // `wine` and its process group (it leads one: `own_process_group`),
+        // which holds what it started that Wine did not move to a session of
+        // its own — so a game started since the last refresh is reached
+        // too. Only while `wine` is unreaped: until then its pid, and so the
+        // group's id, cannot be reused.
+        if !text.lines().any(|l| l == wine_pid.to_string()) {
+            text.push_str(&format!("{wine_pid}\n"));
+        }
+        text.push_str(&format!("-{wine_pid}\n"));
     }
-    let text: String = pids.iter().map(|p| format!("{p}\n")).collect();
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, text)?;
     std::fs::rename(&tmp, path)
@@ -432,7 +441,7 @@ mod tests {
         let w = HostWatch::processes(procs, wine.id(), pid_file.clone(), None).unwrap();
         // The game may not have exec'd at the first write; the refresher
         // finds it within a refresh or two.
-        let want = format!("{}\n{}\n", game.id(), wine.id());
+        let want = format!("{}\n{}\n-{}\n", game.id(), wine.id(), wine.id());
         let deadline = Instant::now() + PID_REFRESH * 5;
         while std::fs::read_to_string(&pid_file).unwrap() != want {
             assert!(
@@ -462,7 +471,10 @@ mod tests {
         let procs = LaunchProcesses::new(vec![r"C:\nowhere".into()], vec![dir.clone()]);
         let pid_file = dir.join("launch.pids");
         let mut w = HostWatch::processes(procs, 4_000_000, pid_file.clone(), None).unwrap();
-        assert_eq!(std::fs::read_to_string(&pid_file).unwrap(), "4000000\n");
+        assert_eq!(
+            std::fs::read_to_string(&pid_file).unwrap(),
+            "4000000\n-4000000\n"
+        );
         w.wine_reaped();
         let deadline = Instant::now() + PID_REFRESH * 5;
         while std::fs::read_to_string(&pid_file).unwrap() != "" {

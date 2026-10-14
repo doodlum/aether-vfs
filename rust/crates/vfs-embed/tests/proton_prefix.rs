@@ -132,3 +132,117 @@ fn a_wineboot_prefixs_user_is_read_from_the_prefix() {
     }
     check_known_folders(&s, &pfx, &users[0]);
 }
+
+/// Names the directory a re-executed test binary acts as a host in.
+const HOST_CHILD: &str = "AETHER_TEST_PREFIX_HOST_CHILD";
+
+/// The host processes of this test's Wine `cmd /c ping -n 613 …` running
+/// now (Linux: read from `/proc`).
+fn pings() -> Vec<u32> {
+    vfs_unix::all_pids()
+        .into_iter()
+        .filter(|&p| {
+            std::fs::read(format!("/proc/{p}/cmdline"))
+                .map(|c| String::from_utf8_lossy(&c).replace('\0', " "))
+                .is_ok_and(|c| c.contains("cmd.exe") && c.contains("-n 613"))
+        })
+        .collect()
+}
+
+/// Not a test of its own: the host `a_killed_host_stops_real_wine_in_its_prefix`
+/// starts and kills. With [`HOST_CHILD`] set, it sets a prefix up, arms the
+/// host watch the way a launch does, starts a long `ping` under real Wine,
+/// writes `<dir>/ready` and waits to be killed.
+#[test]
+#[ignore = "run by a_killed_host_stops_real_wine_in_its_prefix"]
+fn host_process_for_the_real_wine_host_death_test() {
+    let Some(out) = std::env::var_os(HOST_CHILD).map(PathBuf::from) else {
+        return;
+    };
+    let Some(s) = session("host child", "host-death", PrefixInit::Wineboot) else {
+        panic!("no runtime");
+    };
+    let pfx = vfs_proton::prefix::Prefix {
+        dir: s.prepare_prefix().unwrap(),
+    };
+    let runtime = support::runtime_dir().unwrap();
+    let host = vfs_proton::WineHost::Proton(runtime);
+    let lock = pfx.lock().unwrap();
+    let watch = vfs_proton::launch::HostWatch::prefix(&host, &pfx, Some(&lock)).unwrap();
+    let wine = host
+        .wine_command(&pfx.dir)
+        .args(["cmd", "/c", "ping", "-n", "613", "127.0.0.1"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while pings().is_empty() {
+        assert!(std::time::Instant::now() < deadline, "ping never started");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    std::fs::write(out.join("prefix"), pfx.dir.to_string_lossy().as_bytes()).unwrap();
+    std::fs::write(out.join("ready"), b"").unwrap();
+    let _keep = (s, lock, watch, wine);
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
+/// AE-27 against real Wine: a host killed outright takes the Wine programs
+/// it started with it, through the prefix's own `wineserver -k`.
+#[test]
+#[ignore = "needs a GE-Proton runtime: cargo run -p vfs-proton -- install"]
+fn a_killed_host_stops_real_wine_in_its_prefix() {
+    const TEST: &str = "a_killed_host_stops_real_wine_in_its_prefix";
+    if support::not_on_this_wine_host(TEST) {
+        return;
+    }
+    if let Err(e) = support::runtime_dir() {
+        support::skip(TEST, e);
+        return;
+    }
+    assert!(
+        pings().is_empty(),
+        "this test's ping is already running here"
+    );
+    let out = support::scratch("vfs-proton-prefix", "host-death-out");
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "host_process_for_the_real_wine_host_death_test",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(HOST_CHILD, &out)
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(240);
+    while !out.join("ready").exists() {
+        if let Some(st) = child.try_wait().unwrap() {
+            panic!("the host exited first: {st}");
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the host never got ready"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(!pings().is_empty());
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !pings().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the Wine program outlived its killed host: {:?}",
+            pings()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    // The anonymous prefix's session is gone with the host; remove it here.
+    let pfx = PathBuf::from(std::fs::read_to_string(out.join("prefix")).unwrap());
+    let _ = std::fs::remove_dir_all(pfx);
+}

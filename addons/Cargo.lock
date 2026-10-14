@@ -4016,6 +4016,7 @@ dependencies = [
  "vfs-provider",
  "vfs-shim",
  "vfs-unix",
+ "vfs-win",
 ]
 
 [[package]]

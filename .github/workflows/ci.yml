@@ -278,8 +278,9 @@ jobs:
         env:
           VFS_TEST_REQUIRE_ALL: "1"
       # Proton's own prefix setup with a placeholder Steam client directory
-      # (no Steam on the runner), and the prefix user's known folders read
-      # from the prefix. Needs the runtime only.
+      # (no Steam on the runner), the prefix user's known folders read from
+      # the prefix, and a killed host taking its Wine programs with it. Needs
+      # the runtime only.
       - name: Proton prefix and known folders (no Windows fixture)
         run: timeout 600 cargo test -p vfs-embed --test proton_prefix -- --ignored --nocapture
         working-directory: rust

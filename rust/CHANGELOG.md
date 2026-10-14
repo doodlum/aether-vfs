@@ -8,6 +8,19 @@ first. Internal refactors are in the git history, not here.
 
 ### Added
 
+- Unix: **a launch is stopped when its host dies.** If the process that
+  started a Proton/Wine/CrossOver launch dies before ending it (`SIGKILL`, the
+  OOM killer, a crash, `std::process::exit`), the game no longer keeps running
+  without its VFS server: a watcher (`/bin/sh`, in its own process group,
+  reading a pipe only the host holds) sees the pipe close and runs the
+  prefix's `wineserver -k`, or, for a shared prefix
+  (`Session::set_prefix_shared`), signals the launch's own processes and
+  `wine`'s process group, leaving the prefix's Steam client alone. It holds
+  the prefix's launch lock until it is done, so a restarted host cannot start
+  a launch there and see it killed. Disarmed when the launch ends. A watcher
+  that cannot be started is a `LaunchHandle::notes` line, not a failed launch.
+  `vfs-proton`: `launch::HostWatch` (with `WATCHER` and `PID_REFRESH`).
+  A shared-prefix launch keeps `state_dir/launch.pids` while it runs.
 - `Session::known_folder(KnownFolder) -> Result<PathBuf, String>` and
   `vfs_embed::KnownFolder` (`Documents`, `LocalAppData`, `SavedGames`;
   `#[non_exhaustive]`): where a root under the user's own folders goes, so a
