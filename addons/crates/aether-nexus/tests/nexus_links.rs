@@ -318,7 +318,7 @@ async fn the_client_remembers_the_allowance_the_api_last_reported() {
         (h.remaining, d.remaining)
     };
     assert_eq!(left(&q), (1499, 11_999));
-    assert_eq!(q.spare(), 499);
+    assert_eq!(q.spare(), 1999, "above half of the day's allowance");
 
     // A link from the cache is no request: the reading stands.
     c.download_url(uids[1]).await.unwrap();
@@ -366,7 +366,11 @@ async fn the_client_remembers_the_allowance_the_api_last_reported() {
     c.download_url(uids[3]).await.unwrap();
     let q = c.quota().unwrap();
     assert_eq!(left(&q), (7, 11_997));
-    assert_eq!(q.spare(), 0);
+    assert_eq!(
+        q.spare(),
+        1997,
+        "a low hour does not limit while the day lasts"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

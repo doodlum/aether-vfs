@@ -134,8 +134,8 @@ impl Links {
     }
 }
 
-/// The longest a call waits for a used-up API allowance to reset: the
-/// hourly one, not the daily one.
+/// The longest a call waits for a used-up API allowance to come back: an
+/// hour's reset, not a day's.
 const MAX_ALLOWANCE_WAIT: Duration = Duration::from_secs(65 * 60);
 
 /// One of the account's API allowances, as a response reported it.
@@ -251,9 +251,11 @@ impl Readings {
     }
 }
 
-/// What the API last said about the account's request allowances (2,000
-/// an hour and 20,000 a day when this was written), which every call draws
-/// on: a download link is one request.
+/// What the API last said about the account's request allowances, which
+/// every call draws on: a download link is one request. The daily allowance
+/// is the account's pool. The hourly one is a fallback on top of it: it only
+/// applies once the day's is used up, so that the account is never locked
+/// out, and while the day's lasts it limits nothing.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Quota {
     pub hourly: Option<Bucket>,
@@ -276,16 +278,13 @@ impl Quota {
         self.hourly.is_some() || self.daily.is_some()
     }
 
-    /// Requests that can still be made before any reported allowance has
-    /// less than half its limit left. Work that is not needed now (the
-    /// index pass) stops at zero; reads never look at it.
+    /// Requests that can still be made before the day's allowance has less
+    /// than half its limit left. Work that is not needed now (the index pass)
+    /// stops at zero, so it never reaches the hourly fallback; reads never
+    /// look at it. The hour's count is not a limit while the day's lasts, so
+    /// it is used only when the day's is not known.
     pub fn spare(&self) -> u64 {
-        [self.hourly, self.daily]
-            .iter()
-            .flatten()
-            .map(Bucket::spare)
-            .min()
-            .unwrap_or(0)
+        self.daily.or(self.hourly).map_or(0, |b| b.spare())
     }
 }
 
@@ -614,10 +613,11 @@ impl NexusClient {
 
     /// Call the API with retries; map 401/403/404/429 to actionable errors.
     ///
-    /// When the API says an allowance is used up (429) and that allowance
-    /// is full again within [`MAX_ALLOWANCE_WAIT`], the call waits for it
-    /// and goes on: a prepare of a large list asks for more links than an
-    /// hour allows, and failing its jobs would only make it start again.
+    /// When the API says it is out of requests (429) and one of the used-up
+    /// allowances comes back within [`MAX_ALLOWANCE_WAIT`] (once the day's is
+    /// used up, that is the hourly fallback's next reset), the call waits for
+    /// it and goes on: failing a prepare's jobs would only make it start
+    /// again.
     async fn api_call(&self, method: reqwest::Method, url: &Url, job: &Job) -> Result<Vec<u8>> {
         loop {
             let r = self
@@ -643,10 +643,12 @@ impl NexusClient {
     }
 
     /// How long to wait after a 429 before the API answers again: until the
-    /// allowances it reported as used up reset. `None` when it reported
-    /// none (the retries already waited what the response asked for) or
-    /// when that is longer than [`MAX_ALLOWANCE_WAIT`] (the daily
-    /// allowance): the call fails instead.
+    /// first of the allowances it reported as used up resets, since requests
+    /// go on as soon as one has room (the hourly one is there for when the
+    /// day's is used up). `None` when it reported none (the retries already
+    /// waited what the response asked for) or when that is longer than
+    /// [`MAX_ALLOWANCE_WAIT`] (only the day's is used up): the call fails
+    /// instead.
     fn allowance_wait(&self) -> Option<Duration> {
         let now = (self.clock)();
         let resets: Vec<SystemTime> = self
@@ -659,7 +661,7 @@ impl NexusClient {
             .collect();
         // A little past the reset: the clocks need not agree.
         let wait =
-            resets.iter().max()?.duration_since(now).unwrap_or_default() + Duration::from_secs(5);
+            resets.iter().min()?.duration_since(now).unwrap_or_default() + Duration::from_secs(5);
         (wait <= MAX_ALLOWANCE_WAIT).then_some(wait)
     }
 
@@ -792,7 +794,7 @@ mod tests {
                 reset: Some(utc("2026-10-01T00:00:00Z")),
             })
         );
-        assert_eq!(q.spare(), 998, "the hourly allowance is the tighter one");
+        assert_eq!(q.spare(), 9998, "the day's allowance is the pool");
     }
 
     #[test]
@@ -849,7 +851,7 @@ mod tests {
     }
 
     #[test]
-    fn what_is_spare_is_what_is_left_above_half_of_each_allowance() {
+    fn what_is_spare_is_what_is_left_above_half_of_the_days_allowance() {
         let quota = |hourly: (u64, u64), daily: (u64, u64)| Quota {
             hourly: Some(Bucket {
                 limit: hourly.0,
@@ -862,18 +864,30 @@ mod tests {
                 reset: None,
             }),
         };
-        assert_eq!(quota((2000, 2000), (20_000, 20_000)).spare(), 1000);
-        assert_eq!(quota((2000, 1001), (20_000, 20_000)).spare(), 1);
-        assert_eq!(quota((2000, 1000), (20_000, 20_000)).spare(), 0);
-        assert_eq!(quota((2000, 3), (20_000, 20_000)).spare(), 0);
-        // The day's allowance binds when it is the one nearer its half.
+        assert_eq!(quota((2000, 2000), (20_000, 20_000)).spare(), 10_000);
         assert_eq!(quota((2000, 2000), (20_000, 10_007)).spare(), 7);
+        assert_eq!(quota((2000, 2000), (20_000, 10_000)).spare(), 0);
         assert_eq!(quota((2000, 2000), (20_000, 9000)).spare(), 0);
+        // The hour's count is the fallback for a used-up day, not a limit.
+        assert_eq!(quota((2000, 3), (20_000, 20_000)).spare(), 10_000);
+        assert_eq!(quota((2000, 0), (20_000, 15_000)).spare(), 5000);
+        // Nor does the index pass draw on it once the day's is half gone.
+        assert_eq!(quota((2000, 2000), (20_000, 0)).spare(), 0);
         // An odd limit: half of 5 is kept as 3.
-        assert_eq!(quota((5, 4), (20_000, 20_000)).spare(), 1);
-        assert_eq!(quota((5, 3), (20_000, 20_000)).spare(), 0);
+        assert_eq!(quota((2000, 2000), (5, 4)).spare(), 1);
+        assert_eq!(quota((2000, 2000), (5, 3)).spare(), 0);
         // More left than the limit is taken as it is.
-        assert_eq!(quota((100, 150), (20_000, 20_000)).spare(), 100);
+        assert_eq!(quota((2000, 2000), (100, 150)).spare(), 100);
+        // With only the hour's reading, it is all there is to go by.
+        let hourly_only = Quota {
+            hourly: Some(Bucket {
+                limit: 2000,
+                remaining: 1800,
+                reset: None,
+            }),
+            daily: None,
+        };
+        assert_eq!(hourly_only.spare(), 800);
     }
 
     /// A fixed moment, and `secs` after it: no test here reads a clock.
@@ -947,7 +961,7 @@ mod tests {
     #[test]
     fn a_reading_is_none_once_its_reset_time_has_passed() {
         let mut r = Readings::default();
-        // Nothing spare in the hour that ends in ten minutes.
+        // The hour's count does not hold back the index pass.
         r.update(
             reading(
                 Some(bucket(2000, 900, Some(at(600)))),
@@ -955,7 +969,7 @@ mod tests {
             ),
             at(0),
         );
-        assert_eq!(r.quota(at(60)).unwrap().spare(), 0);
+        assert_eq!(r.quota(at(60)).unwrap().spare(), 5000);
         // Asked again just before the reset, and just after it.
         r.update(
             reading(Some(bucket(2000, 899, Some(at(600)))), None),
@@ -965,7 +979,7 @@ mod tests {
             reading(None, Some(bucket(20_000, 14_999, Some(at(40_000))))),
             at(590),
         );
-        assert_eq!(r.quota(at(599)).unwrap().spare(), 0);
+        assert_eq!(r.quota(at(599)).unwrap().spare(), 4999);
         let q = r.quota(at(600)).unwrap();
         assert_eq!(q.hourly, None, "the hour's allowance is full again");
         assert_eq!(q.spare(), 4999, "the day's reading stands");
@@ -1049,7 +1063,7 @@ mod tests {
     }
 
     #[test]
-    fn a_used_up_hourly_allowance_is_waited_for_and_a_daily_one_is_not() {
+    fn a_429_waits_for_the_first_used_up_allowance_to_come_back() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let http = Http::new(Default::default(), Default::default()).unwrap();
         let c = NexusClient::new(http, "k").with_clock(move || now);
@@ -1070,8 +1084,11 @@ mod tests {
             Some(bucket(20_000, 9000, 40_000)),
         );
         assert_eq!(c.allowance_wait(), Some(Duration::from_secs(605)));
-        // The day is used up: not waited for.
+        // Both used up: until the hourly fallback resets, not the day.
         set(Some(bucket(2000, 0, 600)), Some(bucket(20_000, 0, 40_000)));
+        assert_eq!(c.allowance_wait(), Some(Duration::from_secs(605)));
+        // Only the day reported used up: its reset is too far to wait for.
+        set(None, Some(bucket(20_000, 0, 40_000)));
         assert_eq!(c.allowance_wait(), None);
         // Allowances with room say nothing about a 429.
         set(Some(bucket(2000, 5, 600)), None);
