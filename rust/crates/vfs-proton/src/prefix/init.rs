@@ -90,7 +90,8 @@ pub fn prefix_dir(root: &Root, session: &str, init: &PrefixInit) -> Result<PathB
 
 /// [`ensure`], choosing how the prefix is set up. Idempotent: a Wineboot
 /// prefix is set up once; a Proton prefix is set up again only when the
-/// runtime that set it up (`compat/version`) is not `runtime`.
+/// runtime that set it up (`compat/version`) is not `runtime`, or was at
+/// another path ([`set_up_from`]): a prefix moved with its home.
 ///
 /// `runtime` is verified as GE-Proton before anything runs, as [`ensure`]
 /// does.
@@ -110,7 +111,10 @@ pub fn ensure_with(
     let dir = prefix_dir(root, session, init)?;
     let compat = dir.parent().expect("compat/pfx has a parent").to_path_buf();
     let tag = verify_ge(runtime).map_err(|e| PrefixError::NotGe(e.to_string()))?;
-    if is_initialised(&dir) && proton_prefix_version(&compat).as_deref() == Some(tag.as_str()) {
+    if is_initialised(&dir)
+        && proton_prefix_version(&compat).as_deref() == Some(tag.as_str())
+        && set_up_from(&compat, runtime)
+    {
         return Ok(Prefix { dir });
     }
     if !steam_client.is_dir() {
@@ -129,6 +133,23 @@ pub fn ensure_with(
         )));
     }
     Ok(Prefix { dir })
+}
+
+/// Whether Proton set up the prefix under `compat` from `runtime` where it
+/// is now. Proton records the runtime's absolute paths in `config_info`,
+/// and the prefix's DLLs are symlinks to them: a home moved to another
+/// folder (a portable data folder on another drive) leaves them all
+/// pointing at the old one, and Wine cannot even load `kernel32.dll`.
+/// Running Proton's setup again relinks them. With no `config_info` (a
+/// Proton that does not write one), the version alone decides.
+fn set_up_from(compat: &Path, runtime: &Path) -> bool {
+    let Ok(info) = std::fs::read_to_string(compat.join("config_info")) else {
+        return true;
+    };
+    let files = std::path::absolute(runtime)
+        .unwrap_or_else(|_| runtime.to_path_buf())
+        .join("files");
+    info.contains(&*files.to_string_lossy())
 }
 
 /// The runtime tag Proton recorded when it last set up the prefix under
@@ -387,6 +408,41 @@ mod tests {
             proton_prefix_version(&compat).as_deref(),
             Some("GE-Proton99-2")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_prefix_moved_with_its_home_is_set_up_again() {
+        let root = Root::at(scratch("mv-home"));
+        let steam = scratch("mv-steam");
+        let rt = fake_proton_runtime("mv-rt", "GE-Proton99-1", "");
+        let init = PrefixInit::Proton {
+            steam_client: steam,
+            app_id: None,
+        };
+        ensure_with(&root, &rt, "s", &init).unwrap();
+        let compat = root.try_session_dir("s").unwrap().join("compat");
+        let here = std::path::absolute(&rt).unwrap().join("files");
+        // Proton's own record, naming the runtime where it is: up to date.
+        std::fs::write(
+            compat.join("config_info"),
+            format!("GE-Proton99-1\n{}/share/fonts/\n", here.display()),
+        )
+        .unwrap();
+        ensure_with(&root, &rt, "s", &init).unwrap();
+        assert_eq!(
+            calls(&root, "s").len(),
+            1,
+            "a prefix in place is not set up again"
+        );
+        // The same prefix after its home moved: it names the old place.
+        std::fs::write(
+            compat.join("config_info"),
+            "GE-Proton99-1\n/old/home/runtimes/GE-Proton99-1/files/share/fonts/\n",
+        )
+        .unwrap();
+        ensure_with(&root, &rt, "s", &init).unwrap();
+        assert_eq!(calls(&root, "s").len(), 2, "a moved prefix is set up again");
     }
 
     #[cfg(unix)]
