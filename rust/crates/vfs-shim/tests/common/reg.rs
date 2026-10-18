@@ -430,3 +430,14 @@ pub(crate) fn install_hooks(tag: &str) -> &'static Fake {
     assert!(regclient::enabled());
     fake
 }
+
+/// Whether this test runs under Wine: Wine's ntdll exports `wine_get_version`, Windows' does
+/// not. For the few answers the two hosts give differently.
+pub(crate) fn host_is_wine() -> bool {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    // SAFETY: both names are NUL-terminated; a missing module or export is a null return.
+    unsafe {
+        let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+        !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+    }
+}

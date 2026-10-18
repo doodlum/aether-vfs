@@ -20,7 +20,7 @@ use windows_sys::Win32::Foundation::NTSTATUS;
 
 use crate::ntdef::{
     ObjectAttributes, UnicodeString, OBJ_CASE_INSENSITIVE, STATUS_ACCESS_VIOLATION,
-    STATUS_OBJECT_NAME_INVALID,
+    STATUS_INVALID_PARAMETER, STATUS_OBJECT_NAME_INVALID,
 };
 use vfs_redirect::{counted_units, utf16_to_string, CountedErr};
 
@@ -57,17 +57,37 @@ pub(crate) unsafe fn us_string(us: *const UnicodeString) -> Result<Option<String
     Ok(us_units(us)?.map(utf16_to_string))
 }
 
-/// A registry *value* name as UTF-16 units. Unlike an object name, an odd `Length` is read with
-/// its last byte dropped (Wine's server rounds it down, `namelen / 2 * 2`); NT is not shown to
-/// reject it. The other rules of [`us_units`] apply.
+/// A registry *value* name as UTF-16 units. Unlike an object name, an odd `Length` is not
+/// `STATUS_OBJECT_NAME_INVALID`, and what it is depends on the host the shim runs on, which
+/// is what the caller would get without the overlay:
+///
+/// * Wine's server reads it with its last byte dropped (`namelen / 2 * 2`);
+/// * Windows refuses it with `STATUS_INVALID_PARAMETER`, from `NtQueryValueKey` and
+///   `NtSetValueKey` alike (measured on Windows 11 26300).
+///
+/// The other rules of [`us_units`] apply.
 ///
 /// # Safety
 /// As [`us_units`].
 pub(crate) unsafe fn value_name_units<'a>(
     us: *const UnicodeString,
 ) -> Result<Option<&'a [u16]>, NTSTATUS> {
+    value_name_units_on(us, host_is_wine())
+}
+
+/// [`value_name_units`] with the host given: `wine` is whether it is Wine.
+///
+/// # Safety
+/// As [`us_units`].
+unsafe fn value_name_units_on<'a>(
+    us: *const UnicodeString,
+    wine: bool,
+) -> Result<Option<&'a [u16]>, NTSTATUS> {
     if us.is_null() {
         return Ok(None);
+    }
+    if (*us).length & 1 != 0 && !wine {
+        return Err(STATUS_INVALID_PARAMETER);
     }
     let even = UnicodeString {
         length: (*us).length & !1,
@@ -75,6 +95,24 @@ pub(crate) unsafe fn value_name_units<'a>(
         buffer: (*us).buffer,
     };
     us_units(&even)
+}
+
+/// Whether ntdll is Wine's: it exports `wine_get_version`. Asked once per process.
+pub(crate) fn host_is_wine() -> bool {
+    static WINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // SAFETY: both names are NUL-terminated; a missing module or export is a
+    // null return, not a fault.
+    *WINE.get_or_init(|| unsafe {
+        let ntdll = windows_sys::Win32::System::LibraryLoader::GetModuleHandleA(
+            c"ntdll.dll".as_ptr().cast(),
+        );
+        !ntdll.is_null()
+            && windows_sys::Win32::System::LibraryLoader::GetProcAddress(
+                ntdll,
+                c"wine_get_version".as_ptr().cast(),
+            )
+            .is_some()
+    })
 }
 
 /// The `ObjectName` of an `OBJECT_ATTRIBUTES`, ignoring `RootDirectory`: `Ok(None)` for a NULL
@@ -237,17 +275,20 @@ mod tests {
     }
 
     #[test]
-    fn a_value_name_drops_an_odd_last_byte_but_keeps_the_other_rules() {
+    fn a_value_name_drops_an_odd_last_byte_on_wine_but_keeps_the_other_rules() {
         let mut w: Vec<u16> = "abc".encode_utf16().collect();
         let odd = us_of(&mut w, 5);
-        assert_eq!(unsafe { value_name_units(&odd) }, Ok(Some(&w[..2])));
+        assert_eq!(
+            unsafe { value_name_units_on(&odd, true) },
+            Ok(Some(&w[..2]))
+        );
         let null_len = UnicodeString {
             length: 2,
             maximum_length: 2,
             buffer: core::ptr::null_mut(),
         };
         assert_eq!(
-            unsafe { value_name_units(&null_len) },
+            unsafe { value_name_units_on(&null_len, true) },
             Err(STATUS_ACCESS_VIOLATION)
         );
         // One stray byte and nothing else is the empty name, even without a buffer.
@@ -256,8 +297,42 @@ mod tests {
             maximum_length: 1,
             buffer: core::ptr::null_mut(),
         };
-        assert_eq!(unsafe { value_name_units(&one) }, Ok(Some(&[][..])));
-        assert_eq!(unsafe { value_name_units(core::ptr::null()) }, Ok(None));
+        assert_eq!(
+            unsafe { value_name_units_on(&one, true) },
+            Ok(Some(&[][..]))
+        );
+        assert_eq!(
+            unsafe { value_name_units_on(core::ptr::null(), true) },
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn windows_refuses_an_odd_value_name_and_keeps_the_other_rules() {
+        let mut w: Vec<u16> = "abc".encode_utf16().collect();
+        let odd = us_of(&mut w, 5);
+        assert_eq!(
+            unsafe { value_name_units_on(&odd, false) },
+            Err(STATUS_INVALID_PARAMETER)
+        );
+        let even = us_of(&mut w, 4);
+        assert_eq!(
+            unsafe { value_name_units_on(&even, false) },
+            Ok(Some(&w[..2]))
+        );
+        let null_len = UnicodeString {
+            length: 2,
+            maximum_length: 2,
+            buffer: core::ptr::null_mut(),
+        };
+        assert_eq!(
+            unsafe { value_name_units_on(&null_len, false) },
+            Err(STATUS_ACCESS_VIOLATION)
+        );
+        assert_eq!(
+            unsafe { value_name_units_on(core::ptr::null(), false) },
+            Ok(None)
+        );
     }
 
     #[test]

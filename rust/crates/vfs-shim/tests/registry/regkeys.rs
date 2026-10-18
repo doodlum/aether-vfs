@@ -714,12 +714,15 @@ fn a_failed_duplicate_with_close_source_drops_the_record() {
     let (_, r) = f.open("Untouched", NT_KEY_READ);
     assert!(registry_handle_path(r).is_some());
     let mut d = 0isize;
-    // No target process: the duplication fails, and NT closes the source anyway.
+    // A target process handle that names nothing: the duplication fails, and NT closes the
+    // source anyway. Not a null target: NT documents null plus `DUPLICATE_CLOSE_SOURCE` as a
+    // plain close that succeeds (Wine fails it), so it would not exercise the failure path.
+    const NO_SUCH_PROCESS: isize = 0x00ff_fff0;
     let st = unsafe {
         NtDuplicateObject(
             CURRENT_PROCESS,
             r,
-            0,
+            NO_SUCH_PROCESS,
             &mut d,
             0,
             0,
@@ -740,8 +743,18 @@ fn reg_close_key_releases_synthetic_handles() {
     isolate!();
     let (_g, f) = fixture();
     regclient::set_value(&f.canon("PerFrame"), "Seed", 4, &0u32.to_le_bytes()).unwrap();
-    let before = vfs_shim::registry_handle_counts();
     let sub = wide(&format!(r"{BASE}\PerFrame"));
+    // Windows' advapi32 opens `\Registry\User\<sid>` on a process's first use of
+    // `HKEY_CURRENT_USER` and keeps that handle for the life of the process: one tracked
+    // pass-through handle that is not a leak. Take it before the baseline, so the count
+    // below measures only what the loop leaves behind. (Wine's advapi32 caches it too.)
+    let mut k: HKEY = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, sub.as_ptr(), 0, KEY_SET_VALUE, &mut k) },
+        0
+    );
+    assert_eq!(unsafe { RegCloseKey(k) }, 0);
+    let before = vfs_shim::registry_handle_counts();
     let name = wide("Frame");
     for i in 0..500u32 {
         let mut k: HKEY = std::ptr::null_mut();

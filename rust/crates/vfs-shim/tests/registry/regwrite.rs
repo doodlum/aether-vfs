@@ -697,11 +697,12 @@ fn a_dead_director_fails_writes_and_leaves_the_real_key() {
     assert!(!f.really_exists("DeadNew"));
 }
 
-/// Value names are not object names: an odd `Length` is read with its last byte dropped (what
-/// Wine's server does), and only a NULL buffer with a length is refused
-/// (`STATUS_ACCESS_VIOLATION`).
+/// Value names are not object names: an odd `Length` is not `STATUS_OBJECT_NAME_INVALID` but
+/// what the host makes of it. Wine's server reads it with its last byte dropped; Windows refuses
+/// it with `STATUS_INVALID_PARAMETER`, for a query and a set alike. Only a NULL buffer with a
+/// length is refused the same way on both (`STATUS_ACCESS_VIOLATION`).
 #[test]
-fn an_odd_value_name_is_truncated_and_a_null_buffer_with_a_length_is_refused() {
+fn an_odd_value_name_gets_the_hosts_answer_and_a_null_buffer_with_a_length_is_refused() {
     isolate!();
     let (_g, f) = fixture();
     let (st, h) = f.open("Names", NT_KEY_READ | NT_KEY_SET_VALUE);
@@ -711,28 +712,58 @@ fn an_odd_value_name_is_truncated_and_a_null_buffer_with_a_length_is_refused() {
         maximum_length: length,
         buffer,
     };
+    let query = |name: &UnicodeString| {
+        let mut buf = vec![0u64; 64];
+        let mut ret = 0u32;
+        unsafe {
+            NtQueryValueKey(
+                h,
+                name,
+                KEY_VALUE_PARTIAL_INFORMATION,
+                buf.as_mut_ptr().cast(),
+                512,
+                &mut ret,
+            )
+        }
+    };
     // "origx" read as 9 bytes is "orig": the existing value.
     let chars: Vec<u16> = "origx".encode_utf16().collect();
     let odd = raw(9, chars.as_ptr());
-    let mut buf = vec![0u64; 64];
-    let mut ret = 0u32;
-    let st = unsafe {
-        NtQueryValueKey(
-            h,
-            &odd,
-            KEY_VALUE_PARTIAL_INFORMATION,
-            buf.as_mut_ptr().cast(),
-            512,
-            &mut ret,
-        )
-    };
-    assert_eq!(st, STATUS_SUCCESS, "an odd Length reads as the even prefix");
-    // A set through an odd name writes the even prefix's name.
     let newv: Vec<u16> = "newoddx".encode_utf16().collect();
     let odd_new = raw(13, newv.as_ptr());
-    let st = unsafe { NtSetValueKey(h, &odd_new, 0, REG_DWORD, 5u32.to_le_bytes().as_ptr(), 4) };
-    assert_eq!(st, STATUS_SUCCESS);
-    assert_eq!(query_dword(h, "newodd"), Ok(5));
+    let set_odd_new =
+        || unsafe { NtSetValueKey(h, &odd_new, 0, REG_DWORD, 5u32.to_le_bytes().as_ptr(), 4) };
+    if reg::host_is_wine() {
+        assert_eq!(
+            query(&odd),
+            STATUS_SUCCESS,
+            "an odd Length reads as the even prefix"
+        );
+        // A set through an odd name writes the even prefix's name.
+        assert_eq!(set_odd_new(), STATUS_SUCCESS);
+        assert_eq!(query_dword(h, "newodd"), Ok(5));
+    } else {
+        assert_eq!(
+            query(&odd),
+            STATUS_INVALID_PARAMETER,
+            "Windows refuses an odd Length"
+        );
+        assert_eq!(set_odd_new(), STATUS_INVALID_PARAMETER);
+        assert_eq!(query_dword(h, "newodd"), Err(STATUS_OBJECT_NAME_NOT_FOUND));
+        // The overlay now holds a value under this key, so the shim answers the query itself
+        // rather than passing it to the real key: the same refusal.
+        let even_new = raw(12, newv.as_ptr());
+        let st =
+            unsafe { NtSetValueKey(h, &even_new, 0, REG_DWORD, 5u32.to_le_bytes().as_ptr(), 4) };
+        assert_eq!(st, STATUS_SUCCESS);
+        assert_eq!(query_dword(h, "newodd"), Ok(5));
+        assert_eq!(query(&odd), STATUS_INVALID_PARAMETER);
+        assert_eq!(
+            query(&raw(8, chars.as_ptr())),
+            STATUS_SUCCESS,
+            "the even prefix is there"
+        );
+    }
     // A NULL buffer with a length is a bad pointer.
     let null_with_length = raw(2, std::ptr::null());
     let st = unsafe {
