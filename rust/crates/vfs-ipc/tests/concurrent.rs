@@ -6,12 +6,12 @@
 //! `read_fragmented`, `DataGate`) over an in-process segment with real server
 //! threads; only the handler is the test's own.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use vfs_ipc::layout::{ST_ABANDONED, ST_FREE};
+use vfs_ipc::layout::{ST_ABANDONED, ST_FREE, ST_PROCESSING, ST_SUBMITTED};
 use vfs_ipc::ring::{self, Geom, IpcError};
 use vfs_ipc::{
     read_fragmented, DataArena, DataGate, Notifier, OwnedSeg, ReadPlan, RingClient, RingServer,
@@ -21,16 +21,15 @@ use vfs_protocol as P;
 
 /// Echo the payload back at once.
 const OP_ECHO: u32 = 900;
-/// Sleep for the payload's `u64` milliseconds, then answer `b"slept"`.
-const OP_SLEEP: u32 = 901;
 
 /// Block until the test opens the latch ([`Fixture::open_latch`]), then
 /// answer `b"released"`.
 const OP_HOLD: u32 = 902;
+/// Once the client has published (see [`NapClock`]), add the payload's `u64`
+/// milliseconds to [`Fixture::napped_ms`], then answer `b"napped"`. Time that
+/// passes for a [`NapClock`] client and for nothing else.
+const OP_NAP: u32 = 903;
 
-/// Reads of this handle take [`SLOW_READ`] each; every other handle is instant.
-const FH_SLOW: u64 = 99;
-const SLOW_READ: Duration = Duration::from_millis(300);
 /// Reads of this handle block until the test opens the latch: a provider
 /// that has stopped answering, for exactly as long as the test says.
 const FH_HELD: u64 = 98;
@@ -53,15 +52,17 @@ struct Fixture {
     arena_off: usize,
     arena_len: usize,
     stop: AtomicBool,
-    /// Slow reads inside the handler right now, and the most there ever were.
-    slow_now: AtomicU32,
-    slow_peak: AtomicU32,
     /// Closed until the test opens it; held requests wait on it.
     latch: Mutex<bool>,
     latch_opened: Condvar,
     /// Requests inside the handler waiting on the latch, and the most ever.
     held_now: AtomicU32,
     held_peak: AtomicU32,
+    /// What the `OP_NAP` requests have added up to, and whether a
+    /// [`NapClock`] client has published (the server naps only after).
+    napped_ms: AtomicU64,
+    client_notified: AtomicBool,
+    client_published: AtomicBool,
 }
 
 impl Fixture {
@@ -77,12 +78,13 @@ impl Fixture {
             arena_off,
             arena_len,
             stop: AtomicBool::new(false),
-            slow_now: AtomicU32::new(0),
-            slow_peak: AtomicU32::new(0),
             latch: Mutex::new(false),
             latch_opened: Condvar::new(),
             held_now: AtomicU32::new(0),
             held_peak: AtomicU32::new(0),
+            napped_ms: AtomicU64::new(0),
+            client_notified: AtomicBool::new(false),
+            client_published: AtomicBool::new(false),
         }
     }
 
@@ -131,6 +133,11 @@ impl Fixture {
         RingClient::with_geom(self.seg(), self.geom, SpinNotifier)
     }
 
+    /// A client on a clock the test drives: see [`TestClock`].
+    fn client_clocked<F: Fn() -> Duration>(&self, passed: F) -> RingClient<'_, TestClock<F>> {
+        RingClient::with_geom(self.seg(), self.geom, TestClock(Instant::now(), passed))
+    }
+
     fn plan(&self) -> ReadPlan {
         ReadPlan {
             bulk_threshold: 8 * 1024,
@@ -155,10 +162,13 @@ impl Fixture {
         while !self.stop.load(Ordering::Relaxed) {
             ring.serve_one(|req| match req.opcode {
                 OP_ECHO => (P::ST_OK, req.payload.clone()),
-                OP_SLEEP => {
+                OP_NAP => {
+                    self.until("the client published", || {
+                        self.client_published.load(Ordering::SeqCst)
+                    });
                     let ms = u64::from_le_bytes(req.payload[..8].try_into().unwrap());
-                    thread::sleep(Duration::from_millis(ms));
-                    (P::ST_OK, b"slept".to_vec())
+                    self.napped_ms.fetch_add(ms, Ordering::SeqCst);
+                    (P::ST_OK, b"napped".to_vec())
                 }
                 OP_HOLD => {
                     self.hold();
@@ -166,12 +176,6 @@ impl Fixture {
                 }
                 P::OP_READ => {
                     let r = P::decode_read_req(&req.payload).unwrap();
-                    if r.fh == FH_SLOW {
-                        let now = self.slow_now.fetch_add(1, Ordering::SeqCst) + 1;
-                        self.slow_peak.fetch_max(now, Ordering::SeqCst);
-                        thread::sleep(SLOW_READ);
-                        self.slow_now.fetch_sub(1, Ordering::SeqCst);
-                    }
                     if r.fh == FH_HELD {
                         self.hold();
                     }
@@ -245,6 +249,56 @@ fn assert_bytes(fh: u64, offset: u64, got: &[u8]) {
             got[i],
             byte(fh, offset + i as u64)
         );
+    }
+}
+
+/// A client notifier whose clock the test drives: `now()` is the moment it was
+/// made plus however much time `.1` says has passed. Waits spin, as
+/// [`SpinNotifier`]'s do.
+///
+/// A deadline these tests want to see expire then expires when the test says,
+/// not when some milliseconds have gone by. That matters twice over here. A
+/// request no worker has taken yet is simply freed when its client gives up
+/// (`ring::abandon`), so the director never sees it — and on a loaded machine,
+/// this binary's tests each spinning their own workers, no worker taking a
+/// request within 40 ms is ordinary. And a client thread that does not run
+/// until every reply is in finds them all there and returns `Ok`, deadline or
+/// not.
+struct TestClock<F: Fn() -> Duration>(Instant, F);
+
+impl<F: Fn() -> Duration> Notifier for TestClock<F> {
+    fn wait_client(&self, _slot: u32) {
+        core::hint::spin_loop();
+    }
+    fn now(&self) -> Instant {
+        self.0 + (self.1)()
+    }
+}
+
+/// Past any deadline a test client has.
+const LONG_AFTER: Duration = Duration::from_secs(3600);
+
+/// A client notifier whose clock is the server's naps: `now()` is the moment it
+/// was made plus [`Fixture::napped_ms`].
+///
+/// A batch is published, the server told (`notify_server`), and then the clock
+/// read once for the batch's deadline. This notes that read as the moment the
+/// batch was published, and `OP_NAP` waits for it: so the deadline is always
+/// counted from no time at all, however late the client thread runs.
+struct NapClock<'a>(&'a Fixture, Instant);
+
+impl Notifier for NapClock<'_> {
+    fn notify_server(&self) {
+        self.0.client_notified.store(true, Ordering::SeqCst);
+    }
+    fn wait_client(&self, _slot: u32) {
+        core::hint::spin_loop();
+    }
+    fn now(&self) -> Instant {
+        if self.0.client_notified.load(Ordering::SeqCst) {
+            self.0.client_published.store(true, Ordering::SeqCst);
+        }
+        self.1 + Duration::from_millis(self.0.napped_ms.load(Ordering::SeqCst))
     }
 }
 
@@ -370,6 +424,15 @@ fn reads_that_timed_out_keep_their_permits_until_the_director_is_done() {
         let impatient = fx.client().with_deadline(Duration::from_millis(40));
         let mut buf = vec![0u8; 100];
         for sent in 1..=3u32 {
+            let impatient = fx
+                .client_clocked(|| {
+                    if fx.held() >= sent {
+                        LONG_AFTER
+                    } else {
+                        Duration::ZERO
+                    }
+                })
+                .with_deadline(Duration::from_millis(40));
             let r = read_fragmented(&impatient, &gate, &plan, FH_HELD, 0, &mut buf);
             assert_eq!(r, Err(P::ST_IO_ERROR));
             assert_eq!(fx.held(), sent, "the director is still inside read {sent}");
@@ -491,12 +554,25 @@ fn a_timed_out_request_retires_its_slot_until_the_late_reply_is_drained() {
     let gate = DataGate::new(8);
     let plan = fx.plan();
     fx.with_workers(2, || {
-        let impatient = fx.client().with_deadline(Duration::from_millis(40));
+        // The provider is stuck (`FH_HELD`) until the test lets it go, and the
+        // client's deadline passes only once the director is inside the read.
+        let impatient = fx
+            .client_clocked(|| {
+                if fx.held() > 0 {
+                    LONG_AFTER
+                } else {
+                    Duration::ZERO
+                }
+            })
+            .with_deadline(Duration::from_millis(40));
         let mut buf = vec![0u8; BANK];
-        let t = Instant::now();
-        let r = read_fragmented(&impatient, &gate, &plan, FH_SLOW, 0, &mut buf);
+        let r = read_fragmented(&impatient, &gate, &plan, FH_HELD, 0, &mut buf);
         assert_eq!(r, Err(P::ST_IO_ERROR), "the read must fail, not hang");
-        assert!(t.elapsed() < SLOW_READ, "it gave up at its deadline");
+        assert_eq!(
+            fx.held(),
+            1,
+            "it gave up while the director was still inside"
+        );
         assert_eq!(
             gate.in_flight(),
             1,
@@ -509,18 +585,23 @@ fn a_timed_out_request_retires_its_slot_until_the_late_reply_is_drained() {
         let retired = retired.expect("the timed-out slot must be ABANDONED, not FREE");
 
         // Reads made meanwhile — the same size, so they use an arena bank —
-        // never land in the retired slot and never see the slow file's bytes.
+        // never land in the retired slot and never see the held file's bytes.
         let c = fx.client();
-        let mut during = 0;
-        while fx.state(retired) == ST_ABANDONED {
+        for during in 0..16u64 {
             let fh = 7;
             let offset = during * 13;
             let n = read_fragmented(&c, &gate, &plan, fh, offset, &mut buf).unwrap();
             assert_eq!(n, BANK);
             assert_bytes(fh, offset, &buf);
-            during += 1;
+            assert_eq!(
+                fx.state(retired),
+                ST_ABANDONED,
+                "still retired after read {during}"
+            );
         }
-        assert!(during > 0, "no read was made while the slot was retired");
+
+        // The provider answers at last; the server writes its late reply.
+        fx.open_latch();
 
         // The server finished and drained it: free, and usable.
         fx.await_state(retired, ST_FREE);
@@ -564,10 +645,24 @@ fn a_request_nobody_serves_times_out_and_frees_its_slot() {
 fn a_batch_that_times_out_gives_every_slot_back() {
     let fx = Fixture::new(4);
     fx.with_workers(3, || {
-        let c = fx.client().with_deadline(Duration::from_millis(40));
+        // The deadline passes once the held request is in the handler and is
+        // the only one still in play: the echoes were answered, so none of
+        // them can be mid-flight when it does.
+        let c = fx
+            .client_clocked(|| {
+                let in_play = fx.held() == 1
+                    && fx.slots_in(ST_PROCESSING) == 1
+                    && fx.slots_in(ST_SUBMITTED) == 0;
+                if in_play {
+                    LONG_AFTER
+                } else {
+                    Duration::ZERO
+                }
+            })
+            .with_deadline(Duration::from_millis(40));
         let r = c.submit_many_held(&[
             (OP_ECHO, 0, b"a".to_vec()),
-            (OP_SLEEP, 0, 250u64.to_le_bytes().to_vec()),
+            (OP_HOLD, 0, Vec::new()),
             (OP_ECHO, 0, b"c".to_vec()),
         ]);
         assert_eq!(r.err(), Some(IpcError::Timeout));
@@ -575,7 +670,7 @@ fn a_batch_that_times_out_gives_every_slot_back() {
         assert_eq!(
             states.iter().filter(|&&s| s == ST_ABANDONED).count(),
             1,
-            "exactly the sleeping request's slot is retired: {states:?}"
+            "exactly the held request's slot is retired: {states:?}"
         );
         assert_eq!(
             states.iter().filter(|&&s| s == ST_FREE).count(),
@@ -583,6 +678,7 @@ fn a_batch_that_times_out_gives_every_slot_back() {
             "{states:?}"
         );
         let retired = states.iter().position(|&s| s == ST_ABANDONED).unwrap() as u32;
+        fx.open_latch();
         fx.await_state(retired, ST_FREE);
     });
 }
@@ -610,6 +706,10 @@ impl Notifier for &Watching {
 /// shim yields and sleeps — and only once the spin budget is spent. The reply
 /// is still collected, so the sleeping costs latency at most, never the
 /// answer.
+///
+/// The provider is held until the client has gone idle a few times, so the
+/// wait is late by construction rather than by a sleep a descheduled client
+/// thread could sleep straight through.
 #[test]
 fn a_late_response_is_waited_for_off_the_processor() {
     let fx = Fixture::new(2);
@@ -617,15 +717,28 @@ fn a_late_response_is_waited_for_off_the_processor() {
         idle_calls: AtomicU32::new(0),
         least_waited_us: AtomicU32::new(u32::MAX),
     };
-    fx.with_workers(1, || {
-        let c = RingClient::with_geom(fx.seg(), fx.geom, &w);
-        let r = c.submit(OP_SLEEP, 0, &60u64.to_le_bytes()).unwrap();
-        assert_eq!(r.payload, b"slept");
+    let waited = fx.with_workers(1, || {
+        thread::scope(|s| {
+            s.spawn(|| {
+                fx.until("the client went idle", || {
+                    w.idle_calls.load(Ordering::Relaxed) >= 3
+                });
+                fx.open_latch();
+            });
+            let c = RingClient::with_geom(fx.seg(), fx.geom, &w);
+            let t = Instant::now();
+            let r = c.submit(OP_HOLD, 0, b"").unwrap();
+            let waited = t.elapsed();
+            assert_eq!(r.payload, b"released");
+            waited
+        })
     });
+    // Each idle call sleeps 1 ms, so there are never more of them than
+    // milliseconds waited.
     let calls = w.idle_calls.load(Ordering::Relaxed);
     assert!(
-        (1..=70).contains(&calls),
-        "a 60 ms wait in 1 ms sleeps is a few dozen idle calls, not {calls}"
+        calls >= 3 && u128::from(calls) <= waited.as_millis(),
+        "a {waited:?} wait in 1 ms sleeps is at most one idle call a millisecond, not {calls}"
     );
     assert!(
         w.least_waited_us.load(Ordering::Relaxed) as u128 >= CLIENT_SPIN_BUDGET.as_micros(),
@@ -657,22 +770,42 @@ fn a_full_ring_is_waited_for_off_the_processor_and_not_for_ever() {
     assert!(w.least_waited_us.load(Ordering::Relaxed) as u128 >= CLIENT_SPIN_BUDGET.as_micros());
 }
 
-/// One deadline for a whole batch. Three requests served one after another,
-/// each taking 25 ms, against a 60 ms deadline: the third answers at 75 ms.
-/// With a clock per request, started when its turn to be awaited came, each
-/// was "on time" and the call ran past its deadline without noticing.
+/// One deadline for a whole batch. Two requests served one after another, 30
+/// and 35 ms of the client's clock, against a 60 ms deadline, and a third the
+/// server holds. With a clock per request, started when its turn to be awaited
+/// came, each of the first two was "on time" and the third would be waited for
+/// from 65 ms: the call ran past its deadline without noticing. With one, the
+/// deadline has passed by the time the third is awaited.
 #[test]
 fn a_batch_has_one_deadline_not_one_per_request() {
     let fx = Fixture::new(4);
     fx.with_workers(1, || {
-        let c = fx.client().with_deadline(Duration::from_millis(60));
-        let nap = 25u64.to_le_bytes().to_vec();
-        let r = c.submit_many_held(&[
-            (OP_SLEEP, 0, nap.clone()),
-            (OP_SLEEP, 0, nap.clone()),
-            (OP_SLEEP, 0, nap),
-        ]);
-        assert_eq!(r.err(), Some(IpcError::Timeout));
+        let c = RingClient::with_geom(fx.seg(), fx.geom, NapClock(&fx, Instant::now()))
+            .with_deadline(Duration::from_millis(60));
+        let done = AtomicBool::new(false);
+        let r = thread::scope(|s| {
+            // A client that never times out would wait on the held request for
+            // ever: let it go after a while, so that shows as a failure.
+            s.spawn(|| {
+                let t = Instant::now();
+                while !done.load(Ordering::SeqCst) && t.elapsed() < GIVE_UP {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                fx.open_latch();
+            });
+            let r = c.submit_many_held(&[
+                (OP_NAP, 0, 30u64.to_le_bytes().to_vec()),
+                (OP_NAP, 0, 35u64.to_le_bytes().to_vec()),
+                (OP_HOLD, 0, Vec::new()),
+            ]);
+            done.store(true, Ordering::SeqCst);
+            r
+        });
+        assert_eq!(
+            r.err(),
+            Some(IpcError::Timeout),
+            "the batch's one deadline passed at 60 ms"
+        );
         fx.until("every slot came back", || fx.slots_in(ST_FREE) == 4);
     });
 }

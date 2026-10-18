@@ -20,6 +20,15 @@ pub trait Notifier {
         self.wait_client(slot);
     }
     fn notify_slot_free(&self) {}
+    /// The clock a client measures its deadlines and its spin budget by.
+    ///
+    /// Wall-clock, and nothing else ships. It is here so a test can decide
+    /// when time passes for a client: a deadline that expires because a test
+    /// said so is checked the same on every machine, where one that expires
+    /// because 60 ms went by depends on when the client thread got to run.
+    fn now(&self) -> std::time::Instant {
+        std::time::Instant::now()
+    }
 }
 
 /// Ships this slice: pure spin. Waits are `spin_loop()` hints; notifies are

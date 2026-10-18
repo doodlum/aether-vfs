@@ -126,7 +126,7 @@ impl<'a, N: Notifier> RingClient<'a, N> {
     /// so the wait is spin, then [`Notifier::idle_client`], bounded by the
     /// deadline.
     fn claim_slot_from(&self, start: u32) -> Result<u32, IpcError> {
-        let began = std::time::Instant::now();
+        let began = self.notifier.now();
         let mut tries: u32 = 0;
         let mut idle = false;
         loop {
@@ -134,7 +134,7 @@ impl<'a, N: Notifier> RingClient<'a, N> {
                 return Ok(s);
             }
             if idle {
-                let waited = began.elapsed();
+                let waited = self.notifier.now().saturating_duration_since(began);
                 if waited > self.deadline {
                     return Err(IpcError::RingFull);
                 }
@@ -144,7 +144,7 @@ impl<'a, N: Notifier> RingClient<'a, N> {
             }
             tries = tries.wrapping_add(1);
             if tries.is_multiple_of(256) {
-                let waited = began.elapsed();
+                let waited = self.notifier.now().saturating_duration_since(began);
                 if waited > self.deadline {
                     return Err(IpcError::RingFull);
                 }
@@ -164,7 +164,7 @@ impl<'a, N: Notifier> RingClient<'a, N> {
     /// `EventNotifier`'s sleeps 1 ms per call (where the same count would be
     /// thirteen hours). Only wall-clock means the same thing to both.
     ///
-    /// `Instant::now()` is checked once every 4096 iterations so a spinning
+    /// The clock ([`Notifier::now`]) is read once every 4096 iterations so a spinning
     /// notifier does not pay for a clock read per turn. Past
     /// [`CLIENT_SPIN_BUDGET`] the wait is no longer on the hot path: the clock
     /// is read every turn and the notifier is told how long it has been
@@ -182,7 +182,7 @@ impl<'a, N: Notifier> RingClient<'a, N> {
                 return Ok(r);
             }
             if idle {
-                let waited = start.elapsed();
+                let waited = self.notifier.now().saturating_duration_since(start);
                 if waited > self.deadline {
                     return Err(IpcError::Timeout);
                 }
@@ -191,7 +191,7 @@ impl<'a, N: Notifier> RingClient<'a, N> {
             }
             tries = tries.wrapping_add(1);
             if tries.is_multiple_of(4096) {
-                let waited = start.elapsed();
+                let waited = self.notifier.now().saturating_duration_since(start);
                 if waited > self.deadline {
                     return Err(IpcError::Timeout);
                 }
@@ -240,7 +240,7 @@ impl<'a, N: Notifier> RingClient<'a, N> {
         let outcome = ring::publish_request(self.seg, &self.geom, slot, opcode, flags, payload)
             .and_then(|req_id| {
                 self.notifier.notify_server();
-                self.await_response(slot, req_id, std::time::Instant::now())
+                self.await_response(slot, req_id, self.notifier.now())
             });
         let (status, payload) = match outcome {
             Ok(r) => r,
@@ -316,7 +316,7 @@ impl<'a, N: Notifier> RingClient<'a, N> {
         }
         SLOT_HINT.with(|h| h.set(slots[0]));
         self.notifier.notify_server();
-        let published = std::time::Instant::now();
+        let published = self.notifier.now();
         let mut out = Vec::with_capacity(reqs.len());
         for (&slot, &req_id) in slots.iter().zip(&ids) {
             let (status, payload) = match self.await_response(slot, req_id, published) {

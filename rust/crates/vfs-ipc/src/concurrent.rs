@@ -444,11 +444,7 @@ impl DataGate {
             }
             // One permit out of `avail`, whatever the reserve: it is this
             // caller's first.
-            if self
-                .avail
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |a| a.checked_sub(1))
-                .is_err()
-            {
+            if !take_one(&self.avail) {
                 break;
             }
             if front
@@ -706,6 +702,20 @@ pub fn read_fragmented<N: Notifier>(
         }
     }
     Ok(filled)
+}
+
+/// Take one from `a` unless it is zero; whether it did. `fetch_update` by
+/// hand: Rust 1.99 deprecates that for `try_update`, which is newer than this
+/// workspace's MSRV, and a compare-exchange loop builds the same on both.
+fn take_one(a: &AtomicU32) -> bool {
+    let mut cur = a.load(Ordering::SeqCst);
+    while cur > 0 {
+        match a.compare_exchange_weak(cur, cur - 1, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(now) => cur = now,
+        }
+    }
+    false
 }
 
 #[cfg(test)]
