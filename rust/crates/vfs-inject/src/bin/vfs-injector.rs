@@ -74,6 +74,8 @@ fn main() {
         ready_path: ready,
         ready_timeout,
         detach: false,
+        env_set: Vec::new(),
+        env_remove: Vec::new(),
     })
     .unwrap_or_else(|e| {
         eprintln!("[vfs-injector] inject error: {e:?}");

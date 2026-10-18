@@ -390,68 +390,59 @@ impl IpcServe {
         std::fs::write(path, body).map_err(|e| format!("write thin config: {e}"))
     }
 
-    /// Windows-only: publishes the section name and both event names, none of
-    /// which exist in the file-backed mode. For a session that virtualizes
-    /// more than one root, pass the extra roots.
+    /// Windows-only: the variables a child needs to find this ring — the
+    /// section name and both event names, none of which exist in the
+    /// file-backed mode — for the launch to put in the child's environment
+    /// block. Nothing here writes this process's environment.
     ///
     /// `extra_roots` is `(id, path)` for every root **beyond root 0**, which
     /// `virtual_root` names. The shim needs the full set because the root id
     /// is what its ring requests now carry: a root it has never been told
-    /// about is one whose paths it classifies as belonging to no one and lets
-    /// fall through to real disk, silently.
+    /// about is one whose paths it classifies as belonging to no one.
+    ///
+    /// Every `vfs_env::handshake::TRANSPORT` name comes back, set (`Some`) or
+    /// to be removed (`None`), so nothing the host's own environment carries
+    /// can reach the child. The removals that matter most:
+    /// - `VFS_RING_PATH` **wins** over `VFS_RING_SECTION` in the shim (see
+    ///   `director::ring_source` in vfs-shim), so an inherited value would
+    ///   send the child to another ring file while this session's section sat
+    ///   unused;
+    /// - `VFS_VIRTUAL_ROOTS`: inheriting a stale extra root is the "declared
+    ///   root that is not there" failure the variable exists to prevent;
+    /// - `VFS_REGISTRY`: an inherited value must not turn the hooks on.
     #[cfg(windows)]
-    pub fn apply_env_roots(
+    pub fn env_roots(
         &self,
         virtual_root: &str,
         extra_roots: &[(u32, String)],
         thin_cfg: &std::path::Path,
         registry: bool,
-    ) {
-        // Process-global env is for the injected child (and single-session hosts).
-        //
-        // Every `vfs_env::handshake::TRANSPORT` name is either set here or
-        // removed, so nothing a previous session in this process left behind
-        // can reach the child. The removals that matter most:
-        // - `VFS_RING_PATH` **wins** over `VFS_RING_SECTION` in the shim (see
-        //   `director::ring_source` in vfs-shim), so a stale value from an earlier
-        //   file-backed session would send the child to that old ring file
-        //   (a director that is gone, or one another session still serves)
-        //   while this session's section sat unused and every log said the
-        //   launch was configured correctly;
-        // - `VFS_VIRTUAL_ROOTS`: inheriting a stale extra root is the
-        //   "declared root that is not there" failure the variable exists to
-        //   prevent;
-        // - `VFS_REGISTRY`: a stale value must not turn the hooks on.
-        let thin_cfg = thin_cfg.to_string_lossy();
-        let map_bytes = self.map_bytes.to_string();
-        let payload_cap = self.payload_cap.to_string();
-        let arena_offset = self.arena_offset.to_string();
-        let arena_len = self.arena_len.to_string();
-        let mut set: Vec<(&str, &str)> = vec![
-            (vfs_env::RING_SECTION, &self.section_name),
-            (vfs_env::RING_BYTES, &map_bytes),
-            (vfs_env::RING_PAYLOAD_CAP, &payload_cap),
-            (vfs_env::ARENA_OFFSET, &arena_offset),
-            (vfs_env::ARENA_LEN, &arena_len),
-            (vfs_env::SERVER_EV, &self.server_ev_name),
-            (vfs_env::CLIENT_EV, &self.client_ev_name),
-            (vfs_env::FUSE_CFG, &thin_cfg),
-            (vfs_env::VIRTUAL_DIR, virtual_root),
+    ) -> Vec<(&'static str, Option<String>)> {
+        let mut set: Vec<(&'static str, String)> = vec![
+            (vfs_env::RING_SECTION, self.section_name.clone()),
+            (vfs_env::RING_BYTES, self.map_bytes.to_string()),
+            (vfs_env::RING_PAYLOAD_CAP, self.payload_cap.to_string()),
+            (vfs_env::ARENA_OFFSET, self.arena_offset.to_string()),
+            (vfs_env::ARENA_LEN, self.arena_len.to_string()),
+            (vfs_env::SERVER_EV, self.server_ev_name.clone()),
+            (vfs_env::CLIENT_EV, self.client_ev_name.clone()),
+            (vfs_env::FUSE_CFG, thin_cfg.to_string_lossy().into_owned()),
+            (vfs_env::VIRTUAL_DIR, virtual_root.to_string()),
         ];
         // Set only while a registry layer is attached.
         if registry {
-            set.push((vfs_env::REGISTRY, "1"));
+            set.push((vfs_env::REGISTRY, "1".to_string()));
         }
-        let roots = vfs_env::handshake::encode_roots(extra_roots);
-        if let Some(spec) = &roots {
+        if let Some(spec) = vfs_env::handshake::encode_roots(extra_roots) {
             set.push((vfs_env::VIRTUAL_ROOTS, spec));
         }
-        for name in vfs_env::handshake::TRANSPORT {
-            match set.iter().find(|(n, _)| n == name) {
-                Some((n, v)) => std::env::set_var(n, v),
-                None => std::env::remove_var(name),
-            }
-        }
+        vfs_env::handshake::TRANSPORT
+            .iter()
+            .map(|&name| {
+                let value = set.iter().find(|(n, _)| *n == name).map(|(_, v)| v.clone());
+                (name, value)
+            })
+            .collect()
     }
 }
 

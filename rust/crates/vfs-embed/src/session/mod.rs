@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use crate::image::RootLocation;
 // `vfs_director::ipc` is portable, and `Session` uses **both** of its halves:
 // the named-section handshake on Windows (`IpcServe::start`, the event pair,
-// `write_thin_config`, `apply_env_roots`) and the file-backed ring on unix
+// `write_thin_config`, `env_roots`) and the file-backed ring on unix
 // (`IpcServe::start_file_backed`), which is how a shim inside Wine reaches a
 // native Linux director. So neither this import nor the `ipc` field below is
 // gated; only the two bodies that pick a transport are.

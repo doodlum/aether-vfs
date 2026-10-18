@@ -227,21 +227,26 @@ fn ring_client_reads_are_byte_exact() {
     s.mount("", Arc::new(DiskProvider::new(&dir))).unwrap();
     s.serve().expect("serve");
 
-    // `serve` publishes VFS_RING_* / VFS_VIRTUAL_DIR into this process env,
-    // which is exactly what the shim reads on the other side of the boundary.
-    let section = std::env::var("VFS_RING_SECTION").expect("ring section");
-    let ring_bytes: usize = std::env::var("VFS_RING_BYTES")
-        .ok()
+    // The ring's coordinates, from the thin config `serve` writes into the
+    // state directory — what the shim is pointed at (`VFS_FUSE_CFG`) on the
+    // other side of the boundary. `serve` no longer writes them into this
+    // process's environment.
+    let cfg = std::fs::read_to_string(state.join("fuse.cfg")).expect("thin config");
+    let field = |k: &str| {
+        cfg.lines()
+            .find_map(|l| l.strip_prefix(&format!("{k}=")))
+            .map(str::to_string)
+    };
+    let section = field("section").expect("ring section");
+    let ring_bytes: usize = field("ring_bytes")
         .and_then(|v| v.parse().ok())
-        .unwrap_or(2 * 1024 * 1024);
-    let payload_cap: u32 = std::env::var("VFS_RING_PAYLOAD_CAP")
-        .ok()
+        .expect("ring bytes");
+    let payload_cap: u32 = field("payload_cap")
         .and_then(|v| v.parse().ok())
-        .unwrap_or(1_048_576);
-    let arena_len: usize = std::env::var("VFS_ARENA_LEN")
-        .ok()
+        .expect("payload cap");
+    let arena_len: usize = field("arena_len")
         .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+        .expect("arena len");
     let root = dir.to_string_lossy().into_owned();
 
     let roots = [(vfs_protocol::RootId::DEFAULT, root)];

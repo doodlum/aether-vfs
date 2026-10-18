@@ -47,6 +47,8 @@ fn a_shim_that_never_reports_ready_gets_the_process_killed() {
         ready_path: ready_path.to_str().unwrap().to_string(),
         ready_timeout: Duration::from_secs(3),
         detach: false,
+        env_set: Vec::new(),
+        env_remove: Vec::new(),
     });
 
     assert!(

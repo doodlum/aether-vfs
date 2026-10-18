@@ -375,6 +375,9 @@ pub const FIXTURE_ORPHAN_DIR: &str = "VFS_FIXTURE_ORPHAN_DIR";
 /// `vfs-fixture-read`: set by the fixture on its orphan copy, to the parent's
 /// pid; never set by a host.
 pub const FIXTURE_ORPHAN_OF: &str = "VFS_FIXTURE_ORPHAN_OF";
+/// `vfs-fixture-read`: write what the process believes about itself (its
+/// environment, cwd, module path and argv[0]) to this file first.
+pub const FIXTURE_PROBE_OUT: &str = "VFS_FIXTURE_PROBE_OUT";
 /// `vfs-fixture-read`: a file read on slow threads while others read
 /// `FIXTURE_PATH` (the concurrent-read e2e).
 pub const FIXTURE_SLOW_PATH: &str = "VFS_FIXTURE_SLOW_PATH";
@@ -812,6 +815,11 @@ pub const ALL: &[Var] = &[
         default: "unset: not the orphan",
     },
     Var {
+        name: FIXTURE_PROBE_OUT,
+        kind: Kind::Fixture,
+        default: "unset: no probe",
+    },
+    Var {
         name: FIXTURE_SLOW_PATH,
         kind: Kind::Fixture,
         default: "unset: no slow reads",
@@ -1021,7 +1029,7 @@ pub fn describe() -> String {
 /// The handshake: every name the host writes and the child reads, in one place.
 ///
 /// Three crates had to agree on this set by hand: `vfs-proton`'s stale list,
-/// the Windows `IpcServe::apply_env_roots`, and the reserved-name check for
+/// the Windows `IpcServe::env_roots`, and the reserved-name check for
 /// `LaunchOpts::env`. They disagreed (`VFS_REGISTRY` and `VFS_FUSE_CFG` were in
 /// some and not others). They now all read these tables, and a test ties the
 /// tables to [`ALL`]: a new [`Kind::Handshake`] name that is in no table fails

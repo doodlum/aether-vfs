@@ -30,6 +30,8 @@ windows-sys = { workspace = true, features = [
   # `spawn_target_with_shim`: the launch's Job Object and its completion port.
   "Win32_System_JobObjects",
   "Win32_System_IO",
+  # The target's environment block, built from this process's (`env_block`).
+  "Win32_System_Environment",
 ] }
 
 [dev-dependencies]

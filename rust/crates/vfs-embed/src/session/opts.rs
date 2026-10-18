@@ -90,16 +90,16 @@ pub struct LaunchOpts {
     /// `vfs_proton::launch::merge_dll_overrides`), `WINEDEBUG` replaces the
     /// default `-all`, and a name the launch's handshake uses is refused.
     ///
-    /// **Windows: not child-only.** `CreateProcessW` is called with a null environment
-    /// block — inheritance *is* the mechanism — so [`Session::launch`] writes
-    /// each one into **this process's** environment with `std::env::set_var`,
-    /// launches, and restores the previous value. `LAUNCH_ENV_LOCK` serializes
-    /// that against every other env write this crate performs, so two sessions
-    /// cannot interleave; it cannot serialize a host's *own* threads, and
-    /// `set_var` in a multi-threaded process races anything else reading the
-    /// environment. See [`Session::launch`]'s "Process-global environment"
-    /// section for the costed fix.
+    /// **Windows: child-only too.** They go into the environment block the
+    /// child is created with, over this process's own environment and the
+    /// launch's ring variables; this process's environment is never written.
     pub env: BTreeMap<String, String>,
+    /// Variables the child does not inherit from this process — on both
+    /// paths. A name the launch sets itself (its handshake, or [`Self::env`])
+    /// is set regardless. A Steam game started outside Steam relaunches
+    /// itself through `steam://run` when it inherits `SteamAppId` or
+    /// `SteamGameId`; a host that launches one clears those here.
+    pub env_remove: Vec<String>,
     /// **Proton path only**: the working directory the program starts in, as
     /// it sees it — a `C:\…` path, or a path relative to root 0's location.
     /// A `String`, not a `PathBuf`: it names a place in the Wine prefix, with
@@ -153,6 +153,7 @@ impl Default for LaunchOpts {
             shim_dll: None,
             injector: None,
             env: BTreeMap::new(),
+            env_remove: Vec::new(),
             cwd: None,
             ready_timeout: None,
             log_file: None,

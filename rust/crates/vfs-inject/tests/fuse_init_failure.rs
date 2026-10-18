@@ -45,11 +45,6 @@ fn fuse_init_failure_aborts_the_launch() {
     let probe = env!("CARGO_BIN_EXE_vfs-probe").to_string();
     let dll = common::locate_shim();
 
-    // This is a single-test binary (one process), so mutating process env
-    // around this one call cannot race another test the way it would in a
-    // multi-test file (see `vfs-embed`'s `tests/support/launch.rs`
-    // `LAUNCH_LOCK` for that case).
-    std::env::set_var(vfs_env::TEST_FUSE_INIT_FAIL, "1");
     let result = run_target_with_shim(RunConfig {
         target_exe: probe,
         current_dir: None,
@@ -65,8 +60,9 @@ fn fuse_init_failure_aborts_the_launch() {
         ready_path: ready_path.to_str().unwrap().to_string(),
         ready_timeout: Duration::from_secs(10),
         detach: false,
+        env_set: vec![(vfs_env::TEST_FUSE_INIT_FAIL.into(), "1".into())],
+        env_remove: Vec::new(),
     });
-    std::env::remove_var(vfs_env::TEST_FUSE_INIT_FAIL);
 
     match result {
         Err(InjectError::FuseInit(msg)) => {

@@ -10,6 +10,7 @@ use std::time::Duration;
 
 mod artifacts;
 mod cli;
+mod env_block;
 mod inject;
 mod map;
 mod pe;
@@ -32,6 +33,14 @@ pub struct RunConfig {
     /// When true, return as soon as the target is running (do not wait for exit).
     /// [`run_target_with_shim`] only; [`spawn_target_with_shim`] never waits.
     pub detach: bool,
+    /// Variables the target gets on top of this process's environment, which
+    /// is never itself changed: the launch builds the target's block and hands
+    /// it to `CreateProcessW`. A later entry wins; names compare without
+    /// regard to case. The launch's own variables (`VFS_SHIM_CONFIG`,
+    /// `VFS_SHIM_READY`, ...) are added first, so an entry here overrides them.
+    pub env_set: Vec<(String, String)>,
+    /// Variables the target does not inherit from this process.
+    pub env_remove: Vec<String>,
 }
 
 /// Failure points in launch + inject + run.

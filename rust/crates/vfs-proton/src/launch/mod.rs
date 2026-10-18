@@ -134,7 +134,7 @@ pub struct WineLaunch {
     /// The managed root as Wine sees it (`C:\…`) — root 0 for the shim.
     pub virtual_dir: String,
     /// Roots beyond root 0, `(id, location as Wine sees it)`. Sent as
-    /// `VFS_VIRTUAL_ROOTS` in the format `IpcServe::apply_env_roots` writes on
+    /// `VFS_VIRTUAL_ROOTS` in the format `IpcServe::env_roots` writes on
     /// Windows, so the shim's parser is shared.
     pub virtual_roots: Vec<(u32, String)>,
     /// Arguments for the target, passed after `--`.
@@ -147,6 +147,11 @@ pub struct WineLaunch {
     /// refused ([`LaunchError::ReservedEnv`]). Child-only: nothing here is
     /// written into this process's environment.
     pub extra_env: BTreeMap<String, String>,
+    /// Variables the target does not inherit from this process, unless the
+    /// launch sets them itself (its handshake and [`Self::extra_env`] win).
+    /// On Windows a Steam game started through `steam://` relaunches itself
+    /// when it inherits `SteamAppId`; a host clears that here.
+    pub remove_env: Vec<String>,
     /// The target's working directory as it sees it (`C:\…`), sent to the
     /// injector as [`vfs_env::INJECT_CWD`]. `None`: the target inherits the
     /// injector's directory, which is `wine`'s host cwd seen through `Z:`.
@@ -218,6 +223,7 @@ impl WineLaunch {
             virtual_roots: Vec::new(),
             args: Vec::new(),
             extra_env: BTreeMap::new(),
+            remove_env: Vec::new(),
             cwd: None,
             ready_timeout_secs: None,
             log_file: None,
@@ -385,10 +391,15 @@ pub fn spawn(l: &WineLaunch) -> Result<std::process::Child, LaunchError> {
     // over `VFS_RING_SECTION` by design, so the ring itself is safe — but
     // `VFS_VIRTUAL_ROOTS` is not adjudicated that way, and a stale value would
     // point the child's root map somewhere this session never chose. That is
-    // the same stale-value hazard `IpcServe::apply_env_roots` clears with
-    // `remove_var`, and it applies here for the same reason.
+    // the same stale-value hazard the Windows launch (`IpcServe::env_roots`)
+    // clears in the child's block, and it applies here for the same reason.
     for stale in stale_env(&env) {
         cmd.env_remove(stale);
+    }
+    for name in &l.remove_env {
+        if !env.keys().any(|k| k.eq_ignore_ascii_case(name)) {
+            cmd.env_remove(name);
+        }
     }
     crate::process::spawn_retrying_busy(&mut cmd)
         .map_err(|e| LaunchError::Spawn(format!("{prog}: {e}")))

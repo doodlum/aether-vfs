@@ -44,46 +44,22 @@ pub(in crate::session) struct WindowsState {
     latest: Mutex<Weak<StopInner>>,
 }
 
-/// Serializes **every** process-global env mutation this crate performs —
-/// [`Session::serve`]'s as well as [`Session::launch`]'s.
-///
-/// `CreateProcessW` inherits the parent's environment (null env block), so the
-/// child's ring coordinates travel as process-wide `VFS_*` vars that
-/// `IpcServe::apply_env_roots` and `run_target_with_shim` both write. Two
-/// sessions interleaving there hand a child the other one's ring.
-///
-/// The lock is not only about interleaving. `std::env::set_var` is **unsound
-/// in a multi-threaded process** — it mutates a global the C runtime may be
-/// reading concurrently, which is why Rust 2024 marks it `unsafe` — and the
-/// hosts this crate exists for are multi-threaded by construction: a language
-/// runtime's thread pool, a GUI main process. Serializing our own writers is
-/// the floor, not the fix; the fix
-/// is to stop touching process env at all and hand `CreateProcessW` an
-/// explicit environment block built for the child (see [`Session::launch`]).
-///
-/// Windows-only: `serve`'s `apply_env_roots` and `launch`'s `opts.env`
-/// save/set/restore. The unix bodies never write process env: a Wine child's
-/// environment block is built by `vfs_proton::launch::launch_env`, `opts.env`
-/// included.
-#[cfg(windows)]
-static LAUNCH_ENV_LOCK: Mutex<()> = Mutex::new(());
-
 /// How long the injector waits for the shim to report ready when neither
 /// [`LaunchOpts::ready_timeout`] nor `VFS_READY_TIMEOUT_SECS` says: the default
 /// `vfs-injector.exe` itself uses.
 const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(vfs_env::DEFAULT_READY_TIMEOUT_SECS);
 
 impl Session {
-    /// The declared roots beyond root 0, as `apply_env_roots` wants them.
+    /// The declared roots beyond root 0, as `IpcServe::env_roots` wants them.
     ///
     /// No `id != 0` filter: [`Session::declare_root`] routes id 0 to
-    /// `virtual_root`, which `apply_env_roots` is handed separately, so
+    /// `virtual_root`, which `env_roots` is handed separately, so
     /// nothing here can be root 0; filtering id 0 here would silently discard a
     /// `declare_root(0, …)`, so the invariant is enforced in one place instead
     /// of compensated for.
     ///
-    /// Windows-only: its one caller is `serve`'s `apply_env_roots`, which is
-    /// itself `#[cfg(windows)]` — it publishes the named-section handshake
+    /// Windows-only: its one caller is `launch`'s `env_roots`, which is
+    /// itself `#[cfg(windows)]` — the named-section handshake
     /// (`VFS_RING_SECTION` plus the two event names). The file-backed ring has
     /// its own env protocol, published into the **child's** environment by
     /// `vfs_proton::launch::launch_env` rather than into this process's, and
@@ -129,25 +105,10 @@ impl Session {
         let root_s = self.virtual_root.to_string_lossy().into_owned();
         let thin = self.state_dir.join("fuse.cfg");
         ipc.write_thin_config(&thin, &root_s)?;
-        // Under the same lock `launch` holds. `apply_env_roots` writes ten
-        // process-global `VFS_*` vars; doing that outside the lock let a
-        // second session's `serve` land between this one's `serve` and its
-        // `launch` and repoint the ring the child would inherit — and, in a
-        // multi-threaded host, race any other thread reading the environment.
-        // See [`LAUNCH_ENV_LOCK`].
-        {
-            let _guard = LAUNCH_ENV_LOCK
-                .lock()
-                .map_err(|_| "launch env lock poisoned".to_string())?;
-            ipc.apply_env_roots(
-                &root_s,
-                &self.extra_roots_env(),
-                &thin,
-                self.registry_attached(),
-            );
-        }
 
-        // No `shim.cfg` here: `launch` writes it from the root as it is then.
+        // No `shim.cfg` here, and nothing in this process's environment:
+        // `launch` writes the config, and builds the child's environment
+        // block, from the roots as they are then.
 
         self.ipc = Some(ipc);
         Ok(())
@@ -218,25 +179,16 @@ impl Session {
     /// (`wait: false`) requires the session to outlive the child — which it
     /// already did for the ring.
     ///
-    /// ## Process-global environment
+    /// ## The child's environment
     ///
-    /// The child receives its ring coordinates by **inheriting** them:
-    /// `CreateProcessW` is called with a null environment block, so this
-    /// method and [`Session::serve`] set process-wide `VFS_*` variables and
-    /// `opts.env` entries, then restore them. [`LAUNCH_ENV_LOCK`] serializes
-    /// that, which is enough for two sessions in one host and **not** enough
-    /// for a host with unrelated threads: `std::env::set_var` races anything
-    /// else reading the environment, and a language binding always has such
-    /// threads.
-    ///
-    /// Removing the hazard means never writing process env: build the child's
-    /// environment block explicitly and pass it to `CreateProcessW`. That is a
-    /// change to `vfs_inject::RunConfig` (which owns the `CreateProcessW`
-    /// call) plus a caller-supplied set of variables instead of
-    /// `IpcServe::apply_env_roots`'s global writes; the shim side reads the
-    /// same names out of the child's own environment either way, so it does
-    /// not move. Worth doing before a second host depends on the current
-    /// shape.
+    /// Built for the child and handed to `CreateProcessW`; this process's
+    /// own environment is never written, during the launch or after it. The
+    /// block is this process's environment with the ring's `VFS_*` variables
+    /// set (any the host carries are replaced or cleared), then
+    /// [`LaunchOpts::env`], and without [`LaunchOpts::env_remove`]. So two
+    /// sessions in one process each hand their own child their own ring, and
+    /// a host's other threads never see the environment change. The shim
+    /// reads the same names out of the child's own environment.
     #[cfg(windows)]
     pub fn launch(&self, opts: &LaunchOpts) -> Result<i32, String> {
         let mut handle = self.launch_detached(opts)?;
@@ -308,33 +260,25 @@ impl Session {
         );
         let ready_path_s = ready_path.to_string_lossy().into_owned();
 
-        // Serialize env mutation: ring env + per-child fixture vars inherit via
-        // CreateProcessW(null environment).
-        let _guard = LAUNCH_ENV_LOCK
-            .lock()
-            .map_err(|_| "launch env lock poisoned".to_string())?;
-
-        // Re-published here, not only in `serve`: the launch env lock is held
-        // from this point, and a root declared after `serve` (or by another
-        // session sharing this process's environment) must reach this child.
-        ipc.apply_env_roots(
+        // The child's environment: this process's own, which is never
+        // written, with the ring's variables set or cleared (so nothing the
+        // host carries can repoint the child), then `opts.env`, and without
+        // `opts.env_remove`. Built per launch, so a root declared after
+        // `serve`, or a second session in this process, cannot leak into it.
+        let mut env_set: Vec<(String, String)> = Vec::new();
+        let mut env_remove: Vec<String> = opts.env_remove.clone();
+        for (name, value) in ipc.env_roots(
             &root_s,
             &self.extra_roots_env(),
             &thin,
             self.registry_attached(),
-        );
-
-        let mut saved: Vec<(String, Option<String>)> = Vec::with_capacity(opts.env.len() + 2);
-        // `spawn_target_with_shim` publishes these for the target to inherit;
-        // they must not outlive this launch in a host that launches again.
-        // Saved before `opts.env` and before the ready timeout is read below.
-        for k in [vfs_env::READY_TIMEOUT_SECS, vfs_env::CHILD_REFUSED_LOG] {
-            saved.push((k.to_string(), std::env::var(k).ok()));
+        ) {
+            match value {
+                Some(v) => env_set.push((name.to_string(), v)),
+                None => env_remove.push(name.to_string()),
+            }
         }
-        for (k, v) in &opts.env {
-            saved.push((k.clone(), std::env::var(k).ok()));
-            std::env::set_var(k, v);
-        }
+        env_set.extend(opts.env.iter().map(|(k, v)| (k.clone(), v.clone())));
 
         let ready_timeout = opts.ready_timeout.unwrap_or_else(|| {
             vfs_env::text(vfs_env::READY_TIMEOUT_SECS)
@@ -352,17 +296,9 @@ impl Session {
             ready_path: ready_path_s.clone(),
             ready_timeout,
             detach: true,
+            env_set,
+            env_remove,
         });
-
-        for (k, old) in saved {
-            match old {
-                Some(v) => std::env::set_var(&k, v),
-                None => std::env::remove_var(&k),
-            }
-        }
-        // The program has inherited its environment; nothing below touches
-        // process env, so another launch need not wait for this one to end.
-        drop(_guard);
 
         // Children the shim killed because it could not inject them, one
         // `<image> <reason>` line each, beside the ready file.

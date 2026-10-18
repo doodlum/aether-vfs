@@ -829,6 +829,7 @@ impl Session {
         // Child-only: the spawned `wine` gets these in its environment
         // block, and this process's environment is never written.
         launch.extra_env = opts.env.clone();
+        launch.remove_env = opts.env_remove.clone();
         launch.cwd = Some(cwd);
         launch.ready_timeout_secs = opts.ready_timeout.map(|d| d.as_secs().max(1));
         launch.log_file = opts.log_file.clone();

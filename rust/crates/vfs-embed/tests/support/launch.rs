@@ -5,20 +5,14 @@ use std::time::Duration;
 
 use vfs_embed::{LaunchOpts, Session};
 
-/// `Session::launch` configures the injected child through **process-global**
-/// environment variables (`IpcServe::apply_env_roots`'s own comment: "for the
-/// injected child (and single-session hosts)"). Any two tests in this binary
-/// that each create a session and launch a real child process race on that
-/// global env under the default (parallel) test harness — whichever
-/// session's `apply_env_roots` fires last wins for the whole process, so a child
-/// can silently connect to the *other* test's ring/session instead of its
-/// own. Flip-tested: without this lock, running this file's launching tests
-/// together is intermittently flaky (a write lands nowhere the assertions
-/// expect) even though each passes reliably alone.
+/// One launching test at a time in this binary.
 ///
-/// The director's open counts (`vfs_embed::open_totals`) are process-global
-/// too, and the reconciliation tests read a delta of them across one launch,
-/// which is a second reason a launch must not overlap another.
+/// A launch no longer configures its child through this process's
+/// environment (the child gets an explicit block), so two sessions cannot
+/// hand each other's child the wrong ring any more. What still needs the
+/// order: the director's open counts (`vfs_embed::open_totals`) are
+/// process-global, and the reconciliation tests read a delta of them across
+/// one launch, so a launch must not overlap another.
 ///
 /// This is the project's stated convention for a test touching process-global
 /// state (see `VA_LOCK` in `vfs-shim::lazy_section`) rather than moving every

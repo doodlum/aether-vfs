@@ -17,8 +17,8 @@ use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress
 use windows_sys::Win32::System::Memory::{VirtualAllocEx, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, CreateRemoteThread, GetExitCodeProcess, ResumeThread, TerminateProcess,
-    WaitForSingleObject, CREATE_SUSPENDED, INFINITE, LPTHREAD_START_ROUTINE, PROCESS_INFORMATION,
-    STARTUPINFOW,
+    WaitForSingleObject, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, INFINITE,
+    LPTHREAD_START_ROUTINE, PROCESS_INFORMATION, STARTUPINFOW,
 };
 
 use crate::tree::{finish_code, Job, ProcessTree};
@@ -377,8 +377,8 @@ unsafe fn fail_closed(pi: &PROCESS_INFORMATION, e: InjectError) -> InjectError {
 /// inside Wine, where the Proton launch watches the whole prefix instead; a
 /// host that needs the whole process tree uses [`spawn_target_with_shim`].
 pub fn run_target_with_shim(cfg: RunConfig) -> Result<i32, InjectError> {
-    publish_launch_env(&cfg);
-    let started = start_target(&cfg, None)?;
+    let env = launch_env_block(&cfg);
+    let started = start_target(&cfg, None, &env)?;
     // SAFETY: `started.process` is the live handle `start_target` handed over;
     // it is closed on every path below.
     unsafe {
@@ -411,7 +411,7 @@ pub fn run_target_with_shim(cfg: RunConfig) -> Result<i32, InjectError> {
 /// nesting) is launched anyway and tracked alone: see
 /// [`ProcessTree::untracked_reason`].
 pub fn spawn_target_with_shim(cfg: RunConfig) -> Result<ProcessTree, InjectError> {
-    publish_launch_env(&cfg);
+    let env = launch_env_block(&cfg);
     let (mut job, no_job) = match Job::new() {
         Ok(j) => (Some(j), None),
         Err(e) => (
@@ -422,7 +422,7 @@ pub fn spawn_target_with_shim(cfg: RunConfig) -> Result<ProcessTree, InjectError
             )),
         ),
     };
-    let started = start_target(&cfg, job.as_mut())?;
+    let started = start_target(&cfg, job.as_mut(), &env)?;
     // SAFETY: `started.process` is live and owned; the tree takes it over.
     Ok(unsafe {
         ProcessTree::new(
@@ -435,32 +435,41 @@ pub fn spawn_target_with_shim(cfg: RunConfig) -> Result<ProcessTree, InjectError
     })
 }
 
-/// The process-wide environment a launched target inherits, and a clean
-/// slate for its ready file.
-fn publish_launch_env(cfg: &RunConfig) {
-    std::env::set_var(vfs_env::SHIM_CONFIG, &cfg.config_path);
-    std::env::set_var(vfs_env::SHIM_READY, &cfg.ready_path);
+/// The environment block the target starts with, and a clean slate for its
+/// ready file. This process's own environment is read, never written: see
+/// `env_block`.
+fn launch_env_block(cfg: &RunConfig) -> Vec<u16> {
     // Where the shim says which children it killed; descendants inherit it.
     let refused_log = format!("{}{}", cfg.ready_path, vfs_env::CHILD_REFUSED_SUFFIX);
     let _ = std::fs::remove_file(&refused_log);
-    std::env::set_var(vfs_env::CHILD_REFUSED_LOG, &refused_log);
-    // The shim waits for each child process it injects as long as this launch
-    // waits for the shim: it reads the value back from the inherited environment.
-    std::env::set_var(
-        vfs_env::READY_TIMEOUT_SECS,
-        cfg.ready_timeout.as_secs().max(1).to_string(),
-    );
+    let _ = std::fs::remove_file(&cfg.ready_path);
+    let mut set: Vec<(String, String)> = vec![
+        (vfs_env::SHIM_CONFIG.into(), cfg.config_path.clone()),
+        (vfs_env::SHIM_READY.into(), cfg.ready_path.clone()),
+        (vfs_env::CHILD_REFUSED_LOG.into(), refused_log),
+        // The shim waits for each child process it injects as long as this
+        // launch waits for the shim: it reads the value back from its
+        // environment.
+        (
+            vfs_env::READY_TIMEOUT_SECS.into(),
+            cfg.ready_timeout.as_secs().max(1).to_string(),
+        ),
+    ];
     // The managed root, so the child's fuse client matches the session root —
-    // unless the caller already named it. The Proton launch sets
-    // `VFS_VIRTUAL_DIR` to root 0 and a working directory that may be below
-    // it; every Windows caller passes its root as `current_dir` and sets the
-    // same value (or none), so for them nothing changes.
+    // unless the caller or this process already names it. The Proton launch
+    // sets `VFS_VIRTUAL_DIR` to root 0 and a working directory that may be
+    // below it.
     if let Some(ref d) = cfg.current_dir {
-        if std::env::var_os(vfs_env::VIRTUAL_DIR).is_none() {
-            std::env::set_var(vfs_env::VIRTUAL_DIR, d);
+        let named = |n: &str| n.eq_ignore_ascii_case(vfs_env::VIRTUAL_DIR);
+        let removed = cfg.env_remove.iter().any(|n| named(n));
+        if !cfg.env_set.iter().any(|(n, _)| named(n))
+            && (removed || std::env::var_os(vfs_env::VIRTUAL_DIR).is_none())
+        {
+            set.push((vfs_env::VIRTUAL_DIR.into(), d.clone()));
         }
     }
-    let _ = std::fs::remove_file(&cfg.ready_path);
+    set.extend(cfg.env_set.iter().cloned());
+    crate::env_block::build(&crate::env_block::current(), &set, &cfg.env_remove)
 }
 
 /// A target that is running with its shim up.
@@ -474,9 +483,13 @@ struct Started {
 
 /// Start the target with the shim (see [`run_target_with_shim`]) and, when
 /// `job` is given, assign it to the job before it runs.
-fn start_target(cfg: &RunConfig, job: Option<&mut Job>) -> Result<Started, InjectError> {
+fn start_target(
+    cfg: &RunConfig,
+    job: Option<&mut Job>,
+    env: &[u16],
+) -> Result<Started, InjectError> {
     if crate::exe_imports_shim(&cfg.target_exe) {
-        return start_import_activated(cfg, job);
+        return start_import_activated(cfg, job, env);
     }
 
     let timeout_ms = u32::try_from(cfg.ready_timeout.as_millis()).unwrap_or(u32::MAX - 1);
@@ -496,8 +509,8 @@ fn start_target(cfg: &RunConfig, job: Option<&mut Job>) -> Result<Started, Injec
             core::ptr::null(),
             core::ptr::null(),
             0,
-            CREATE_SUSPENDED,
-            core::ptr::null(),
+            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
+            env.as_ptr().cast(),
             cwd_w
                 .as_ref()
                 .map(|v| v.as_ptr())
@@ -584,7 +597,11 @@ fn command_line(cfg: &RunConfig) -> String {
 ///
 /// Created suspended only to be assigned to `job` before it runs, then
 /// resumed at once; without a job it is started running, as it always was.
-fn start_import_activated(cfg: &RunConfig, job: Option<&mut Job>) -> Result<Started, InjectError> {
+fn start_import_activated(
+    cfg: &RunConfig,
+    job: Option<&mut Job>,
+    env: &[u16],
+) -> Result<Started, InjectError> {
     let mut cmd_w = wide(&command_line(cfg));
     let app_w = wide(&cfg.target_exe);
     let cwd_w = cfg.current_dir.as_ref().map(|s| wide(s));
@@ -602,8 +619,8 @@ fn start_import_activated(cfg: &RunConfig, job: Option<&mut Job>) -> Result<Star
             core::ptr::null(),
             core::ptr::null(),
             0,
-            flags,
-            core::ptr::null(),
+            flags | CREATE_UNICODE_ENVIRONMENT,
+            env.as_ptr().cast(),
             cwd_w
                 .as_ref()
                 .map(|v| v.as_ptr())

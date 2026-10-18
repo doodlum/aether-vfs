@@ -25,6 +25,9 @@
 //! `VFS_FIXTURE_ORPHAN_DIR` starts a copy of the fixture after the first read
 //! and exits without waiting for it, the copy outliving it: see `orphan.rs`.
 //!
+//! `VFS_FIXTURE_PROBE_OUT` writes what the process believes about itself (its
+//! environment, cwd, module path and argv[0]) before anything else: see `probe.rs`.
+//!
 //! `VFS_FIXTURE_NAMES` and its companions run the names phase first: see
 //! `names.rs`. Windows only — it calls Win32 directly.
 //!
@@ -66,6 +69,7 @@ mod cache;
 #[cfg(windows)]
 mod names;
 mod orphan;
+mod probe;
 
 fn env_num(name: &str, default: usize) -> usize {
     std::env::var(name)
@@ -195,6 +199,7 @@ fn spawn_copy_of_self() {
 }
 
 fn main() {
+    probe::run();
     #[cfg(windows)]
     names::run();
     let path = std::env::var("VFS_FIXTURE_PATH").unwrap_or_else(|_| {

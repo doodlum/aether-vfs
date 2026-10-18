@@ -55,7 +55,7 @@ impl Session {
             old.durable()?;
         }
         self.kernel.set_registry(host);
-        // `VFS_REGISTRY` reaches a child through `launch`: `apply_env_roots`
+        // `VFS_REGISTRY` reaches a child through `launch`: `env_roots`
         // sets or clears it, under `LAUNCH_ENV_LOCK`, from
         // `registry_attached()` on every serve and launch (a unix launch
         // builds its own environment, `WineLaunch::registry`). So this does
