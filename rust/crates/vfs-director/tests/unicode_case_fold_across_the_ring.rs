@@ -158,9 +158,9 @@ fn a_mount_prefixed_with_a_non_ascii_cased_component_matches_a_shim_folded_vpath
 }
 
 /// Two layers each contributing the same file under a non-ASCII-cased name,
-/// spelled with different case. The merge map must collapse them to one entry
-/// with the top layer winning — the same job `to_ascii_lowercase` silently
-/// stopped doing for these names.
+/// spelled with different case. The merge map must collapse them to one entry,
+/// the top layer's, under the bottom layer's spelling — a collapse
+/// `to_ascii_lowercase` silently stopped doing for these names.
 #[test]
 fn layered_readdir_collapses_two_case_spellings_of_a_non_ascii_name() {
     let dir = scratch("layered");
@@ -189,9 +189,18 @@ fn layered_readdir_collapses_two_case_spellings_of_a_non_ascii_name() {
         1,
         "two case spellings of one Unicode name must merge to a single entry, got {entries:?}"
     );
+    // The top layer is the live entry: its size, not the bottom's. The name
+    // keeps the bottom's spelling, the merge rule `LayeredProvider` shares
+    // with the overlay (`vfs_compose::merge_upper_entry`).
+    let merged = entries.iter().find(|e| e.name == matching[0]).unwrap();
     assert_eq!(
-        matching[0], lower_file,
-        "the top layer's spelling must win the merge"
+        merged.stat.size,
+        b"FROM-TOP".len() as u64,
+        "the top layer's entry must win the merge"
+    );
+    assert_eq!(
+        matching[0], upper_file,
+        "a name both layers hold keeps the bottom layer's spelling"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
