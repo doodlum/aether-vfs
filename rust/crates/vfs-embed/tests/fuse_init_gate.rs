@@ -42,7 +42,7 @@ fn locate_artifact(name: &str) -> std::path::PathBuf {
     panic!("{name} not found near {profile:?} after ensure_fixtures()");
 }
 
-/// Build the shim DLL, the (separate-workspace) payload DLL, and `vfs-probe`
+/// Build the shim DLL and `vfs-probe`
 /// (a `vfs-inject` test target that unconditionally writes its output file —
 /// the decisive "did this process actually run" signal below) once per test
 /// process, then co-locate them beside the test binary so `Session::launch`'s
@@ -82,21 +82,6 @@ fn ensure_fixtures() {
             .status()
             .expect("spawn cargo to build shim + vfs-probe");
         assert!(status.success(), "shim/vfs-probe build failed: {status}");
-
-        let target_dir = workspace.join("target");
-        let status = std::process::Command::new(&cargo)
-            .current_dir(&workspace)
-            .env("CARGO_TARGET_DIR", &target_dir)
-            .args([
-                "build",
-                "--manifest-path",
-                "crates/vfs-payload/Cargo.toml",
-                "--quiet",
-            ])
-            .args(release)
-            .status()
-            .expect("spawn cargo to build vfs-payload");
-        assert!(status.success(), "vfs-payload build failed: {status}");
 
         let profile = profile_dir();
         for name in ["vfs_shim_dll.dll", "vfs-probe.exe"] {
