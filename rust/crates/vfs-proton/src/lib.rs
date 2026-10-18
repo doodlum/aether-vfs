@@ -16,6 +16,7 @@
 // carries `ureq` -> `rustls` -> `ring`, a C cross-compile in a build script,
 // and `vfs-embed` consumes this crate on unix to *launch*, not to install.
 pub mod artifacts;
+pub mod hostenv;
 #[cfg(feature = "acquire")]
 pub mod install;
 pub mod launch;

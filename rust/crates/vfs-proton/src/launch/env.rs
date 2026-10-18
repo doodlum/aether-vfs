@@ -69,7 +69,7 @@ pub fn launch_env(l: &WineLaunch) -> BTreeMap<String, String> {
     for (k, v) in runtime_lib_env(
         &runtime_abs,
         ld_in.as_deref(),
-        std::env::var_os("ORIG_LD_LIBRARY_PATH").as_deref(),
+        crate::hostenv::var_os("ORIG_LD_LIBRARY_PATH").as_deref(),
         dll_in.as_deref(),
     ) {
         env.insert(k, v);
@@ -170,7 +170,7 @@ pub fn launch_env(l: &WineLaunch) -> BTreeMap<String, String> {
 /// A search-path variable's inherited part: [`WineLaunch::extra_env`]'s value
 /// in front of this process's, either alone when the other is unset or empty.
 fn caller_then_host(l: &WineLaunch, name: &str) -> Option<std::ffi::OsString> {
-    let host = std::env::var_os(name);
+    let host = crate::hostenv::var_os(name);
     match (l.extra_env.get(name), &host) {
         (Some(x), Some(h)) if !h.is_empty() => Some(std::ffi::OsString::from(format!(
             "{x}:{}",

@@ -148,7 +148,7 @@ fn run_proton_init(
     let log_path = compat.join(PROTON_INIT_LOG);
     let log = std::fs::File::create(&log_path)?;
     let app = app_id.to_string();
-    let mut cmd = std::process::Command::new(&proton);
+    let mut cmd = crate::hostenv::command(&proton);
     // The host's own Proton knobs (`PROTON_USE_WINED3D`, `PROTON_LOG`, …) and
     // DLL overrides would shape the prefix this builds for every later launch;
     // it is set up from this runtime's defaults alone.
@@ -227,7 +227,7 @@ fn is_initialised(prefix_dir: &Path) -> bool {
 
 fn run_wineboot(runtime: &Path, prefix_dir: &Path) -> Result<(), PrefixError> {
     let wine = runtime.join("files").join("bin").join("wine");
-    let mut cmd = std::process::Command::new(&wine);
+    let mut cmd = crate::hostenv::command(&wine);
     cmd.arg("wineboot")
         .arg("-u")
         .env("WINEPREFIX", prefix_dir)

@@ -142,9 +142,9 @@ pub fn runtime_lib_env(
 pub fn runtime_lib_env_host(runtime: &Path) -> Vec<(String, String)> {
     runtime_lib_env(
         runtime,
-        std::env::var_os("LD_LIBRARY_PATH").as_deref(),
-        std::env::var_os("ORIG_LD_LIBRARY_PATH").as_deref(),
-        std::env::var_os("WINEDLLPATH").as_deref(),
+        crate::hostenv::var_os("LD_LIBRARY_PATH").as_deref(),
+        crate::hostenv::var_os("ORIG_LD_LIBRARY_PATH").as_deref(),
+        crate::hostenv::var_os("WINEDLLPATH").as_deref(),
     )
 }
 

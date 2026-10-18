@@ -28,7 +28,7 @@ impl Prefix {
         let mut timed_out = None;
         for flag in ["-k", "-w"] {
             // `-k` exits non-zero when no server is running; that is fine.
-            let mut cmd = std::process::Command::new(&server);
+            let mut cmd = crate::hostenv::command(&server);
             cmd.arg(flag)
                 .env("WINEPREFIX", &self.dir)
                 .stdin(std::process::Stdio::null())
@@ -59,8 +59,7 @@ impl Prefix {
     /// whatever runs in the prefix, so a caller polls it (`try_wait`) or
     /// waits on it where blocking for that long is the point.
     pub fn spawn_wineserver_wait(&self, runtime: &Path) -> io::Result<std::process::Child> {
-        let mut cmd =
-            std::process::Command::new(runtime.join("files").join("bin").join("wineserver"));
+        let mut cmd = crate::hostenv::command(runtime.join("files").join("bin").join("wineserver"));
         cmd.arg("-w")
             .env("WINEPREFIX", &self.dir)
             .stdin(std::process::Stdio::null())

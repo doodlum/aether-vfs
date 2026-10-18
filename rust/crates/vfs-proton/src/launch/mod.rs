@@ -357,7 +357,7 @@ pub fn spawn(l: &WineLaunch) -> Result<std::process::Child, LaunchError> {
     }
 
     let (prog, argv) = command_line(l);
-    let mut cmd = std::process::Command::new(&prog);
+    let mut cmd = crate::hostenv::command(&prog);
     let env = launch_env(l);
     cmd.args(&argv).envs(&env);
     if let Some(log) = &l.log_file {
