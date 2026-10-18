@@ -233,6 +233,18 @@ mod tests {
         d
     }
 
+    /// `/rt/files/lib/<sub>` as [`runtime_lib_env`] spells it on this host:
+    /// exactly that string on Linux, where these variables are used; with the
+    /// joins in `\` on a Windows host, which builds them only in tests.
+    fn rt_lib(sub: &str) -> String {
+        Path::new("/rt")
+            .join("files")
+            .join("lib")
+            .join(sub)
+            .to_string_lossy()
+            .into_owned()
+    }
+
     #[test]
     fn verify_ge_accepts_a_real_ge_version_file() {
         // Exactly the bytes GE-Proton11-6 ships: a build id, a space, the tag.
@@ -308,12 +320,16 @@ mod tests {
         .collect();
         assert_eq!(
             m["LD_LIBRARY_PATH"],
-            "/rt/files/lib/x86_64-linux-gnu:/rt/files/lib/i386-linux-gnu:/host/lib"
+            format!(
+                "{}:{}:/host/lib",
+                rt_lib("x86_64-linux-gnu"),
+                rt_lib("i386-linux-gnu")
+            )
         );
         assert_eq!(m["ORIG_LD_LIBRARY_PATH"], "/host/lib");
         assert_eq!(
             m["WINEDLLPATH"],
-            "/rt/files/lib/vkd3d:/rt/files/lib/wine:/host/dll"
+            format!("{}:{}:/host/dll", rt_lib("vkd3d"), rt_lib("wine"))
         );
     }
 
@@ -325,10 +341,17 @@ mod tests {
                 .collect();
         assert_eq!(
             m["LD_LIBRARY_PATH"],
-            "/rt/files/lib/x86_64-linux-gnu:/rt/files/lib/i386-linux-gnu"
+            format!(
+                "{}:{}",
+                rt_lib("x86_64-linux-gnu"),
+                rt_lib("i386-linux-gnu")
+            )
         );
         assert_eq!(m["ORIG_LD_LIBRARY_PATH"], "");
-        assert_eq!(m["WINEDLLPATH"], "/rt/files/lib/vkd3d:/rt/files/lib/wine");
+        assert_eq!(
+            m["WINEDLLPATH"],
+            format!("{}:{}", rt_lib("vkd3d"), rt_lib("wine"))
+        );
         let m: std::collections::HashMap<_, _> = runtime_lib_env(
             Path::new("/rt"),
             Some(OsStr::new("/x")),

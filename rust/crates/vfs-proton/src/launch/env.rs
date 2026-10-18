@@ -252,21 +252,31 @@ mod tests {
     use crate::launch::tests::{abs, sample};
     use crate::launch::*;
 
+    /// `<runtime>/files/lib/<sub>` joined the way [`launch_env`] joins it.
+    /// On Linux, where these variables are used, that is plain `/`; a
+    /// Windows host builds them only in tests and joins with `\`.
+    fn lib(l: &WineLaunch, sub: &str) -> String {
+        path_string(&l.runtime.join("files").join("lib").join(sub))
+    }
+
     #[test]
     fn launch_env_puts_the_runtime_libs_first_on_ld_library_path() {
         let l = sample();
         let env = launch_env(&l);
-        let rt = path_string(&l.runtime);
         assert!(
             env["LD_LIBRARY_PATH"].starts_with(&format!(
-                "{rt}/files/lib/x86_64-linux-gnu:{rt}/files/lib/i386-linux-gnu"
+                "{}:{}",
+                lib(&l, "x86_64-linux-gnu"),
+                lib(&l, "i386-linux-gnu")
             )),
             "{}",
             env["LD_LIBRARY_PATH"]
         );
-        assert!(
-            env["WINEDLLPATH"].starts_with(&format!("{rt}/files/lib/vkd3d:{rt}/files/lib/wine"))
-        );
+        assert!(env["WINEDLLPATH"].starts_with(&format!(
+            "{}:{}",
+            lib(&l, "vkd3d"),
+            lib(&l, "wine")
+        )));
         assert!(
             env.contains_key("ORIG_LD_LIBRARY_PATH")
                 || std::env::var_os("ORIG_LD_LIBRARY_PATH").is_some()
@@ -279,8 +289,11 @@ mod tests {
         l.extra_env
             .insert("LD_LIBRARY_PATH".to_string(), "/mine/lib".to_string());
         let ld = launch_env(&l).remove("LD_LIBRARY_PATH").unwrap();
-        let rt = path_string(&l.runtime);
-        let rt_dirs = format!("{rt}/files/lib/x86_64-linux-gnu:{rt}/files/lib/i386-linux-gnu");
+        let rt_dirs = format!(
+            "{}:{}",
+            lib(&l, "x86_64-linux-gnu"),
+            lib(&l, "i386-linux-gnu")
+        );
         assert!(ld.starts_with(&rt_dirs), "{ld}");
         let rest = &ld[rt_dirs.len()..];
         assert!(rest.starts_with(":/mine/lib"), "{ld}");
@@ -483,7 +496,7 @@ mod tests {
         l.extra_env = BTreeMap::from([("WINEDLLPATH".to_string(), "/mine".to_string())]);
         let dll = launch_env(&l)["WINEDLLPATH"].clone();
         assert!(dll.starts_with("/rt/nvml/wine:"), "{dll}");
-        assert!(dll.contains("/files/lib/wine:/mine"), "{dll}");
+        assert!(dll.contains(&format!("{}:/mine", lib(&l, "wine"))), "{dll}");
 
         l.extra_env = BTreeMap::from([("DXVK_ENABLE_NVAPI".to_string(), "0".to_string())]);
         assert_eq!(

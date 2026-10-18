@@ -242,11 +242,9 @@ mod tests {
         let rt = fake_runtime(&b);
         let h = nvidia_host(&b);
         let s = setup(&h, &rt).unwrap();
-        let to: Vec<_> = s
-            .copies
-            .iter()
-            .map(|c| c.to.to_string_lossy().into_owned())
-            .collect();
+        // Compared as paths, not strings: the plan joins the DLL name onto the
+        // prefix-relative directory, which a Windows host does with `\`.
+        let to: Vec<_> = s.copies.iter().map(|c| c.to.as_path()).collect();
         assert_eq!(
             to,
             [
@@ -256,6 +254,7 @@ mod tests {
                 "drive_c/windows/system32/_nvngx.dll",
                 "drive_c/windows/system32/nvngx.dll",
             ]
+            .map(Path::new)
         );
         let ngx = h.root.join("usr/lib/nvidia/wine");
         assert_eq!(s.ngx_dir.as_deref(), Some(ngx.as_path()));

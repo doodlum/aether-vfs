@@ -62,8 +62,21 @@ mod test_support {
         std::fs::write(p, body).unwrap();
     }
 
+    /// A PCI address (`0000:01:00.0`) as a directory name the test host's
+    /// filesystem can hold. Linux keeps it as the kernel spells it; NTFS
+    /// reserves `:` for alternate data streams, so a Windows run swaps it for
+    /// `-`. The detector never parses these names, only sorts them, and the
+    /// swap keeps their order.
+    pub(super) fn bus_dir(bus: &str) -> String {
+        if cfg!(windows) {
+            bus.replace(':', "-")
+        } else {
+            bus.to_string()
+        }
+    }
+
     pub(super) fn pci(host: &Path, slot: &str, vendor: &str, class: &str) {
-        let d = host.join("sys/bus/pci/devices").join(slot);
+        let d = host.join("sys/bus/pci/devices").join(bus_dir(slot));
         write(&d.join("vendor"), &format!("{vendor}\n"));
         write(&d.join("class"), &format!("{class}\n"));
     }
@@ -96,7 +109,7 @@ mod test_support {
         write(
             &host
                 .join("proc/driver/nvidia/gpus")
-                .join(bus)
+                .join(bus_dir(bus))
                 .join("information"),
             &format!("Model: \t\t {model}\nIRQ:   \t\t 76\nBus Location: \t {bus}\n"),
         );
