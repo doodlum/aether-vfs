@@ -413,9 +413,18 @@ fn an_image_only_the_provider_graph_holds_launches_from_an_empty_managed_root() 
         "the host's own mount is gone, so its content must be gone with it — \
          otherwise the next assertion proves nothing"
     );
+    // What answers is the staged file itself, byte for byte. That is not the
+    // graph's `probe.exe`: under import activation (the default) staging
+    // writes the image rewritten to import the shim first, so it is larger.
+    let staged = std::fs::read(root.join("probe.exe")).expect("read the staged image");
+    assert_eq!(s.staged_unpatched(), vec![], "vfs-probe is patchable");
+    assert_ne!(
+        staged, probe,
+        "import activation must have rewritten the staged image"
+    );
     assert_eq!(
-        s.read_file("probe.exe").unwrap().len(),
-        probe.len(),
+        s.read_file("probe.exe").unwrap(),
+        staged,
         "the staged image must stay answerable at its vpath, and survive the host \
          rebuilding the root's mounts"
     );
