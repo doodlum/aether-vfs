@@ -442,9 +442,12 @@ Windows path.
   of them.
 - **Launch.** The injector argv and the environment the shim reads are pure
   functions (`vfs_proton::launch`), so they are unit-tested without Wine. A
-  launch lasts as long as anything runs in the prefix, not only the program it
-  started (a mod loader that starts the game and exits keeps it alive), and
-  `LaunchHandle` lets the host poll or stop it.
+  launch lasts as long as anything runs in the prefix (`wineserver -w`), not
+  only the program it started (a mod loader that starts the game and exits
+  keeps it alive), and `LaunchHandle` lets the host poll or stop it. The
+  Windows path gives the same answer with a Job Object (§3.11, §4.3); the
+  injector itself uses no job under Wine, because the prefix watch already
+  covers the tree.
 
 ### 3.11 Embedding — `vfs-embed`
 
@@ -454,8 +457,25 @@ launch (Windows or Proton). Every host goes through it;
 if a host has to reach past `vfs-embed`, the fix belongs in `vfs-embed`. It
 re-exports what a host needs (the provider and composition types, the storage
 types, and a `proton` module for runtime, prefix and GPU probes). Its Proton
-code is `session/proton/`; Windows launch and staging are `session/windows.rs`
+code is `session/proton/`; Windows launch and staging are `session/windows/`
 and `session/stage.rs`.
+
+**Launch lifetime is the same on both targets.** A launch runs until every
+process it started has exited; the exit code reported is the first process's
+(the program `LaunchOpts::image` named); `stop` ends the whole tree and the
+launch reports `LaunchExit::Stopped` (`Session::launch` returns
+`STOPPED_EXIT_CODE`). Both targets have `Session::launch` (blocks),
+`Session::launch_detached` (returns a `LaunchHandle` with `pid`, `notes`,
+`stopper`, `is_running`, `try_wait`, `wait`, `stop`), `Session::stop_launch`
+and `LaunchStopper`. Dropping a running `LaunchHandle` stops it, and dropping
+the session stops the launches it holds or that are still live before the ring
+goes. A session runs **one launch at a time** on both targets: while one runs,
+`launch` and `launch_detached` are refused ("a launch is already running in
+this session — stop_launch() first"), before anything is resolved or staged.
+On Proton "the tree" is the session's Wine prefix (`wineserver -w`). On Windows
+it is a Job Object per launch (`vfs_inject::spawn_target_with_shim`,
+`ProcessTree`) that no process can leave (§4.3). `LaunchHandle::pid` is the launched program's pid on Windows and
+the `wine` process's on Proton; the Steam helper accessors are Proton-only.
 
 ---
 
@@ -595,6 +615,32 @@ file, and the host reports them. The wait is the
 launch's own (`LaunchOpts::ready_timeout`, else 180 s), which the injector passes
 down in `VFS_READY_TIMEOUT_SECS`; every child is injected, none is skipped. The
 child's image identity is scoped so the parent's does not leak into it.
+
+**Wait for the tree, not the loader.** The handover also decides when the
+launch is over: the loader exits while the game is still running. On Proton
+the launch watches the Wine prefix (§3.10). On Windows,
+`vfs_inject::spawn_target_with_shim` creates an unnamed Job Object per launch
+and assigns the target to it while it is still suspended, before the remote
+`LoadLibrary` thread and before `ResumeThread`, so no child can escape it by
+racing the assignment; children inherit the job. The launch is over when the
+job's `ActiveProcesses` count is zero. The completion port's
+`JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO` is only a wake-up (job notifications are
+not guaranteed), so the wait re-reads the count every 500 ms at most. Stopping
+is `TerminateJobObject`. The job has `KILL_ON_JOB_CLOSE` (its handle lives only
+in the host, so the game does not outlive the director it reads through) and
+no breakaway limit (neither `BREAKAWAY_OK` nor `SILENT_BREAKAWAY_OK`): a process
+that left the job would be neither waited for nor stopped, yet still do file
+I/O through the VFS after the host saw the launch end. The shim's process hook
+drops `CREATE_BREAKAWAY_FROM_JOB` from every child it creates
+(`child_creation_flags`), so a child that asks to break away stays in the job
+instead of failing with `ERROR_ACCESS_DENIED`. A child the shim refuses dies at once
+and never holds the launch open. If the target cannot be put in a job (a host
+job that forbids nesting), the launch falls back to tracking the first process
+alone and says so as the first `LaunchHandle::notes()` line. The injector's
+`run_target_with_shim`, used under Wine, keeps first-process tracking. (Design:
+`docs/superpowers/specs/2026-10-13-windows-process-tree-wait-design.md`; §9
+records the owner's decisions: children are tracked, one launch per session,
+kill-on-close stays.)
 
 Verified 2026-08-13: launched via SKSE, the hook-stats file is written by the
 *child* pid, `getskseversion` reports `2.2.6` in-game, and `coc riverwood` loads
