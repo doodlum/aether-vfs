@@ -104,7 +104,7 @@ fn inside(appdir: &Path, entry: &str) -> bool {
 mod tests {
     use super::*;
 
-    const APPDIR: &str = "/tmp/.mount_HaskilXYZ";
+    const APPDIR: &str = "/run/appimage/.mount_HaskilXYZ";
 
     fn c(value: &str) -> Cleaned {
         clean(Path::new(APPDIR), OsStr::new(value))
@@ -112,10 +112,10 @@ mod tests {
 
     #[test]
     fn a_value_wholly_inside_the_appimage_is_dropped() {
-        assert_eq!(c("/tmp/.mount_HaskilXYZ/usr/"), Cleaned::Empty);
+        assert_eq!(c("/run/appimage/.mount_HaskilXYZ/usr/"), Cleaned::Empty);
         // AppRun's PYTHONPATH with nothing of the host's after it.
         assert_eq!(
-            c("/tmp/.mount_HaskilXYZ/usr/share/pyshared/:"),
+            c("/run/appimage/.mount_HaskilXYZ/usr/share/pyshared/:"),
             Cleaned::Empty
         );
     }
@@ -123,11 +123,11 @@ mod tests {
     #[test]
     fn the_hosts_entries_are_kept_in_order() {
         assert_eq!(
-            c("/tmp/.mount_HaskilXYZ/usr/bin/:/tmp/.mount_HaskilXYZ/bin/:/usr/local/bin:/usr/bin"),
+            c("/run/appimage/.mount_HaskilXYZ/usr/bin/:/run/appimage/.mount_HaskilXYZ/bin/:/usr/local/bin:/usr/bin"),
             Cleaned::Changed("/usr/local/bin:/usr/bin".into())
         );
         assert_eq!(
-            c("/tmp/.mount_HaskilXYZ/usr/share:/usr/share:/usr/local/share"),
+            c("/run/appimage/.mount_HaskilXYZ/usr/share:/usr/share:/usr/local/share"),
             Cleaned::Changed("/usr/share:/usr/local/share".into())
         );
     }
@@ -139,6 +139,6 @@ mod tests {
         assert_eq!(c("Adwaita:light"), Cleaned::Unchanged);
         assert_eq!(c(""), Cleaned::Unchanged);
         // A sibling whose name only starts the same is not inside it.
-        assert_eq!(c("/tmp/.mount_HaskilXYZ2/lib"), Cleaned::Unchanged);
+        assert_eq!(c("/run/appimage/.mount_HaskilXYZ2/lib"), Cleaned::Unchanged);
     }
 }
