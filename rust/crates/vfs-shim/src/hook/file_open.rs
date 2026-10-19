@@ -420,7 +420,7 @@ unsafe fn try_fuse_mkdir(
         // honor the disposition — FILE_CREATE(2) must report a name collision
         // (ERROR_ALREADY_EXISTS, so the create-and-ignore idiom works), while
         // FILE_OPEN_IF(3)/FILE_OVERWRITE_IF(5) open the existing directory.
-        Err(_) => match client.getattr(root, vp) {
+        Err(st) => match client.getattr(root, vp) {
             Ok(a) if a.found && a.is_dir => {
                 if disp == 2 {
                     Some(STATUS_OBJECT_NAME_COLLISION)
@@ -449,6 +449,10 @@ unsafe fn try_fuse_mkdir(
                     Some(STATUS_SUCCESS)
                 }
             }
+            // Not there, and refused because no writable layer serves the path
+            // (a read-only root, the folder chain above a location): a
+            // read-only filesystem's answer.
+            _ if st == vfs_protocol::ST_READ_ONLY => Some(STATUS_ACCESS_DENIED),
             _ => Some(STATUS_UNSUCCESSFUL),
         },
     }

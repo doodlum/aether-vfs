@@ -302,6 +302,7 @@ impl Session {
     }
 
     /// Root 0's location, as [`Session::root_locations`] gives it.
+    #[cfg(windows)]
     pub(crate) fn root0_location(&self) -> String {
         self.root_locations().swap_remove(0).location
     }

@@ -419,6 +419,73 @@ impl Director {
         provider.rename(VPath::new(root, &from), VPath::new(root, &to))
     }
 
+    /// A rename from one root to another — a root and one nested in its
+    /// location, where a program moves a file across the boundary without
+    /// knowing it is one (a temp file under the profile root moved into a
+    /// game's folder). A file is copied into `to_root` (replacing what is
+    /// there) and then removed from `from_root`; providers have no cross-root
+    /// move. A directory is refused with `ST_CROSS_ROOT`, which the shim
+    /// reports as a move between volumes, so the caller copies and deletes it
+    /// itself. The same root is [`Director::rename`].
+    pub fn rename_across(
+        &self,
+        from_root: RootId,
+        from: &str,
+        to_root: RootId,
+        to: &str,
+    ) -> Result<(), i32> {
+        if from_root == to_root {
+            return self.rename(from_root, from, to);
+        }
+        let from = normalize(from).map_err(|_| bad_request())?;
+        let to = normalize(to).map_err(|_| bad_request())?;
+        let src = self.provider_for(from_root)?.ok_or_else(not_found)?;
+        let dst = self.provider_for(to_root)?.ok_or_else(not_found)?;
+        let stat = src
+            .getattr(VPath::new(from_root, &from))?
+            .ok_or_else(not_found)?;
+        if stat.kind == vfs_provider::KIND_DIR {
+            return Err(vfs_provider::ST_CROSS_ROOT);
+        }
+        if dst.capabilities().access < Access::ReadWrite {
+            return Err(read_only());
+        }
+        let (sh, size, _) = src.open(VPath::new(from_root, &from), vfs_provider::OPEN_READ)?;
+        let copied = (|| {
+            let (dh, _, _) = dst.open(
+                VPath::new(to_root, &to),
+                OPEN_WRITE | vfs_provider::OPEN_CREATE | vfs_provider::OPEN_TRUNC,
+            )?;
+            let mut buf = vec![0u8; 1 << 20];
+            let mut at = 0u64;
+            let result = loop {
+                if at >= size {
+                    break Ok(());
+                }
+                let n = match src.read_at(sh, at, &mut buf) {
+                    Ok(0) => break Ok(()),
+                    Ok(n) => n,
+                    Err(e) => break Err(e),
+                };
+                let mut done = 0;
+                while done < n {
+                    match dst.write_at(dh, at + done as u64, &buf[done..n]) {
+                        Ok(0) => return Err(map_io_err()),
+                        Ok(w) => done += w,
+                        Err(e) => return Err(e),
+                    }
+                }
+                at += n as u64;
+            };
+            let flushed = dst.flush(dh);
+            let closed = dst.close(dh);
+            result.and(flushed).and(closed)
+        })();
+        let _ = src.close(sh);
+        copied?;
+        src.remove(VPath::new(from_root, &from))
+    }
+
     pub fn set_attr(&self, root: RootId, path: &str, attr: SetAttr) -> Result<(), i32> {
         let path = normalize(path).map_err(|_| bad_request())?;
         let provider = self.provider_for(root)?.ok_or_else(not_found)?;
@@ -805,5 +872,64 @@ mod tests {
         assert_eq!(&buf0[..n0], b"ZERO");
         assert_eq!(size1, 3);
         assert_eq!(&buf1[..n1], b"ONE");
+    }
+}
+
+#[cfg(test)]
+mod rename_across_tests {
+    use super::*;
+    use vfs_compose::MemoryProvider;
+
+    fn read_all(d: &Director, root: RootId, path: &str) -> Option<Vec<u8>> {
+        let (fh, size, _) = d.open(root, path, vfs_provider::OPEN_READ).ok()?;
+        let mut buf = vec![0u8; size as usize];
+        let n = d.read(fh, 0, &mut buf).ok()?;
+        d.close(fh).ok()?;
+        buf.truncate(n);
+        Some(buf)
+    }
+
+    #[test]
+    fn a_file_moves_between_roots_and_a_directory_is_refused() {
+        let d = Director::new();
+        let (a, b) = (RootId(4), RootId(1));
+        d.mount(
+            a,
+            Arc::new(MemoryProvider::from_files([
+                ("Temp/t.tmp", b"payload".as_slice()),
+                ("dir/x", b"x".as_slice()),
+            ])),
+        )
+        .unwrap();
+        d.mount(
+            b,
+            Arc::new(MemoryProvider::from_files([("old.tmp", b"old".as_slice())])),
+        )
+        .unwrap();
+
+        d.rename_across(a, "Temp/t.tmp", b, "moved.tmp").unwrap();
+        assert_eq!(
+            read_all(&d, b, "moved.tmp").as_deref(),
+            Some(&b"payload"[..])
+        );
+        assert_eq!(
+            d.getattr(a, "Temp/t.tmp").unwrap(),
+            None,
+            "gone from the source"
+        );
+
+        // Replaces what is at the destination, as a same-root rename does.
+        d.rename_across(b, "moved.tmp", a, "Temp/back.tmp").unwrap();
+        d.rename_across(a, "Temp/back.tmp", b, "old.tmp").unwrap();
+        assert_eq!(read_all(&d, b, "old.tmp").as_deref(), Some(&b"payload"[..]));
+
+        assert_eq!(
+            d.rename_across(a, "dir", b, "dir"),
+            Err(vfs_provider::ST_CROSS_ROOT)
+        );
+        assert_eq!(
+            d.rename_across(a, "missing", b, "x"),
+            Err(vfs_provider::ST_NOT_FOUND)
+        );
     }
 }

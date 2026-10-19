@@ -175,13 +175,14 @@ unsafe fn setinfo_source_path(handle: HANDLE) -> Option<(String, bool)> {
 const FILE_COMPLETION_INFORMATION: u32 = 30;
 
 /// A delete or rename through `handle`, whose path is `nt`, answered by the director: `OP_DELETE`,
-/// or `OP_RENAME` when the target lands under the same root. `None` when `nt` is under no root, so
-/// the caller decides; otherwise the caller's answer, success or `STATUS_UNSUCCESSFUL`.
+/// `OP_RENAME` when the target lands under the same root, or `OP_RENAME_X` when it lands under
+/// another root (a root and one nested in its location). `None` when `nt` is under no root, so
+/// the caller decides; otherwise the caller's answer.
 ///
 /// One function for both kinds of handle, so a synthetic handle and a real one under a root get
-/// the same answer. A rename whose target is outside the root, or under a *different* root, is
-/// refused rather than guessed at: the wire carries one root for both sides and the provider
-/// contract has no cross-root move. Refused means `STATUS_UNSUCCESSFUL`, never the trampoline.
+/// the same answer. A rename whose target is outside every root is refused rather than guessed
+/// at (`STATUS_UNSUCCESSFUL`, never the trampoline). A directory moved to another root is
+/// `STATUS_NOT_SAME_DEVICE`, as between volumes, so the caller copies and deletes it itself.
 ///
 /// # Safety
 /// `info`/`length`/`iosb` are the caller's `NtSetInformationFile` arguments.
@@ -197,13 +198,15 @@ unsafe fn director_delete_or_rename(
     let (root, src) = c.route(nt)?;
     c.names_changed(root, &src);
     crate::read_cache::invalidate_path(root.0, &src);
-    let ok = if is_delete {
+    let status = if is_delete {
         let deleted = c.delete(root, &src).is_ok();
         if deleted {
             // Deleted now: a delete-on-close on the same handle must not delete again at close.
             crate::synth_file::set_delete_on_close(handle as isize, false);
+            STATUS_SUCCESS
+        } else {
+            STATUS_UNSUCCESSFUL
         }
-        deleted
     } else {
         // The destination is a name being created, so it goes as the caller spelled it — which
         // is also how a rename that changes only the letter case says what the new case is. See
@@ -211,33 +214,40 @@ unsafe fn director_delete_or_rename(
         // SAFETY: same NT-pointer contract as this fn (hook/mod.rs).
         let target = unsafe { parse_rename_target(info, length) };
         match target.as_deref().and_then(|t| c.route_as_spelled(t)) {
-            Some((dst_root, dst)) if dst_root == root => {
-                c.names_changed(root, &vfs_core::fold(&dst));
-                crate::read_cache::invalidate_path(root.0, &vfs_core::fold(&dst));
-                let renamed = c.rename(root, &src, &dst).is_ok();
-                if renamed {
-                    // The handle follows the file: what it is finally named, and its id, are the
-                    // new path's from here on. (`set_abs_path` is a no-op on a real handle.)
-                    if let Some(t) = target {
-                        let nt = to_nt_path(&t);
-                        if let Ok(mut table) = HANDLES.lock() {
-                            table.set_under_root(handle as isize, nt.clone());
+            Some((dst_root, dst)) => {
+                c.names_changed(dst_root, &vfs_core::fold(&dst));
+                crate::read_cache::invalidate_path(dst_root.0, &vfs_core::fold(&dst));
+                let renamed = if dst_root == root {
+                    c.rename(root, &src, &dst)
+                } else {
+                    c.rename_across(root, &src, dst_root, &dst)
+                };
+                match renamed {
+                    Ok(()) => {
+                        // The handle follows the file: what it is finally named, and its id, are
+                        // the new path's from here on. (`set_abs_path` is a no-op on a real
+                        // handle.)
+                        if let Some(t) = target {
+                            let nt = to_nt_path(&t);
+                            if let Ok(mut table) = HANDLES.lock() {
+                                table.set_under_root(handle as isize, nt.clone());
+                            }
+                            crate::synth_file::set_abs_path(handle as isize, nt);
                         }
-                        crate::synth_file::set_abs_path(handle as isize, nt);
+                        STATUS_SUCCESS
                     }
+                    Err(vfs_protocol::ST_CROSS_ROOT) => crate::ntdef::STATUS_NOT_SAME_DEVICE,
+                    Err(_) => STATUS_UNSUCCESSFUL,
                 }
-                renamed
             }
-            _ => false,
+            None => STATUS_UNSUCCESSFUL,
         }
     };
-    if ok {
+    if status == STATUS_SUCCESS {
         // SAFETY: same NT-pointer contract as this fn (hook/mod.rs).
         unsafe { crate::ntbuf::iosb_set(iosb, STATUS_SUCCESS, 0) };
-        Some(STATUS_SUCCESS)
-    } else {
-        Some(STATUS_UNSUCCESSFUL)
     }
+    Some(status)
 }
 
 /// `NtSetInformationFile` hook. For a synthetic (director-served) handle it routes

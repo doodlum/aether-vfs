@@ -28,6 +28,9 @@
 //! `VFS_FIXTURE_PROBE_OUT` writes what the process believes about itself (its
 //! environment, cwd, module path and argv[0]) before anything else: see `probe.rs`.
 //!
+//! `VFS_FIXTURE_OPS` runs a script of filesystem operations and writes what each
+//! did to `VFS_FIXTURE_OPS_OUT`: see `ops.rs`.
+//!
 //! `VFS_FIXTURE_NAMES` and its companions run the names phase first: see
 //! `names.rs`. Windows only — it calls Win32 directly.
 //!
@@ -68,6 +71,7 @@ fn read_in_one_call(path: &str) -> std::io::Result<Vec<u8>> {
 mod cache;
 #[cfg(windows)]
 mod names;
+mod ops;
 mod orphan;
 mod probe;
 
@@ -200,6 +204,7 @@ fn spawn_copy_of_self() {
 
 fn main() {
     probe::run();
+    ops::run();
     #[cfg(windows)]
     names::run();
     let path = std::env::var("VFS_FIXTURE_PATH").unwrap_or_else(|_| {

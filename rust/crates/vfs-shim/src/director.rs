@@ -698,6 +698,30 @@ impl FuseClient {
         Ok(())
     }
 
+    /// Rename `from` under `from_root` to `to` under `to_root`, two different
+    /// roots (`OP_RENAME_X`): the director copies a file across and removes
+    /// it at the source. `Err(ST_CROSS_ROOT)` for a directory.
+    pub fn rename_across(
+        &self,
+        from_root: RootId,
+        from: &str,
+        to_root: RootId,
+        to: &str,
+    ) -> Result<(), i32> {
+        let c = self.client();
+        let r = c
+            .submit(
+                vfs_protocol::OP_RENAME_X,
+                0,
+                &vfs_protocol::encode_rename_x_req(from_root.0, from, to_root.0, to),
+            )
+            .map_err(|_| vfs_protocol::ST_IO_ERROR)?;
+        if r.status != ST_OK {
+            return Err(r.status);
+        }
+        Ok(())
+    }
+
     /// Create a virtual directory via the director overlay (`OP_MKDIR`).
     pub fn mkdir(&self, root: RootId, vpath: &str, mode: u32) -> Result<(), i32> {
         let c = self.client();

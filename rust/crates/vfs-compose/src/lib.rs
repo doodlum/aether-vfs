@@ -18,6 +18,7 @@
 mod casefold;
 mod disk;
 mod glob;
+mod guarded;
 mod inline;
 mod layered;
 mod memory;
@@ -28,9 +29,11 @@ mod readonly;
 mod rejected_writes;
 mod router;
 mod seekable;
+mod stub_dirs;
 mod subdir;
 
 pub use disk::DiskProvider;
+pub use guarded::GuardedProvider;
 pub use inline::InlineProvider;
 pub use layered::LayeredProvider;
 pub use memory::MemoryProvider;
@@ -40,6 +43,7 @@ pub use readonly::ReadOnlyProvider;
 pub use rejected_writes::{record_rejected_write, rejected_writes, reset_rejected_writes};
 pub use router::{Route, RouterProvider};
 pub use seekable::SeekableProvider;
+pub use stub_dirs::StubDirsProvider;
 pub use subdir::SubdirProvider;
 
 use std::collections::HashMap;

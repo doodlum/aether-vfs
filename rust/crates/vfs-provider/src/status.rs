@@ -28,6 +28,10 @@ pub const ST_EXISTS: i32 = -10;
 /// ring's payload; the shim treats it like a failed director read and serves
 /// the real key.
 pub const ST_REPLY_TOO_LARGE: i32 = -11;
+/// A move between two roots of something the director does not copy across
+/// (a directory). The shim answers `STATUS_NOT_SAME_DEVICE`, what Windows
+/// says for a move between volumes, so a caller falls back to copy and delete.
+pub const ST_CROSS_ROOT: i32 = -12;
 
 use std::io;
 use std::sync::{Mutex, MutexGuard};

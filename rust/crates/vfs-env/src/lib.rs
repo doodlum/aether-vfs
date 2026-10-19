@@ -385,6 +385,11 @@ pub const FIXTURE_ORPHAN_OF: &str = "VFS_FIXTURE_ORPHAN_OF";
 /// `vfs-fixture-read`: write what the process believes about itself (its
 /// environment, cwd, module path and argv[0]) to this file first.
 pub const FIXTURE_PROBE_OUT: &str = "VFS_FIXTURE_PROBE_OUT";
+/// `vfs-fixture-read`: a script of filesystem operations to run first (see the
+/// fixture's `ops.rs`).
+pub const FIXTURE_OPS: &str = "VFS_FIXTURE_OPS";
+/// `vfs-fixture-read`: where the ops phase writes what each operation did.
+pub const FIXTURE_OPS_OUT: &str = "VFS_FIXTURE_OPS_OUT";
 /// `vfs-fixture-read`: a file read on slow threads while others read
 /// `FIXTURE_PATH` (the concurrent-read e2e).
 pub const FIXTURE_SLOW_PATH: &str = "VFS_FIXTURE_SLOW_PATH";
@@ -830,6 +835,16 @@ pub const ALL: &[Var] = &[
         name: FIXTURE_PROBE_OUT,
         kind: Kind::Fixture,
         default: "unset: no probe",
+    },
+    Var {
+        name: FIXTURE_OPS,
+        kind: Kind::Fixture,
+        default: "unset: no ops",
+    },
+    Var {
+        name: FIXTURE_OPS_OUT,
+        kind: Kind::Fixture,
+        default: "unset: no ops",
     },
     Var {
         name: FIXTURE_SLOW_PATH,

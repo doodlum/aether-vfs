@@ -2,12 +2,14 @@
 //! `vfs-inject`, and the child's ring coordinates inherited through the
 //! process environment.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use vfs_director::ipc::IpcServe;
+use vfs_provider::RootId;
 
 use super::stage::ResolvedImage;
 use super::{check_image, LaunchExit, LaunchOpts, Session, StartingGuard, STOPPED_EXIT_CODE};
@@ -290,9 +292,11 @@ impl Session {
         // `serve`, or a second session in this process, cannot leak into it.
         let mut env_set: Vec<(String, String)> = Vec::new();
         let mut env_remove: Vec<String> = opts.env_remove.clone();
+        let mut roots_env = self.extra_roots_env();
+        roots_env.extend(self.prepare_locations()?);
         for (name, value) in ipc.env_roots(
             &root_s,
-            &self.extra_roots_env(),
+            &roots_env,
             &self.root_backings(),
             &thin,
             self.registry_attached(),
@@ -481,4 +485,130 @@ fn virtual_path(location: &str, vpath: &str) -> String {
         p.push_str(c);
     }
     p
+}
+
+/// The first id of the hidden roots [`Session::prepare_locations`] mounts for
+/// the ancestors of a location that do not exist on disk. High, so a host's
+/// own ids never meet them.
+#[cfg(windows)]
+const ANCESTOR_ROOT_BASE: u32 = 0x7FFF_0000;
+
+/// `location`'s components, for comparing: split on either separator,
+/// empty ones dropped.
+#[cfg(windows)]
+fn location_components(location: &str) -> Vec<String> {
+    location
+        .split(['\\', '/'])
+        .filter(|c| !c.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Whether `prefix` is a proper, component-wise, case-insensitive prefix of `path`.
+#[cfg(windows)]
+fn is_proper_prefix(prefix: &[String], path: &[String]) -> bool {
+    prefix.len() < path.len()
+        && prefix
+            .iter()
+            .zip(path)
+            .all(|(a, b)| a.to_lowercase() == b.to_lowercase())
+}
+
+#[cfg(windows)]
+impl Session {
+    /// Make every location reachable before a launch, without making
+    /// anything real, and return the hidden roots that does it (`(id,
+    /// location)`, for the child's root list).
+    ///
+    /// - **Nested roots.** A root whose location lies inside another root's
+    ///   (the most specific one: the longest) is listed by that parent as a
+    ///   folder chain — a [`vfs_compose::StubDirsProvider`] composed under the
+    ///   parent's content, guarded against delete and rename.
+    /// - **Ancestors not on disk.** For a location inside no other root, the
+    ///   outermost ancestor that does not exist on real disk (`C:\Haskill`)
+    ///   becomes a hidden read-only root serving the folder chain down to
+    ///   every location below it. A program can open, list and "create" those
+    ///   folders; anything else there is refused. Ancestors that do exist on
+    ///   disk are real directories outside every root, and stay so.
+    ///
+    /// Asking whether an ancestor exists is the only real-disk access, and an
+    /// ancestor is above every location, never at or under one.
+    pub(in crate::session) fn prepare_locations(&self) -> Result<Vec<(u32, String)>, String> {
+        let locs: Vec<(u32, Vec<String>)> = self
+            .root_locations()
+            .into_iter()
+            .map(|l| (l.id, location_components(&l.location)))
+            .collect();
+        let parent_of = |c: &[String]| {
+            locs.iter()
+                .filter(|(_, p)| is_proper_prefix(p, c))
+                .max_by_key(|(_, p)| p.len())
+                .map(|(id, p)| (*id, p.len()))
+        };
+
+        let mut chains: BTreeMap<u32, Vec<String>> = BTreeMap::new();
+        for (_, comps) in &locs {
+            if let Some((parent, n)) = parent_of(comps) {
+                chains.entry(parent).or_default().push(comps[n..].join("/"));
+            }
+        }
+        for (id, _) in &locs {
+            let stubs = chains.get(id).map(|dirs| {
+                let p: Arc<dyn vfs_provider::Provider> =
+                    Arc::new(vfs_compose::StubDirsProvider::new(dirs));
+                (p, dirs.clone())
+            });
+            let changed = {
+                let mut roots = self
+                    .roots
+                    .lock()
+                    .map_err(|_| "session roots lock poisoned".to_string())?;
+                let had = roots.get(id).is_some_and(|c| c.stubs.is_some());
+                if stubs.is_none() && !had {
+                    false
+                } else {
+                    self.claim(&mut roots, RootId(*id))
+                        .map_err(|st| format!("launch: root {id} is mounted directly ({st})"))?
+                        .stubs = stubs;
+                    true
+                }
+            };
+            if changed {
+                self.recompose(RootId(*id))
+                    .map_err(|st| format!("launch: compose root {id}: status {st}"))?;
+            }
+        }
+
+        let mut hidden: BTreeMap<String, (String, Vec<String>)> = BTreeMap::new();
+        for (_, comps) in &locs {
+            if parent_of(comps).is_some() {
+                continue;
+            }
+            // From the shortest ancestor below the drive down; the first that
+            // is not on disk holds the rest of the chain.
+            for n in 2..comps.len() {
+                let ancestor = comps[..n].join("\\");
+                if !std::path::Path::new(&ancestor).exists() {
+                    hidden
+                        .entry(ancestor.to_lowercase())
+                        .or_insert_with(|| (ancestor.clone(), Vec::new()))
+                        .1
+                        .push(comps[n..].join("/"));
+                    break;
+                }
+            }
+        }
+        let mut out = Vec::with_capacity(hidden.len());
+        for (i, (_, (location, dirs))) in hidden.into_iter().enumerate() {
+            let id = ANCESTOR_ROOT_BASE + i as u32;
+            self.kernel
+                .mount(
+                    RootId(id),
+                    Arc::new(vfs_compose::StubDirsProvider::new(&dirs)),
+                )
+                .map_err(|st| format!("launch: mount the ancestors at {location}: status {st}"))?;
+            out.push((id, location));
+        }
+        Ok(out)
+    }
 }

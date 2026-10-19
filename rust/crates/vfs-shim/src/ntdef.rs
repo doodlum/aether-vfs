@@ -16,6 +16,8 @@ pub(crate) use vfs_registry::layout::{
 /// `STATUS_UNSUCCESSFUL` — returned only if the trampoline is somehow unset
 /// (an invariant violation the hook must not panic on).
 pub(crate) const STATUS_UNSUCCESSFUL: NTSTATUS = 0xC000_0001u32 as i32;
+/// A move between volumes; also a move of a directory between two roots.
+pub(crate) const STATUS_NOT_SAME_DEVICE: NTSTATUS = 0xC000_00D4_u32 as i32;
 
 /// `STATUS_OBJECT_PATH_NOT_FOUND` — maps to Win32 `ERROR_PATH_NOT_FOUND` (3),
 /// as distinct from `STATUS_OBJECT_NAME_NOT_FOUND`'s `ERROR_FILE_NOT_FOUND`

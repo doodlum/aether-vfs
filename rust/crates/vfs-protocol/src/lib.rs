@@ -15,8 +15,8 @@ pub use vfs_provider::{
 };
 pub use vfs_provider::{
     OPEN_APPEND, OPEN_CREATE, OPEN_EXCL, OPEN_READ, OPEN_TRUNC, OPEN_WRITE, ST_BAD_FH,
-    ST_BAD_REQUEST, ST_EXISTS, ST_IO_ERROR, ST_IS_DIR, ST_NOT_A_DIRECTORY, ST_NOT_FOUND,
-    ST_NOT_SUPPORTED, ST_NO_SPACE, ST_OK, ST_READ_ONLY, ST_REPLY_TOO_LARGE,
+    ST_BAD_REQUEST, ST_CROSS_ROOT, ST_EXISTS, ST_IO_ERROR, ST_IS_DIR, ST_NOT_A_DIRECTORY,
+    ST_NOT_FOUND, ST_NOT_SUPPORTED, ST_NO_SPACE, ST_OK, ST_READ_ONLY, ST_REPLY_TOO_LARGE,
 };
 
 // The opcode catalog. This is the only definition: `vfs_ipc::layout`
@@ -47,6 +47,10 @@ pub const OP_REG_CREATE_KEY: u32 = 19;
 pub const OP_REG_DELETE_KEY: u32 = 20;
 pub const OP_REG_RENAME_KEY: u32 = 21;
 pub const OP_REG_CHANGED: u32 = 22;
+/// A rename whose source and destination are under different roots (a root
+/// and one nested in its location): the director copies a file into the
+/// destination root and removes it at the source. See [`encode_rename_x_req`].
+pub const OP_RENAME_X: u32 = 23;
 
 /// Every live opcode with its name, in number order.
 pub const OPCODES: &[(&str, u32)] = &[
@@ -70,6 +74,7 @@ pub const OPCODES: &[(&str, u32)] = &[
     ("reg-delete-key", OP_REG_DELETE_KEY),
     ("reg-rename-key", OP_REG_RENAME_KEY),
     ("reg-changed", OP_REG_CHANGED),
+    ("rename-x", OP_RENAME_X),
 ];
 
 /// Every status code with its name, in number order.
@@ -86,6 +91,7 @@ pub const STATUSES: &[(&str, i32)] = &[
     ("read-only", ST_READ_ONLY),
     ("exists", ST_EXISTS),
     ("reply-too-large", ST_REPLY_TOO_LARGE),
+    ("cross-root", ST_CROSS_ROOT),
 ];
 
 /// Ring/request flag: prefer bulk-arena READ (data in shared arena, not ring payload).
@@ -474,6 +480,28 @@ pub fn decode_rename_req(p: &[u8]) -> Option<(u32, String, String)> {
     let from = core::str::from_utf8(r.take(from_len)?).ok()?.to_string();
     let to = r.rest_str()?.to_string();
     Some((root, from, to))
+}
+
+/// RENAME_X req: `from_root:u32 | to_root:u32 | from_len:u32 | from | to`.
+pub fn encode_rename_x_req(from_root: u32, from: &str, to_root: u32, to: &str) -> Vec<u8> {
+    let mut b = Vec::with_capacity(12 + from.len() + to.len());
+    b.extend_from_slice(&from_root.to_le_bytes());
+    b.extend_from_slice(&to_root.to_le_bytes());
+    b.extend_from_slice(&(from.len() as u32).to_le_bytes());
+    b.extend_from_slice(from.as_bytes());
+    b.extend_from_slice(to.as_bytes());
+    b
+}
+
+/// Returns `(from_root, from, to_root, to)`.
+pub fn decode_rename_x_req(p: &[u8]) -> Option<(u32, String, u32, String)> {
+    let mut r = Rd(p);
+    let from_root = r.u32()?;
+    let to_root = r.u32()?;
+    let from_len = r.u32()? as usize;
+    let from = core::str::from_utf8(r.take(from_len)?).ok()?.to_string();
+    let to = r.rest_str()?.to_string();
+    Some((from_root, from, to_root, to))
 }
 
 /// SETATTR req: `fh:u64 | size:u64`
@@ -925,6 +953,7 @@ mod tests {
             ("reg-delete-key", 20),
             ("reg-rename-key", 21),
             ("reg-changed", 22),
+            ("rename-x", 23),
         ];
         assert_eq!(OPCODES, want);
         let sts: &[(&str, i32)] = &[
@@ -940,6 +969,7 @@ mod tests {
             ("read-only", -9),
             ("exists", -10),
             ("reply-too-large", -11),
+            ("cross-root", -12),
         ];
         assert_eq!(STATUSES, sts);
         assert_eq!(OPEN_READ, 1);

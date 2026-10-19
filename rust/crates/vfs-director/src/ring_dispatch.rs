@@ -7,8 +7,8 @@ use vfs_protocol::{
     decode_rename_req, decode_setattr_req, decode_write_req, encode_getattr_resp, encode_open_resp,
     encode_read_resp, encode_read_resp_bulk, encode_readdir_resp, encode_write_resp, AttrResp,
     DirEntryWire, OpenResp, RootId, FLAG_READ_BULK, OP_CLOSE, OP_DELETE, OP_GETATTR, OP_HEARTBEAT,
-    OP_MKDIR, OP_OPEN, OP_READ, OP_READDIR, OP_REG_CHANGED, OP_REG_LOOKUP, OP_RENAME, OP_SETATTR,
-    OP_STORED_NAMES, OP_WRITE, ST_BAD_REQUEST, ST_NOT_SUPPORTED, ST_OK,
+    OP_MKDIR, OP_OPEN, OP_READ, OP_READDIR, OP_REG_CHANGED, OP_REG_LOOKUP, OP_RENAME, OP_RENAME_X,
+    OP_SETATTR, OP_STORED_NAMES, OP_WRITE, ST_BAD_REQUEST, ST_NOT_SUPPORTED, ST_OK,
 };
 
 use crate::director::Director;
@@ -219,6 +219,12 @@ pub fn dispatch_director(
         },
         OP_RENAME => match decode_rename_req(payload) {
             Some((root, from, to)) => status_only(director.rename(RootId(root), &from, &to)),
+            None => bad(),
+        },
+        OP_RENAME_X => match vfs_protocol::decode_rename_x_req(payload) {
+            Some((from_root, from, to_root, to)) => {
+                status_only(director.rename_across(RootId(from_root), &from, RootId(to_root), &to))
+            }
             None => bad(),
         },
         OP_DELETE => match decode_path_req(payload) {

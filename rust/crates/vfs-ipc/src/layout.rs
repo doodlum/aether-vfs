@@ -52,8 +52,8 @@ pub const ST_ABANDONED: u32 = 5;
 pub use vfs_protocol::{
     OP_CLOSE, OP_DELETE, OP_GETATTR, OP_HEARTBEAT, OP_MKDIR, OP_OPEN, OP_READ, OP_READDIR,
     OP_REG_CHANGED, OP_REG_CREATE_KEY, OP_REG_DELETE_KEY, OP_REG_DELETE_VALUE, OP_REG_KEY,
-    OP_REG_LOOKUP, OP_REG_RENAME_KEY, OP_REG_SET_VALUE, OP_RENAME, OP_SETATTR, OP_STORED_NAMES,
-    OP_WRITE,
+    OP_REG_LOOKUP, OP_REG_RENAME_KEY, OP_REG_SET_VALUE, OP_RENAME, OP_RENAME_X, OP_SETATTR,
+    OP_STORED_NAMES, OP_WRITE,
 };
 
 #[repr(C)]
@@ -177,6 +177,7 @@ mod tests {
             ("reg-delete-key", OP_REG_DELETE_KEY),
             ("reg-rename-key", OP_REG_RENAME_KEY),
             ("reg-changed", OP_REG_CHANGED),
+            ("rename-x", OP_RENAME_X),
         ];
         assert_eq!(here, vfs_protocol::OPCODES);
     }

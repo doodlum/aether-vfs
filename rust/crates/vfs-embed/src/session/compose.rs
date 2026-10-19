@@ -109,6 +109,11 @@ pub(super) struct RootComposition {
     /// Every `(prefix, provider)` accumulated for this root, in registration
     /// order (later wins on an overlapping path).
     mounts: Vec<(String, Arc<dyn Provider>)>,
+    /// The folder chain to each root nested inside this one's location, and
+    /// those folders' paths: composed below everything else, so the root lists
+    /// them, and guarded, so they cannot be deleted or renamed. Set at each
+    /// launch from the roots' locations ([`Session::prepare_locations`]).
+    pub(super) stubs: Option<(Arc<dyn Provider>, Vec<String>)>,
     /// The writable upper this root's writes copy up into, if one is set.
     write_layer: Option<Arc<dyn Provider>>,
 }
@@ -279,11 +284,21 @@ impl Session {
         // shape `mount_at` would produce — inverts that and lets a
         // point-in-time staged copy shadow curated content. See
         // [`RootComposition::staging`].
+        // The chain to a nested root goes lower still: it only shows folders
+        // nothing else serves.
+        let (stubs, guarded) = match composition.stubs {
+            Some((p, dirs)) => (Some(p), dirs),
+            None => (None, Vec::new()),
+        };
         let mut mounts: Vec<(String, Arc<dyn Provider>)> =
-            Vec::with_capacity(composition.mounts.len() + 1);
+            Vec::with_capacity(composition.mounts.len() + 2);
+        mounts.extend(stubs.map(|p| (String::new(), p)));
         mounts.extend(composition.staging.map(|p| (String::new(), p)));
         mounts.extend(composition.mounts);
-        let composed = compose_root(mounts, composition.write_layer)?;
+        let mut composed = compose_root(mounts, composition.write_layer)?;
+        if !guarded.is_empty() {
+            composed = Arc::new(vfs_compose::GuardedProvider::new(composed, guarded));
+        }
         self.kernel.mount(root, composed)
     }
 
