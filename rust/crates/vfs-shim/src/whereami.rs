@@ -54,6 +54,13 @@ pub(crate) fn to_virtual(
 /// resumed).
 #[allow(unsafe_code)]
 pub(crate) unsafe fn rename_image() {
+    // Test switch: leave the process reporting its real staged path (see
+    // `vfs_env::REAL_IMAGE_PATH`). Skips the ImagePathName and loader-entry
+    // rename; the launcher separately skips the argv[0] rewrite.
+    if vfs_env::opt_in(vfs_env::REAL_IMAGE_PATH) {
+        crate::loadlog::note("rename_image skipped (VFS_REAL_IMAGE_PATH)");
+        return;
+    }
     let backings = backings_from_env();
     if backings.is_empty() {
         return;

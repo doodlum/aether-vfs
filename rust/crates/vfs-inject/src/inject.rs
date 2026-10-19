@@ -690,10 +690,18 @@ fn command_line_for(image: &str, cfg: &RunConfig) -> String {
 /// # Safety
 /// `process` is the suspended target's `CreateProcessW` handle.
 unsafe fn tell_where(process: HANDLE, cfg: &RunConfig) -> Result<(), InjectError> {
-    let cmd = cfg
-        .virtual_image
-        .as_deref()
-        .map(|v| command_line_for(v, cfg));
+    // Test switch (`VFS_REAL_IMAGE_PATH`): skip the command-line (argv[0])
+    // rewrite so the process reports its real staged path, but keep the
+    // working-directory rewrite. The shim's bootstrap skips the matching
+    // ImagePathName/loader-entry rename. See `vfs_env::REAL_IMAGE_PATH`.
+    let real_image = vfs_env::opt_in(vfs_env::REAL_IMAGE_PATH);
+    let cmd = if real_image {
+        None
+    } else {
+        cfg.virtual_image
+            .as_deref()
+            .map(|v| command_line_for(v, cfg))
+    };
     // SAFETY: as this function's contract.
     unsafe { crate::procparams::rewrite(process, cmd.as_deref(), cfg.virtual_cwd.as_deref()) }
         .map_err(InjectError::Bootstrap)

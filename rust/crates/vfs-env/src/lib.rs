@@ -103,6 +103,24 @@ pub const VIRTUAL_ROOTS: &str = "VFS_VIRTUAL_ROOTS";
 /// the shim recognises each backing directory as a second spelling of its
 /// root. Unset: every root's location is its backing directory.
 pub const ROOT_BACKINGS: &str = "VFS_ROOT_BACKINGS";
+/// Test/diagnostic switch (`VFS_REAL_IMAGE_PATH=1`, inherited like
+/// [`crate::REGISTRY`]): leave the launched program reporting its **real**
+/// (backing-directory) image path everywhere, instead of the virtual one. When
+/// set, the launcher skips rewriting `CommandLine` argv[0] (vfs-inject's
+/// `procparams`), and the shim's bootstrap skips renaming `ImagePathName` and
+/// the loader entry's `FullDllName`/`BaseDllName` to the virtual path
+/// (`whereami`). The working-directory rewrite is kept. Lets a run match the
+/// proven skyrim-live shape (location == backing folder) so Steam's client, which
+/// looks for `steam_appid.txt` beside the process's reported image path from
+/// outside, finds it in the real staged folder. Default off: the virtual path is
+/// reported as usual.
+pub const REAL_IMAGE_PATH: &str = "VFS_REAL_IMAGE_PATH";
+/// Switch (`VFS_MEM_IMPORT_PATCH=0`, inherited): turn the in-memory import patch
+/// off for a launch, so a child that cannot be file-patched is given the shim by
+/// remote injection instead (`patch_imports_in_memory` refuses "Disabled"). The
+/// header patch is the one thing the proven setups never did; this leaves the
+/// target's header untouched. Default on (the in-memory patch is used).
+pub const MEM_IMPORT_PATCH: &str = "VFS_MEM_IMPORT_PATCH";
 /// Directory for session state (ready flag, configs, logs).
 pub const STATE_DIR: &str = "VFS_STATE_DIR";
 /// Base directory aether-vfs owns: downloaded Proton runtimes, per-session
@@ -581,6 +599,16 @@ pub const ALL: &[Var] = &[
         name: ROOT_BACKINGS,
         kind: Kind::Handshake,
         default: "none (each root's location is its backing directory)",
+    },
+    Var {
+        name: REAL_IMAGE_PATH,
+        kind: Kind::Behaviour,
+        default: "false (the virtual image path is reported)",
+    },
+    Var {
+        name: MEM_IMPORT_PATCH,
+        kind: Kind::Behaviour,
+        default: "true (the in-memory import patch is used)",
     },
     Var {
         name: STATE_DIR,

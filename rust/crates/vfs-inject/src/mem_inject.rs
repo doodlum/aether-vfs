@@ -53,8 +53,8 @@ pub enum MemPatchRefused {
 /// `VFS_MEM_IMPORT_PATCH=0` turns the in-memory import patch off for the
 /// launch whose environment holds it (and every child the shim follows,
 /// which inherits it): an unpatchable image is reached by remote injection
-/// instead.
-pub const MEM_IMPORT_PATCH_ENV: &str = "VFS_MEM_IMPORT_PATCH";
+/// instead. Registered in `vfs_env::ALL` as [`vfs_env::MEM_IMPORT_PATCH`].
+pub const MEM_IMPORT_PATCH_ENV: &str = vfs_env::MEM_IMPORT_PATCH;
 
 /// Patch the suspended `process`'s mapped image so it imports the shim first.
 ///
