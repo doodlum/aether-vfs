@@ -34,6 +34,10 @@ pub enum MemPatchRefused {
     /// known-good path under Wine and makes the Linux TPF launch work. So the
     /// in-memory patch is native-Windows only.
     UnderWine,
+    /// Turned off for this launch: `VFS_MEM_IMPORT_PATCH=0` in the
+    /// environment ([`MEM_IMPORT_PATCH_ENV`]). The caller injects instead,
+    /// the activation the shim method has always used for a child.
+    Disabled,
     /// The image's version of SteamStub could not be read.
     SteamStubUnknown,
     /// The headers, PEB or descriptors could not be read or parsed.
@@ -46,6 +50,12 @@ pub enum MemPatchRefused {
     RemoteMemory(String),
 }
 
+/// `VFS_MEM_IMPORT_PATCH=0` turns the in-memory import patch off for the
+/// launch whose environment holds it (and every child the shim follows,
+/// which inherits it): an unpatchable image is reached by remote injection
+/// instead.
+pub const MEM_IMPORT_PATCH_ENV: &str = "VFS_MEM_IMPORT_PATCH";
+
 /// Patch the suspended `process`'s mapped image so it imports the shim first.
 ///
 /// # Safety
@@ -57,6 +67,9 @@ pub unsafe fn patch_imports_in_memory(process: HANDLE) -> Result<(), MemPatchRef
     use MemPatchRefused::{NoRoomNearImage, RemoteMemory, Unreadable};
     if crate::running_under_wine() {
         return Err(MemPatchRefused::UnderWine);
+    }
+    if std::env::var_os(MEM_IMPORT_PATCH_ENV).is_some_and(|v| v == "0") {
+        return Err(MemPatchRefused::Disabled);
     }
     // SAFETY: as this function's contract.
     let base = unsafe { crate::procparams::peb_base(process) }

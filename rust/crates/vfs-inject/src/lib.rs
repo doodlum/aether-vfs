@@ -22,7 +22,7 @@ mod tree;
 /// A target's environment block, built from another (see `env_block`).
 pub use env_block::{build as build_env_block, current as current_env_block};
 /// In-memory import patch of a suspended image (`mem_inject`).
-pub use mem_inject::{patch_imports_in_memory, MemPatchRefused};
+pub use mem_inject::{patch_imports_in_memory, MemPatchRefused, MEM_IMPORT_PATCH_ENV};
 pub use pe::map_image_from_pe_bytes_local;
 /// Tell a suspended process its virtual command line and working directory.
 pub use procparams::rewrite as rewrite_process_parameters;
