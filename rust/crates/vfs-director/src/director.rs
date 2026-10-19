@@ -59,7 +59,15 @@ pub struct Director {
     /// The registry generation every ring of this director publishes ([`RegistryGeneration`]).
     /// Shared with each attached [`RegistryHost`], whose writes move it.
     reg_gen: Arc<RegistryGeneration>,
+    /// What puts a program the launched process starts onto real disk
+    /// ([`Director::stage_exec`]), set by the host for each launch.
+    exec_stager: RwLock<Option<ExecStager>>,
 }
+
+/// Stages the program at `(root, vpath)` onto real disk for a process the
+/// launched program starts, and returns the real path to start it by. See
+/// [`Director::stage_exec`].
+pub type ExecStager = Arc<dyn Fn(RootId, &str) -> Result<String, i32> + Send + Sync>;
 
 /// What [`Director::open_info`] says about a new handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,7 +97,34 @@ impl Director {
             mount_gen: AtomicU32::new(1),
             registry: RwLock::new(None),
             reg_gen: Arc::new(RegistryGeneration::new()),
+            exec_stager: RwLock::new(None),
         }
+    }
+
+    /// Set (`Some`) or clear (`None`) what [`Director::stage_exec`] calls.
+    pub fn set_exec_stager(&self, stager: Option<ExecStager>) {
+        *self.exec_stager.write().unwrap_or_else(|e| e.into_inner()) = stager;
+    }
+
+    /// Put the program at `(root, vpath)` onto real disk for a process the
+    /// launched program is starting (`OP_STAGE_EXEC`), and return the real
+    /// path to start it by.
+    ///
+    /// A child's image is opened by the kernel and its static imports by the
+    /// loader before any hook of the shim's runs in it, so a program that
+    /// only the VFS holds — a game the launcher starts, say — must be real
+    /// somewhere first: the host stages it into the root's backing directory,
+    /// as it did the launched program. `ST_NOT_SUPPORTED` when the host set no
+    /// stager.
+    pub fn stage_exec(&self, root: RootId, vpath: &str) -> Result<String, i32> {
+        let path = normalize(vpath).map_err(|_| bad_request())?;
+        let stager = self
+            .exec_stager
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .ok_or_else(vfs_provider::not_supported)?;
+        stager(root, &path)
     }
 
     /// Attach (`Some`) or detach (`None`) the session's registry overlay. Detaching does not

@@ -141,7 +141,7 @@ impl Session {
 
     /// The shim's bytes for staging to import-activate with, or `None` under
     /// [`Activation::Inject`]. Located the way the launch itself locates it.
-    fn shim_for_staging(&self, opts: &LaunchOpts) -> Result<Option<Vec<u8>>, String> {
+    pub(super) fn shim_for_staging(&self, opts: &LaunchOpts) -> Result<Option<Vec<u8>>, String> {
         if opts.activation != Activation::Import {
             return Ok(None);
         }

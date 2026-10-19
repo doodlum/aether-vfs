@@ -18,7 +18,11 @@ mod procparams;
 mod steam_helper;
 mod tree;
 
+/// A target's environment block, built from another (see `env_block`).
+pub use env_block::{build as build_env_block, current as current_env_block};
 pub use pe::map_image_from_pe_bytes_local;
+/// Tell a suspended process its virtual command line and working directory.
+pub use procparams::rewrite as rewrite_process_parameters;
 
 /// Parameters for [`run_target_with_shim`].
 pub struct RunConfig {

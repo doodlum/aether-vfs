@@ -38,7 +38,7 @@ fn key(name: &[u16]) -> String {
 /// `remove` or `set`, plus each of `set` (a later duplicate wins), sorted by
 /// name as Windows keeps a block — the `=`-prefixed entries first, in their
 /// own order.
-pub(crate) fn build(parent: &[u16], set: &[(String, String)], remove: &[String]) -> Vec<u16> {
+pub fn build(parent: &[u16], set: &[(String, String)], remove: &[String]) -> Vec<u16> {
     let mut dropped: Vec<String> = remove.iter().map(|n| n.to_uppercase()).collect();
     dropped.extend(set.iter().map(|(n, _)| n.to_uppercase()));
     let mut hidden: Vec<Vec<u16>> = Vec::new();
@@ -78,7 +78,7 @@ pub(crate) fn build(parent: &[u16], set: &[(String, String)], remove: &[String])
 /// This process's environment block, as `GetEnvironmentStringsW` returns
 /// it, through the final empty entry.
 #[allow(unsafe_code)]
-pub(crate) fn current() -> Vec<u16> {
+pub fn current() -> Vec<u16> {
     use windows_sys::Win32::System::Environment::{
         FreeEnvironmentStringsW, GetEnvironmentStringsW,
     };

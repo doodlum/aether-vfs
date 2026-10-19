@@ -40,6 +40,9 @@ pub(crate) enum ChildInjectError {
     InjectDll,
     /// The child's shim bootstrap failed and said so.
     BootstrapFailed,
+    /// The child could not be told its virtual working directory (see
+    /// `hook::child_start`).
+    VirtualStart,
     /// The child's shim never reported ready within the ready timeout.
     ReadyTimeout,
 }
@@ -54,6 +57,7 @@ impl ChildInjectError {
             Self::InjectDll => "inject-dll",
             Self::BootstrapFailed => "bootstrap-failed",
             Self::ReadyTimeout => "ready-timeout",
+            Self::VirtualStart => "virtual-start",
         }
     }
 }

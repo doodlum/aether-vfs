@@ -8,7 +8,7 @@ use vfs_protocol::{
     encode_read_resp, encode_read_resp_bulk, encode_readdir_resp, encode_write_resp, AttrResp,
     DirEntryWire, OpenResp, RootId, FLAG_READ_BULK, OP_CLOSE, OP_DELETE, OP_GETATTR, OP_HEARTBEAT,
     OP_MKDIR, OP_OPEN, OP_READ, OP_READDIR, OP_REG_CHANGED, OP_REG_LOOKUP, OP_RENAME, OP_RENAME_X,
-    OP_SETATTR, OP_STORED_NAMES, OP_WRITE, ST_BAD_REQUEST, ST_NOT_SUPPORTED, ST_OK,
+    OP_SETATTR, OP_STAGE_EXEC, OP_STORED_NAMES, OP_WRITE, ST_BAD_REQUEST, ST_NOT_SUPPORTED, ST_OK,
 };
 
 use crate::director::Director;
@@ -225,6 +225,13 @@ pub fn dispatch_director(
             Some((from_root, from, to_root, to)) => {
                 status_only(director.rename_across(RootId(from_root), &from, RootId(to_root), &to))
             }
+            None => bad(),
+        },
+        OP_STAGE_EXEC => match decode_path_req(payload) {
+            Some((root, path)) => match director.stage_exec(RootId(root), &path) {
+                Ok(real) => (ST_OK, real.into_bytes()),
+                Err(st) => (st, Vec::new()),
+            },
             None => bad(),
         },
         OP_DELETE => match decode_path_req(payload) {

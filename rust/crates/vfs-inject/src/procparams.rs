@@ -75,7 +75,7 @@ type NtQueryInformationProcessFn =
 /// `PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION |
 /// PROCESS_QUERY_INFORMATION` (a `CreateProcessW` handle has all of them).
 #[allow(unsafe_code)]
-pub(crate) unsafe fn rewrite(
+pub unsafe fn rewrite(
     process: HANDLE,
     command_line: Option<&str>,
     cwd: Option<&str>,

@@ -722,6 +722,23 @@ impl FuseClient {
         Ok(())
     }
 
+    /// Stage the program at `vpath` under `root` onto real disk so a child
+    /// can be started from it (`OP_STAGE_EXEC`): the real path to start it by.
+    pub fn stage_exec(&self, root: RootId, vpath: &str) -> Result<String, i32> {
+        let c = self.client();
+        let r = c
+            .submit(
+                vfs_protocol::OP_STAGE_EXEC,
+                0,
+                &vfs_protocol::encode_path_req(root.0, vpath),
+            )
+            .map_err(|_| vfs_protocol::ST_IO_ERROR)?;
+        if r.status != ST_OK {
+            return Err(r.status);
+        }
+        String::from_utf8(r.payload).map_err(|_| vfs_protocol::ST_IO_ERROR)
+    }
+
     /// Create a virtual directory via the director overlay (`OP_MKDIR`).
     pub fn mkdir(&self, root: RootId, vpath: &str, mode: u32) -> Result<(), i32> {
         let c = self.client();

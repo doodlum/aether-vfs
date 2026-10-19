@@ -51,6 +51,10 @@ pub const OP_REG_CHANGED: u32 = 22;
 /// and one nested in its location): the director copies a file into the
 /// destination root and removes it at the source. See [`encode_rename_x_req`].
 pub const OP_RENAME_X: u32 = 23;
+/// Stage the program at a vpath onto real disk for a process the launched
+/// program starts (`encode_path_req`); the reply is the real path to start it
+/// by. See `Director::stage_exec`.
+pub const OP_STAGE_EXEC: u32 = 24;
 
 /// Every live opcode with its name, in number order.
 pub const OPCODES: &[(&str, u32)] = &[
@@ -75,6 +79,7 @@ pub const OPCODES: &[(&str, u32)] = &[
     ("reg-rename-key", OP_REG_RENAME_KEY),
     ("reg-changed", OP_REG_CHANGED),
     ("rename-x", OP_RENAME_X),
+    ("stage-exec", OP_STAGE_EXEC),
 ];
 
 /// Every status code with its name, in number order.
@@ -954,6 +959,7 @@ mod tests {
             ("reg-rename-key", 21),
             ("reg-changed", 22),
             ("rename-x", 23),
+            ("stage-exec", 24),
         ];
         assert_eq!(OPCODES, want);
         let sts: &[(&str, i32)] = &[

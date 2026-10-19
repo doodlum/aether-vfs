@@ -77,23 +77,48 @@ pub(super) unsafe fn cpiw_hook_body(
     } else {
         None
     };
-    let cur_dir_eff: *const u16 = match &root_cwd_w {
+    let mut cur_dir_eff: *const u16 = match &root_cwd_w {
         Some(v) => v.as_ptr(),
         None => cur_dir,
     };
 
-    let forced = child_creation_flags(flags);
+    // Roots whose locations are purely virtual: the child is started from
+    // real copies and told where it is (see `child_start`). The plan's
+    // buffers stay alive for the whole call.
+    // SAFETY: the caller's strings and environment block, as the NT contract.
+    let plan = unsafe {
+        let wanted_cwd = super::child_start::wide_opt(cur_dir_eff);
+        super::child_start::plan(app, cmd, env, flags, wanted_cwd)
+    };
+    if plan.as_ref().is_some_and(|p| p.refuse) {
+        // SAFETY: FFI call with a valid error code.
+        unsafe { SetLastError(windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND) };
+        return 0;
+    }
+    let app_eff: *const u16 = plan
+        .as_ref()
+        .and_then(|p| p.app.as_ref())
+        .map_or(app, |v| v.as_ptr());
+    if let Some(c) = plan.as_ref().and_then(|p| p.cwd.as_ref()) {
+        cur_dir_eff = c.as_ptr();
+    }
+    let env_eff: *const c_void = plan
+        .as_ref()
+        .and_then(|p| p.env.as_ref())
+        .map_or(env, |v| v.as_ptr().cast());
+
+    let forced = super::child_start::flags_for(plan.as_ref(), child_creation_flags(flags));
     // SAFETY: the original NT function, called with valid NT arguments.
     let r = unsafe {
         tramp(
             token,
-            app,
+            app_eff,
             cmd,
             proc_attr,
             thread_attr,
             inherit,
             forced,
-            env,
+            env_eff,
             cur_dir_eff,
             si,
             pi,
@@ -107,6 +132,16 @@ pub(super) unsafe fn cpiw_hook_body(
         let hprocess = unsafe { (*pi).hProcess };
         // SAFETY: raw access under the NT-pointer contract (hook/mod.rs).
         let hthread = unsafe { (*pi).hThread };
+        // Started in a backing directory: told its virtual one before it runs.
+        if let Some(dir) = plan.as_ref().and_then(|p| p.virtual_cwd.as_deref()) {
+            // SAFETY: a suspended process this call just created.
+            if unsafe { vfs_inject::rewrite_process_parameters(hprocess, None, Some(dir)) }.is_err()
+            {
+                // SAFETY: as `refuse_child`'s contract: the successful call's out-parameters.
+                unsafe { refuse_child(pi, ptok, app, cmd, ChildInjectError::VirtualStart) };
+                return 0;
+            }
+        }
         // A patched child loads the shim through its own import table, and the
         // loader refuses to start it without one, so it is not injected:
         // injecting would load a second copy.

@@ -44,6 +44,10 @@ pub(in crate::session) struct WindowsState {
     /// ended, [`Session::stop_launch`] stops it, and dropping the session
     /// stops it before the ring goes.
     latest: Mutex<Weak<StopInner>>,
+    /// Programs the launched program started that were staged onto real disk
+    /// for it ([`Session::arm_exec_stager`]): held until the next launch, as
+    /// Windows keeps an image mapped while its process runs.
+    exec_staged: Arc<Mutex<Vec<vfs_director::stage::StagedDir>>>,
 }
 
 /// How long the injector waits for the shim to report ready when neither
@@ -294,6 +298,7 @@ impl Session {
         let mut env_remove: Vec<String> = opts.env_remove.clone();
         let mut roots_env = self.extra_roots_env();
         roots_env.extend(self.prepare_locations()?);
+        self.arm_exec_stager(opts)?;
         for (name, value) in ipc.env_roots(
             &root_s,
             &roots_env,
@@ -485,6 +490,71 @@ fn virtual_path(location: &str, vpath: &str) -> String {
         p.push_str(c);
     }
     p
+}
+
+/// Reads whole files out of one root of a session's graph, for staging.
+#[cfg(windows)]
+struct RootSource {
+    kernel: Arc<vfs_director::Director>,
+    root: RootId,
+}
+
+#[cfg(windows)]
+impl vfs_director::stage::ImageSource for RootSource {
+    fn read(&self, vpath: &str) -> Option<Vec<u8>> {
+        super::read::read_whole(&self.kernel, self.root, vpath).ok()
+    }
+}
+
+#[cfg(windows)]
+impl Session {
+    /// Let the director stage, for this launch, a program the launched one
+    /// starts that only the VFS holds ([`vfs_director::Director::stage_exec`],
+    /// `OP_STAGE_EXEC`): into its root's backing directory, with its import
+    /// closure, import-activated like the launched program, and held until the
+    /// next launch. A file already there is used as it is.
+    fn arm_exec_stager(&self, opts: &LaunchOpts) -> Result<(), String> {
+        let backings: BTreeMap<u32, PathBuf> = self
+            .root_locations()
+            .into_iter()
+            .filter_map(|l| self.root_backing_dir(l.id).map(|b| (l.id, b)))
+            .collect();
+        let shim = self.shim_for_staging(opts)?;
+        let fallback = opts.stage_fallback_dirs.clone();
+        let held = Arc::clone(&self.windows.exec_staged);
+        held.lock()
+            .map_err(|_| "exec staging lock poisoned".to_string())?
+            .clear();
+        let kernel = Arc::downgrade(&self.kernel);
+        let stager: vfs_director::ExecStager = Arc::new(move |root: RootId, vpath: &str| {
+            let kernel = kernel.upgrade().ok_or_else(vfs_provider::not_found)?;
+            let dir = backings.get(&root.0).ok_or_else(vfs_provider::not_found)?;
+            let host = vpath.split('/').fold(dir.clone(), |p, c| p.join(c));
+            if host.is_file() {
+                return Ok(host.to_string_lossy().into_owned());
+            }
+            let source = RootSource { kernel, root };
+            let staged = match &shim {
+                Some(s) => vfs_director::stage::stage_launch_into_patched(
+                    &source,
+                    vpath,
+                    &[],
+                    dir,
+                    &fallback,
+                    s,
+                ),
+                None => vfs_director::stage::stage_launch_into(&source, vpath, &[], dir, &fallback),
+            }
+            .map_err(|_| vfs_provider::map_io_err())?;
+            let exe = staged.exe().to_string_lossy().into_owned();
+            if let Ok(mut h) = held.lock() {
+                h.push(staged);
+            }
+            Ok(exe)
+        });
+        self.kernel.set_exec_stager(Some(stager));
+        Ok(())
+    }
 }
 
 /// The first id of the hidden roots [`Session::prepare_locations`] mounts for

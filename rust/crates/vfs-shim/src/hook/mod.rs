@@ -14,6 +14,7 @@
 //! `unsafe fn`'s contract. A comment says more only where a pointer comes from somewhere else.
 #![allow(unsafe_code)]
 
+mod child_start;
 mod close;
 mod dirquery;
 mod entry;

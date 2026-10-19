@@ -117,3 +117,77 @@ fn a_program_runs_from_a_location_that_does_not_exist_and_believes_it_is_there()
         ancestor.display()
     );
 }
+
+/// A program the launched one starts — by its virtual path, the way a
+/// launcher starts the game — runs from its virtual location too: it is
+/// staged, started from the backing directory, and told its cwd, module path
+/// and argv[0] are the virtual ones; its relative read goes through the
+/// virtual cwd it inherited. `vfs-fixture-read`'s child mode starts a copy of
+/// itself by `current_exe()` (the virtual path, after the rename) with an
+/// environment of its own (one variable removed), and the copy's probe
+/// replaces the parent's.
+#[cfg(windows)]
+#[test]
+fn a_child_of_a_program_at_a_virtual_location_runs_there_too() {
+    ensure_inject_artifacts();
+    let _launches = lock_launches();
+
+    let content = vfs_testkit::scratch_dir("vloc-child-content");
+    std::fs::copy(
+        locate_artifact("vfs-fixture-read.exe"),
+        content.join("game.exe"),
+    )
+    .unwrap();
+    std::fs::write(content.join("hello.txt"), b"hello").unwrap();
+    let out_dir = vfs_testkit::scratch_dir("vloc-child-out");
+    let world = vfs_testkit::scratch_dir("vloc-child-world");
+    let ancestor = world.join("Haskill");
+    let location = ancestor.join("list").join("game");
+
+    let mut session = LiveSession::create("vloc-child");
+    session.declare_root(0, &location);
+    session
+        .add_source(0, "/", 0, Arc::new(DiskProvider::new(&*content)))
+        .expect("add source");
+
+    let out = out_dir.join("probe.txt");
+    let env: BTreeMap<String, String> = [
+        ("VFS_FIXTURE_PROBE_OUT", out.to_string_lossy().into_owned()),
+        ("VFS_FIXTURE_PATH", "hello.txt".to_string()),
+        ("VFS_FIXTURE_EXPECT", "5".to_string()),
+        ("VFS_FIXTURE_SPAWN_CHILD", "1".to_string()),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect();
+    let code = launch_bounded(
+        session.shared(),
+        LaunchOpts {
+            image: "game.exe".into(),
+            env,
+            ..Default::default()
+        },
+        "virtual location child",
+    );
+    assert_eq!(
+        code, 0,
+        "parent and child must both read hello.txt through their virtual cwd"
+    );
+
+    let facts = probe_facts(&out);
+    let fact = |k: &str| facts.get(k).map(String::as_str);
+    assert_eq!(
+        fact("env VFS_FIXTURE_SPAWN_CHILD"),
+        None,
+        "this is the child's probe"
+    );
+    let exe = location.join("game.exe").to_string_lossy().into_owned();
+    assert_eq!(
+        fact("cwd"),
+        Some(&*location.to_string_lossy()),
+        "the child's cwd"
+    );
+    assert_eq!(fact("exe"), Some(&*exe), "the child's module path");
+    assert_eq!(fact("argv0"), Some(&*exe), "the child's argv[0]");
+    assert!(!ancestor.exists(), "nothing may appear above the location");
+}

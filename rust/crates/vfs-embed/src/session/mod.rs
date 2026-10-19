@@ -310,7 +310,7 @@ impl Session {
     /// The real host directory that backs `root`: root 0's is `virtual_root`
     /// ([`Session::set_root`]), a declared extra root's is
     /// `state_dir/roots/<id>`. `None` for an undeclared root.
-    fn root_backing_dir(&self, root: u32) -> Option<PathBuf> {
+    pub(super) fn root_backing_dir(&self, root: u32) -> Option<PathBuf> {
         if root == 0 {
             return Some(self.virtual_root.clone());
         }
