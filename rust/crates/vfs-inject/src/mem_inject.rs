@@ -28,6 +28,12 @@ const PEB_IMAGE_BASE: usize = 0x10;
 /// these as "fall back to remote-thread injection".
 #[derive(Debug)]
 pub enum MemPatchRefused {
+    /// Running under Wine (the Proton path). The import this adds names the
+    /// shim by filename, and Wine's loader does not find it beside the target
+    /// there; remote injection, which loads the shim by full path, is the
+    /// known-good path under Wine and makes the Linux TPF launch work. So the
+    /// in-memory patch is native-Windows only.
+    UnderWine,
     /// The image is a self-verifying SteamStub wrapper.
     SteamStubVerifies,
     /// The image's version of SteamStub could not be read.
@@ -51,6 +57,9 @@ pub enum MemPatchRefused {
 #[allow(unsafe_code)]
 pub unsafe fn patch_imports_in_memory(process: HANDLE) -> Result<(), MemPatchRefused> {
     use MemPatchRefused::{NoRoomNearImage, RemoteMemory, Unreadable};
+    if crate::running_under_wine() {
+        return Err(MemPatchRefused::UnderWine);
+    }
     // SAFETY: as this function's contract.
     let base = unsafe { crate::procparams::peb_base(process) }
         .map_err(Unreadable)
