@@ -117,10 +117,11 @@ pub(super) unsafe fn ldr_load_dll_hook_body(
             .ok()
             .flatten()
             .unwrap_or_default();
-        // SAFETY: `search_path` is NULL or a NUL-terminated wide string.
-        let path = unsafe { wide_opt(search_path) }.unwrap_or_default();
+        // `search_path` is not read: kernelbase passes load flags in it as
+        // often as a string (`LoadLibraryExW` ORs in bit 0), and reading
+        // that as text faulted in every failed load, killing the game.
         crate::loadlog::note(&format!(
-            "LdrLoadDll FAILED status={:#010x} name=\"{name}\" search_path=\"{path}\"",
+            "LdrLoadDll FAILED status={:#010x} name=\"{name}\"",
             status as u32
         ));
     }
@@ -184,26 +185,6 @@ unsafe fn image_path_of(params: *const c_void) -> Option<String> {
     let us = unsafe { params.cast::<u8>().add(RTL_UPP_IMAGE_PATH_OFF) }.cast::<UnicodeString>();
     // SAFETY: `us` points to the embedded `UNICODE_STRING`.
     unsafe { us_string(us) }.ok().flatten()
-}
-
-/// A NUL-terminated wide string at `p`, or `None` for NULL. Capped so a stray
-/// pointer cannot run away.
-///
-/// # Safety
-/// `p` is NULL or points to NUL-terminated UTF-16.
-unsafe fn wide_opt(p: *const u16) -> Option<String> {
-    if p.is_null() {
-        return None;
-    }
-    const CAP: usize = 4096;
-    let mut v = Vec::new();
-    // SAFETY: read up to the NUL or the cap, per the contract.
-    unsafe {
-        while v.len() < CAP && *p.add(v.len()) != 0 {
-            v.push(*p.add(v.len()));
-        }
-    }
-    Some(String::from_utf16_lossy(&v))
 }
 
 #[cfg(test)]
