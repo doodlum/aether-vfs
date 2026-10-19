@@ -719,7 +719,7 @@ fn launch_env_block(cfg: &RunConfig) -> Vec<u16> {
     // Payload-activation handshake: the child's shim DllMain reads these to
     // `install_late` through the early payload, and the shim's child hook reads
     // the payload path to arm its own children. A no-op when the switch is off.
-    if payload_active() {
+    if payload_active_for(cfg) {
         let cfg_file = format!("{}.payload_cfg", cfg.ready_path);
         let _ = std::fs::remove_file(&cfg_file);
         set.push((vfs_env::DUAL_LAYER.into(), "1".into()));
@@ -771,7 +771,7 @@ fn start_target(
     // The early-payload-activation path: opt-in, native Windows only (never
     // under Wine — the payload branch must not engage there). Everything below
     // this point is today's default injection path, kept as the `else`.
-    if payload_active() {
+    if payload_active_for(cfg) {
         return start_target_payload(cfg, job, env);
     }
 
@@ -1044,10 +1044,29 @@ fn start_import_activated(
     }
 }
 
-/// Whether the early-payload-activation path should engage: opt-in through
-/// `VFS_PAYLOAD_ACTIVATION`, and never under Wine (native Windows only).
-fn payload_active() -> bool {
-    vfs_env::opt_in(vfs_env::PAYLOAD_ACTIVATION) && !crate::running_under_wine()
+/// Whether the process being launched will have payload activation on. This
+/// looks at the environment the child will actually get: the switch set
+/// explicitly in `cfg.env_set` (how a host passes it to the launch), else
+/// inherited from this process. Native Windows only (never under Wine — the
+/// payload branch must not engage there).
+///
+/// The distinction matters because the launcher itself usually does not carry
+/// `VFS_PAYLOAD_ACTIVATION` in its own environment — it hands it to the child —
+/// so the payload handshake (`PAYLOAD_PATH`/`DUAL_LAYER`/`PAYLOAD_CFG_FILE`) and
+/// the launch-path choice must key off the child's environment, not the
+/// launcher's process environment.
+fn payload_active_for(cfg: &RunConfig) -> bool {
+    if crate::running_under_wine() {
+        return false;
+    }
+    match cfg
+        .env_set
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(vfs_env::PAYLOAD_ACTIVATION))
+    {
+        Some((_, v)) => vfs_env::truthy(v),
+        None => vfs_env::opt_in(vfs_env::PAYLOAD_ACTIVATION),
+    }
 }
 
 /// Start the target through the early payload (dual-layer):

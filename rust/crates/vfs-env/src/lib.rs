@@ -1040,9 +1040,18 @@ pub fn is_known(name: &str) -> bool {
 /// accident: under the opposite rule, `=off` would read as *true*.
 pub fn opt_in(name: &str) -> bool {
     match std::env::var(name) {
-        Ok(v) => matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+        Ok(v) => truthy(&v),
         Err(_) => false,
     }
+}
+
+/// Whether a switch *value* is affirmative — `1`, `true`, `yes` or `on`,
+/// case-insensitively. This is the acceptance set [`opt_in`] applies to a
+/// process-environment variable, exposed so a caller holding a value from
+/// elsewhere (e.g. an explicit per-launch override, not yet in any
+/// environment) decides it the same way.
+pub fn truthy(v: &str) -> bool {
+    matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
 }
 
 /// A switch that is **on unless explicitly turned off**.
