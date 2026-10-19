@@ -393,16 +393,38 @@ pub fn spawn(l: &WineLaunch) -> Result<std::process::Child, LaunchError> {
     // point the child's root map somewhere this session never chose. That is
     // the same stale-value hazard the Windows launch (`IpcServe::env_roots`)
     // clears in the child's block, and it applies here for the same reason.
-    for stale in stale_env(&env) {
-        cmd.env_remove(stale);
-    }
-    for name in &l.remove_env {
-        if !env.keys().any(|k| k.eq_ignore_ascii_case(name)) {
-            cmd.env_remove(name);
-        }
-    }
+    clear_env(
+        &mut cmd,
+        &env,
+        &l.remove_env,
+        std::env::vars_os().map(|(k, _)| k),
+    );
     crate::process::spawn_retrying_busy(&mut cmd)
         .map_err(|e| LaunchError::Spawn(format!("{prog}: {e}")))
+}
+
+/// Clears from `cmd` the inherited variables the child must not see: the
+/// handshake names the launch did not set ([`stale_env`]), and every name in
+/// `remove` that the launch did not set either. `inherited` is this process's
+/// variable names. A `remove` entry matches without regard to case — a
+/// Windows program sees `SteamAppId` and `STEAMAPPID` as one name — so each
+/// inherited spelling of it is cleared.
+fn clear_env(
+    cmd: &mut std::process::Command,
+    env: &BTreeMap<String, String>,
+    remove: &[String],
+    inherited: impl Iterator<Item = std::ffi::OsString>,
+) {
+    for stale in stale_env(env) {
+        cmd.env_remove(stale);
+    }
+    let set = |n: &str| env.keys().any(|k| k.eq_ignore_ascii_case(n));
+    let wanted = |n: &str| remove.iter().any(|r| r.eq_ignore_ascii_case(n)) && !set(n);
+    for name in inherited {
+        if name.to_str().is_some_and(wanted) {
+            cmd.env_remove(&name);
+        }
+    }
 }
 
 /// Creates `path` (and its parent directories) for a launch's output,
@@ -723,6 +745,44 @@ mod tests {
             w.ends_with(Path::new("files").join("bin").join("wine")),
             "{}",
             w.display()
+        );
+    }
+}
+
+#[cfg(test)]
+mod clear_env_tests {
+    use super::*;
+    use std::ffi::{OsStr, OsString};
+
+    /// What `cmd` was told to do with `name`: `Some(None)` is a removal.
+    fn told<'a>(cmd: &'a std::process::Command, name: &str) -> Option<Option<&'a OsStr>> {
+        cmd.get_envs()
+            .find(|(k, _)| *k == OsStr::new(name))
+            .map(|(_, v)| v)
+    }
+
+    #[test]
+    fn a_removed_name_is_cleared_in_every_inherited_spelling_unless_the_launch_sets_it() {
+        let mut cmd = std::process::Command::new("wine");
+        let env: BTreeMap<String, String> = [("WINEDEBUG".to_string(), "-all".to_string())].into();
+        let inherited = ["SteamAppId", "STEAMGAMEID", "HOME", "winedebug"].map(OsString::from);
+        clear_env(
+            &mut cmd,
+            &env,
+            &[
+                "steamappid".into(),
+                "SteamGameId".into(),
+                "WINEDEBUG".into(),
+            ],
+            inherited.into_iter(),
+        );
+        assert_eq!(told(&cmd, "SteamAppId"), Some(None), "matched in any case");
+        assert_eq!(told(&cmd, "STEAMGAMEID"), Some(None), "matched in any case");
+        assert_eq!(told(&cmd, "HOME"), None, "not asked for");
+        assert_eq!(
+            told(&cmd, "winedebug"),
+            None,
+            "the launch sets WINEDEBUG itself, so a removal does not clear it"
         );
     }
 }
