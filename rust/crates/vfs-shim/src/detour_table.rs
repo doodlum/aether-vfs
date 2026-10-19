@@ -32,6 +32,9 @@ macro_rules! detour_table {
         $cb! {
             // --- file hooks ---
             // The four path/attr stubs, detoured first and enabled together.
+            // On the payload-activation path (`VFS_PAYLOAD_ACTIVATION`) the early
+            // payload owns these four: `install_late` wires their trampolines to
+            // the payload's and skips re-detouring them (see `hook::install`).
             {
                 export: "NtCreateFile",
                 stat: [Create = 0],

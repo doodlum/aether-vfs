@@ -82,6 +82,12 @@ pub struct LaunchOpts {
     pub shim_dll: Option<PathBuf>,
     /// **Proton path only**: `vfs-injector.exe` — see [`shim_dll`](Self::shim_dll).
     pub injector: Option<PathBuf>,
+    /// **Windows early-payload-activation path only** (`VFS_PAYLOAD_ACTIVATION`):
+    /// absolute path to `vfs_payload.dll`, the zero-import early payload. Left
+    /// `None` — the default — it is resolved beside [`shim_dll`](Self::shim_dll)
+    /// at launch. Read only when the switch is set and the host is native
+    /// Windows; ignored otherwise, including on the Proton path and under Wine.
+    pub payload_dll: Option<PathBuf>,
     /// Extra environment variables for the child.
     ///
     /// **Proton path: child-only.** They go into the environment block the
@@ -152,6 +158,7 @@ impl Default for LaunchOpts {
             stage_fallback_dirs: Vec::new(),
             shim_dll: None,
             injector: None,
+            payload_dll: None,
             env: BTreeMap::new(),
             env_remove: Vec::new(),
             cwd: None,

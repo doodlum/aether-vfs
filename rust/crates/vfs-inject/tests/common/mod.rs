@@ -19,6 +19,7 @@ pub fn ensure_fixtures() {
             .join("..")
             .canonicalize()
             .expect("workspace root");
+        let target_dir = workspace.join("target");
 
         // Main-workspace fixtures.
         let mut cmd = Command::new(&cargo);
@@ -28,6 +29,8 @@ pub fn ensure_fixtures() {
             "vfs-shim-dll",
             "-p",
             "vfs-fixture-vproxy",
+            "-p",
+            "vfs-fixture-staticimp",
             "--quiet",
         ]);
         if !cfg!(debug_assertions) {
@@ -35,6 +38,24 @@ pub fn ensure_fixtures() {
         }
         let status = cmd.status().expect("spawn cargo to build fixtures");
         assert!(status.success(), "fixture cargo build failed: {status}");
+
+        // vfs-payload lives in its own workspace (panic = "abort"). Build it
+        // into the same target dir so `locate_artifact` finds it unchanged.
+        // Needed by the early-payload-activation tests.
+        let mut pay = Command::new(&cargo);
+        pay.current_dir(&workspace)
+            .env("CARGO_TARGET_DIR", &target_dir)
+            .args([
+                "build",
+                "--manifest-path",
+                "crates/vfs-payload/Cargo.toml",
+                "--quiet",
+            ]);
+        if !cfg!(debug_assertions) {
+            pay.arg("--release");
+        }
+        let status = pay.status().expect("spawn cargo to build vfs-payload");
+        assert!(status.success(), "vfs-payload cargo build failed: {status}");
 
         // Co-locate under profile dir for child inject + locate.
         colocate_profile_artifacts();
@@ -55,7 +76,12 @@ fn colocate_profile_artifacts() {
     let Some(profile_dir) = profile_dir_from_test_exe() else {
         return;
     };
-    for name in ["vfs_shim_dll.dll", "vproxy.dll"] {
+    for name in [
+        "vfs_payload.dll",
+        "vfs_shim_dll.dll",
+        "vproxy.dll",
+        "vfs-staticimp.exe",
+    ] {
         let dest = profile_dir.join(name);
         if dest.is_file() {
             continue;
@@ -114,6 +140,17 @@ fn find_near(reference: &Path, name: &str) -> Option<PathBuf> {
 #[allow(dead_code)] // used by some test binaries, not all
 pub fn locate_shim() -> String {
     locate_artifact("vfs_shim_dll.dll")
+}
+
+/// Shim + payload paths, with the payload co-located beside the shim when
+/// possible. Used by the early-payload-activation tests.
+#[allow(dead_code)] // used by some test binaries, not all
+pub fn locate_shim_and_payload() -> (String, String) {
+    ensure_fixtures();
+    let dll = locate_artifact("vfs_shim_dll.dll");
+    let payload = locate_artifact("vfs_payload.dll");
+    let resolved = vfs_inject::ensure_payload_beside_shim(&dll, Some(&payload)).unwrap_or(payload);
+    (dll, resolved)
 }
 
 /// Wait up to ~2 s for this process to have no child processes left, and

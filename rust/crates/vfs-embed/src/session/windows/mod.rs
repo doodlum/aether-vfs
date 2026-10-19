@@ -334,6 +334,16 @@ impl Session {
             env_set,
             env_remove,
             force_injection: false,
+            // Early-payload-activation path (`VFS_PAYLOAD_ACTIVATION`): the
+            // payload DLL, resolved beside the shim when the caller leaves it
+            // `None`. Read only when the switch is on and the host is native
+            // Windows; otherwise ignored.
+            payload_path: opts
+                .payload_dll
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            preinit_redirects: Vec::new(),
         });
 
         // Children the shim killed because it could not inject them, one

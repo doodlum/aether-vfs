@@ -14,15 +14,20 @@ mod env_block;
 mod inject;
 mod map;
 mod mem_inject;
+mod payload_cfg;
 mod pe;
 mod procparams;
+mod static_imports;
 mod steam_helper;
+mod stub;
 mod tree;
 
 /// A target's environment block, built from another (see `env_block`).
 pub use env_block::{build as build_env_block, current as current_env_block};
 /// In-memory import patch of a suspended image (`mem_inject`).
 pub use mem_inject::{patch_imports_in_memory, MemPatchRefused};
+/// Host-side mirror of the early payload's `Config` (payload-activation path).
+pub use payload_cfg::{PayloadConfig, RedirectEntry, MAX_REDIRECTS};
 pub use pe::map_image_from_pe_bytes_local;
 /// Tell a suspended process its virtual command line and working directory.
 pub use procparams::rewrite as rewrite_process_parameters;
@@ -64,6 +69,34 @@ pub struct RunConfig {
     /// which the loader's name-based import resolution cannot use); production
     /// launches leave it `false` and prefer the in-memory patch.
     pub force_injection: bool,
+    /// **Payload-activation path only** (`VFS_PAYLOAD_ACTIVATION`): the
+    /// zero-import early payload DLL (`vfs_payload.dll`). Empty — the default —
+    /// means "resolve it beside `dll_path`"; it is only read when the switch is
+    /// on. Non-payload callers leave it empty and are unaffected.
+    pub payload_path: String,
+    /// **Payload-activation path only**: early redirect-table entries
+    /// (static-import DLLs) to merge into the payload's table; usually empty.
+    pub preinit_redirects: Vec<PreinitRedirect>,
+}
+
+/// One early-payload redirect: object names ending with `suffix` (final path
+/// component) open the backing file at `backing_nt` (absolute NT path
+/// `\??\...`). Used only on the payload-activation path.
+pub struct PreinitRedirect {
+    pub suffix: String,
+    pub backing_nt: String,
+    pub backing_size: u64,
+}
+
+/// Parameters for [`run_target_with_preinit`] (early payload only; the
+/// static-import fixture path). Payload-activation machinery.
+pub struct PreinitConfig {
+    pub target_exe: String,
+    pub args: Vec<String>,
+    /// Working directory for the child (app dir without the virtualized DLL).
+    pub current_dir: Option<String>,
+    pub payload_path: String,
+    pub redirects: Vec<PreinitRedirect>,
 }
 
 /// Failure points in launch + inject + run.
@@ -109,12 +142,17 @@ pub enum InjectError {
     Terminate,
 }
 
-pub use artifacts::{exe_imports_shim, find_near};
+pub use artifacts::{
+    ensure_payload_beside_shim, exe_imports_shim, find_near, resolve_payload_for_run,
+};
 pub use cli::{parse_injector_args, InjectorArgs};
 pub use inject::{
-    expand_primary_stack, inject_dll, inject_dll_exit_code, resume_primary_thread,
-    run_target_with_shim, spawn_target_with_shim, PRIMARY_STACK_BYTES,
+    arm_preinit_payload, arm_preinit_payload_ex, expand_primary_stack, inject_dll,
+    inject_dll_exit_code, load_static_imports_from_config, merge_preinit_redirects,
+    resume_primary_thread, run_target_with_preinit, run_target_with_shim, spawn_target_with_shim,
+    PreinitArm, PRIMARY_STACK_BYTES,
 };
+pub use static_imports::StaticImport as ConfigStaticImport;
 pub use steam_helper::{
     active_process_pid, check_helper_command, clear_active_process_pid, running_under_wine,
     start_steam_helper, SteamHelper, SteamHelperError, ACTIVE_PROCESS_KEY,

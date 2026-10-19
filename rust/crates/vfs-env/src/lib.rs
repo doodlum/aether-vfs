@@ -179,6 +179,22 @@ pub const SHIM_READY: &str = "VFS_SHIM_READY";
 pub const CHILD_REFUSED_LOG: &str = "VFS_CHILD_REFUSED_LOG";
 /// Appended to the ready file's path to name [`CHILD_REFUSED_LOG`]'s file.
 pub const CHILD_REFUSED_SUFFIX: &str = ".child-refused";
+/// Opt-in: activate the shim through the early payload on native Windows
+/// (reflective-map `vfs_payload.dll`, redirect the primary thread's RIP to a
+/// spin-gated stub, remote-`LoadLibrary` the full shim, `install_late`),
+/// rather than today's default remote-injection / import-patch path. Read with
+/// [`opt_in`]. Native Windows only: under Wine the payload branch never
+/// engages. Written so it is easy to delete later — one guarded branch.
+pub const PAYLOAD_ACTIVATION: &str = "VFS_PAYLOAD_ACTIVATION";
+/// Path to `vfs_payload.dll`, for children that resolve it by environment
+/// (the payload-activation path only).
+pub const PAYLOAD_PATH: &str = "VFS_PAYLOAD_PATH";
+/// File carrying the remote address of the payload config, for `install_late`
+/// (the payload-activation path only).
+pub const PAYLOAD_CFG_FILE: &str = "VFS_PAYLOAD_CFG_FILE";
+/// Set when the launch uses the dual-layer (pre-init payload + full shim) path
+/// (the payload-activation path only).
+pub const DUAL_LAYER: &str = "VFS_DUAL_LAYER";
 /// Test-only: force `vfs_shim::director::try_init_from_env` to report a
 /// connect failure, regardless of ring configuration. Exists to exercise a
 /// director-launched process's abort path without a director that is
@@ -641,6 +657,31 @@ pub const ALL: &[Var] = &[
         name: CHILD_REFUSED_LOG,
         kind: Kind::Handshake,
         default: "unset: refusals are only counted",
+    },
+    // The early-payload-activation switch and the handshake vars that path
+    // threads through the child's environment. Behaviour (not Handshake) so the
+    // drift surface treats them as the opt-in feature they gate rather than
+    // part of the always-on launch handshake — and so this whole feature stays
+    // a single, easily deleted cluster.
+    Var {
+        name: PAYLOAD_ACTIVATION,
+        kind: Kind::Behaviour,
+        default: "unset: the shim is injected / import-patched (today's path)",
+    },
+    Var {
+        name: PAYLOAD_PATH,
+        kind: Kind::Behaviour,
+        default: "resolved beside the shim",
+    },
+    Var {
+        name: PAYLOAD_CFG_FILE,
+        kind: Kind::Behaviour,
+        default: "none",
+    },
+    Var {
+        name: DUAL_LAYER,
+        kind: Kind::Behaviour,
+        default: "unset",
     },
     Var {
         name: TEST_FUSE_INIT_FAIL,

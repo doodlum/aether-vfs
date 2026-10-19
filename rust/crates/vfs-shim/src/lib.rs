@@ -51,8 +51,8 @@ pub use hook::as_shim_io_for_tests;
 /// `no_extern_hook_bypasses_the_panic_containment_macro`.
 pub use hook::contain_panic;
 pub use hook::{
-    install, registry_detours_installed, skipped_detours, tracked_handle_count, HookGuard,
-    InstallError,
+    install, install_late, registry_detours_installed, skipped_detours, tracked_handle_count,
+    HookGuard, InstallError,
 };
 /// The under-root open classifier's counters. Exported so a gate's own tests
 /// can assert that a bypass class it closed reads **zero** — see
@@ -97,3 +97,8 @@ pub fn registry_notify_pending() -> usize {
 pub fn is_synthetic_key_handle(handle: isize) -> bool {
     regkeys::is_synthetic(handle)
 }
+
+/// The host-side mirror of the early payload's `Config`, for `install_late`'s
+/// signature and the payload-activation path. Re-exported so callers name it as
+/// `vfs_shim::PayloadConfig`.
+pub use vfs_inject::PayloadConfig;

@@ -79,6 +79,11 @@ fn main() {
         virtual_image: None,
         virtual_cwd: None,
         force_injection: false,
+        // The payload-activation path is native-Windows only; the injector runs
+        // under Wine, so this is never read. Left empty (resolved beside the
+        // shim if it ever were).
+        payload_path: String::new(),
+        preinit_redirects: Vec::new(),
     })
     .unwrap_or_else(|e| {
         eprintln!("[vfs-injector] inject error: {e:?}");

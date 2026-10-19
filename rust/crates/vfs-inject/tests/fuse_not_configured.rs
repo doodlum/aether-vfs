@@ -71,6 +71,8 @@ fn no_ring_configured_aborts_the_launch() {
         virtual_image: None,
         virtual_cwd: None,
         force_injection: false,
+        payload_path: String::new(),
+        preinit_redirects: Vec::new(),
     });
 
     match result {

@@ -53,6 +53,8 @@ fn a_config_version_mismatch_kills_the_process_with_the_message() {
         virtual_image: None,
         virtual_cwd: None,
         force_injection: false,
+        payload_path: String::new(),
+        preinit_redirects: Vec::new(),
     });
 
     match result {

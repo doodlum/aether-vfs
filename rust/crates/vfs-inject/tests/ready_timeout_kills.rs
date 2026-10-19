@@ -54,6 +54,8 @@ fn a_shim_that_never_reports_ready_gets_the_process_killed() {
         // This test injects a full-path fake shim; the in-memory patch (which
         // imports the real shim by name) does not apply, so force injection.
         force_injection: true,
+        payload_path: String::new(),
+        preinit_redirects: Vec::new(),
     });
 
     assert!(
