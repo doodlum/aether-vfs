@@ -375,6 +375,57 @@ macro_rules! detour_table {
                 ) -> NTSTATUS,
                 on_panic: STATUS_HOOK_PANICKED,
             }
+            // --- load diagnostics (group File, from ntdll): log-only, change nothing ---
+            // `IfPresent`: on Windows and Wine all three exist and are hooked; an absent export
+            // (older host) is skipped silently. `stat: []` — no hook-stats row. See `hook::diag`.
+            {
+                export: "NtRaiseHardError",
+                stat: [],
+                tramp: TRAMP_RAISE_HARD_ERROR: NtRaiseHardErrorFn,
+                install: IfPresent, group: File, flags: [],
+                hook: raise_hard_error_hook = raise_hard_error_hook_body(
+                    status: NTSTATUS,
+                    num_params: u32,
+                    mask: u32,
+                    params: *const usize,
+                    response_option: u32,
+                    response: *mut u32,
+                ) -> NTSTATUS,
+                on_panic: STATUS_HOOK_PANICKED,
+            }
+            {
+                export: "LdrLoadDll",
+                stat: [],
+                tramp: TRAMP_LDR_LOAD_DLL: LdrLoadDllFn,
+                install: IfPresent, group: File, flags: [],
+                hook: ldr_load_dll_hook = ldr_load_dll_hook_body(
+                    search_path: *const u16,
+                    characteristics: *const u32,
+                    dll_name: *const UnicodeString,
+                    base: *mut *mut c_void,
+                ) -> NTSTATUS,
+                on_panic: STATUS_HOOK_PANICKED,
+            }
+            {
+                export: "NtCreateUserProcess",
+                stat: [],
+                tramp: TRAMP_NT_CREATE_USER_PROCESS: NtCreateUserProcessFn,
+                install: IfPresent, group: File, flags: [],
+                hook: create_user_process_hook = create_user_process_hook_body(
+                    process_handle: *mut HANDLE,
+                    thread_handle: *mut HANDLE,
+                    process_access: u32,
+                    thread_access: u32,
+                    process_oa: *const ObjectAttributes,
+                    thread_oa: *const ObjectAttributes,
+                    process_flags: u32,
+                    thread_flags: u32,
+                    process_params: *const c_void,
+                    create_info: *mut c_void,
+                    attribute_list: *const c_void,
+                ) -> NTSTATUS,
+                on_panic: STATUS_HOOK_PANICKED,
+            }
             // --- registry hooks (group Registry): installed only when `VFS_REGISTRY` is set ---
             // Registry virtualisation is all or nothing (`regclient::enabled`): every row below that is not
             // installed lands in `missing`, and the outcome is recorded once, after the last row.

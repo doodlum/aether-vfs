@@ -16,6 +16,7 @@
 
 mod child_start;
 mod close;
+mod diag;
 mod dirquery;
 mod entry;
 mod file_attr;
@@ -44,6 +45,7 @@ pub(crate) use self::registry::reg_real;
 
 // Every module reaches the others' `pub(super)` items through here.
 use self::close::*;
+use self::diag::*;
 use self::dirquery::*;
 use self::entry::*;
 use self::file_attr::*;

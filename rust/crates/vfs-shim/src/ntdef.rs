@@ -774,6 +774,53 @@ pub(crate) const STATUS_HANDLE_NOT_CLOSABLE: NTSTATUS = 0xC000_0235u32 as i32;
 /// `STATUS_INVALID_SECURITY_DESCR`.
 pub(crate) const STATUS_INVALID_SECURITY_DESCR: NTSTATUS = 0xC000_0079u32 as i32;
 
+/// `ntdll!NtRaiseHardError`. The loader calls it when a module cannot be loaded
+/// (a missing static import or delay-load): `ErrorStatus` is the failure (e.g.
+/// `STATUS_DLL_NOT_FOUND` 0xC0000135) and `Parameters[0]` is a `UNICODE_STRING*`
+/// naming the DLL when bit 0 of `UnicodeStringParameterMask` is set. The shim
+/// hooks it to *log* the error in whichever process raises it; it changes
+/// nothing (the trampoline is called unchanged). Diagnostics only.
+pub(crate) type NtRaiseHardErrorFn = unsafe extern "system" fn(
+    NTSTATUS,     // ErrorStatus
+    u32,          // NumberOfParameters
+    u32,          // UnicodeStringParameterMask
+    *const usize, // Parameters (PULONG_PTR)
+    u32,          // ValidResponseOptions
+    *mut u32,     // Response
+) -> NTSTATUS;
+
+/// `ntdll!LdrLoadDll`, the loader's dynamic-load entry (under `LoadLibrary*`).
+/// The shim hooks it to log a *failed* load — the DLL name, the search path and
+/// the status — so a dynamic load that resolves against the virtual game dir and
+/// misses (a DLL only in the backing folder) is visible. Diagnostics only; the
+/// trampoline's result is returned unchanged.
+pub(crate) type LdrLoadDllFn = unsafe extern "system" fn(
+    *const u16,           // SearchPath (optional)
+    *const u32,           // DllCharacteristics (optional)
+    *const UnicodeString, // DllName
+    *mut *mut c_void,     // BaseAddress (out)
+) -> NTSTATUS;
+
+/// `ntdll!NtCreateUserProcess`, the native process-creation syscall that
+/// `CreateProcessInternalW` funnels into — but which can also be called directly,
+/// bypassing that hook. The shim hooks it to log the image path of every process
+/// created from a shimmed process, so a create that never reached
+/// `cpiw_hook_body` is caught. Diagnostics only (log + call through); it does not
+/// yet virtualise or refuse here — see `cpiw_hook_body` for the fail-closed path.
+pub(crate) type NtCreateUserProcessFn = unsafe extern "system" fn(
+    *mut HANDLE,             // ProcessHandle (out)
+    *mut HANDLE,             // ThreadHandle (out)
+    u32,                     // ProcessDesiredAccess
+    u32,                     // ThreadDesiredAccess
+    *const ObjectAttributes, // ProcessObjectAttributes (optional)
+    *const ObjectAttributes, // ThreadObjectAttributes (optional)
+    u32,                     // ProcessFlags
+    u32,                     // ThreadFlags
+    *const c_void,           // ProcessParameters (PRTL_USER_PROCESS_PARAMETERS)
+    *mut c_void,             // CreateInfo (PPS_CREATE_INFO)
+    *const c_void,           // AttributeList (PPS_ATTRIBUTE_LIST)
+) -> NTSTATUS;
+
 /// The typed structures above are the layouts `vfs_ntlayout`'s byte writers fill: this pins the two
 /// together, so a field moved on either side fails on a Windows host.
 #[cfg(test)]
