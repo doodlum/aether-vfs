@@ -11,15 +11,14 @@
 //! - `VFS_SKYRIM_ROOT`    = `C:\tmp\skyrim-runtime` (empty managed virtual root)
 //! - `VFS_SKYRIM_LAUNCH`  = `SkyrimSE.exe`, or `skse64_loader.exe` to go via SKSE
 //!
-//! **Two managed roots** (stage 2b task 6): root 0 is the game directory
-//! above; root 1 is `Documents\My Games\Skyrim Special Edition` — the
-//! junction `setup_my_games_junctions` points at `profiles`, declared here so
-//! the gate-1 baseline's headline open question (does the game's save route
-//! through the director, or does it still bypass every counter through that
-//! junction?) can actually be measured instead of assumed. See
-//! `resolve_second_root_target`'s doc comment for the junction-resolution
-//! detail and `print_open_totals`/`CountingProvider` for the per-root
-//! counters this adds.
+//! **Three managed roots.** Root 0 is the game directory above; root 1 is
+//! `Documents\My Games\Skyrim Special Edition` and root 2 is
+//! `%LOCALAPPDATA%\Skyrim Special Edition`, both declared at the user's real
+//! paths and both **purely virtual**: the shim serves everything under them
+//! from `profiles` (and `profiles\LocalAppData`), and nothing in the user's
+//! real Documents or LocalAppData is created, moved or changed. (This harness
+//! used to junction those folders to `profiles`, migrating what was there.)
+//! See `print_open_totals`/`CountingProvider` for the per-root counters.
 
 // On Linux `main` exits immediately, so the Windows-only helpers are unused.
 #![cfg_attr(not(windows), allow(dead_code))]
@@ -153,8 +152,17 @@ fn run() -> Result<(), String> {
     stage_dx_redist(&root, &data.join("dx-redist"))?;
 
     // ── remap My Games saves + profile/ini area ────────────────────────────
-    let my_games_docs = setup_my_games_junctions(&profiles, &saves)?;
-    setup_localappdata_junction(&profiles)?;
+    // Purely virtual locations: nothing is created, moved or junctioned in the
+    // user's real Documents or LocalAppData. Root 1 (My Games) is served from
+    // `profiles`, root 2 (LocalAppData) from `profiles\LocalAppData`.
+    let my_games_docs = user_folder(
+        "USERPROFILE",
+        &["Documents", "My Games", "Skyrim Special Edition"],
+    )?;
+    let local_sse = user_folder("LOCALAPPDATA", &["Skyrim Special Edition"])?;
+    let local_backing = profiles.join("LocalAppData");
+    std::fs::create_dir_all(&local_backing)
+        .map_err(|e| format!("mkdir {}: {e}", local_backing.display()))?;
     seed_profile_settings(&profiles)?;
 
     // DRM path: talk to the *already-running* Steam client only.
@@ -163,13 +171,20 @@ fn run() -> Result<(), String> {
     // - Do write steam_appid.txt next to the exe (and in the VFS overlay). That
     //   is Valve's documented dev override so RestartAppIfNecessary returns
     //   false and SteamAPI_Init still verifies ownership via the running client.
-    std::env::remove_var("SteamAppId");
-    std::env::remove_var("SteamGameId");
-    std::env::remove_var("SteamOverlayGameId");
-    std::env::remove_var("SteamClientLaunch");
-    std::env::remove_var("SteamEnv");
-    std::env::remove_var("SteamTenfoot");
-    std::env::remove_var("SteamAppUser");
+    //   Cleared from the child's environment only (`LaunchOpts::env_remove`).
+    let child_env_remove: Vec<String> = [
+        "SteamAppId",
+        "SteamGameId",
+        "SteamOverlayGameId",
+        "SteamClientLaunch",
+        "SteamEnv",
+        "SteamTenfoot",
+        "SteamAppUser",
+        vfs_env::ALLOW_DISK_FALLTHROUGH,
+        vfs_env::DISK_ONLY_ROOT,
+    ]
+    .map(String::from)
+    .to_vec();
     write_steam_appid(&root, &overrides)?;
     // Overlay inject has been observed to trip Steam CM asserts (`Expected
     // connection state 0/1 but got 2`) and clean Shutdown.
@@ -186,8 +201,6 @@ fn run() -> Result<(), String> {
     // (Spelled in prose rather than as the literal name on purpose —
     // `vfs-env`'s drift test scans these sources for unregistered `VFS_*`
     // names, and a retired one in a comment reads to it as a live use.)
-    std::env::remove_var(vfs_env::ALLOW_DISK_FALLTHROUGH);
-    std::env::remove_var(vfs_env::DISK_ONLY_ROOT);
     if let Some(p) = vfs_env::raw(vfs_env::DIRECTOR_OPEN_LOG) {
         eprintln!("  director-open log: {}", p.to_string_lossy());
     }
@@ -285,39 +298,18 @@ fn run() -> Result<(), String> {
     );
 
     // ── second managed root: Documents\My Games\Skyrim Special Edition ─────
-    // Gate 1's baseline found the game's own save invisible to every
-    // counter: it travels through the junction `setup_my_games_junctions`
-    // just created (`my_games_docs` -> `profiles`), which sits outside root
-    // 0 (`root`) entirely, so neither the shim's classifier nor the
-    // director's reconciliation ever saw it as anything but "outside-root".
-    // Declaring it as root 1 is this task's whole question: does the save
-    // now route through the director, or does it still bypass? Either
-    // answer is the deliverable — see `resolve_second_root_target`'s doc
-    // comment for why the path handed to `declare_root` (the junction's own
-    // spelling) and the path backing this root's provider (its resolved
-    // target) are deliberately different strings, not an oversight.
-    let profiles_target = resolve_second_root_target(&my_games_docs)?;
+    // Gate 1's baseline found the game's own save invisible to every counter:
+    // it travelled through a junction this harness made in the user's real
+    // Documents. Root 1's location is now that real path, declared purely
+    // virtual: the shim serves everything under it, nothing is made or
+    // changed there, and its content is `profiles` — so the save routes
+    // through the director, and the per-root counters below see it.
+    let profiles_target = profiles.clone();
     eprintln!(
-        "  root 1:    {}  (Documents\\My Games junction; declared as-is so the shim's literal-\
-component match sees exactly what the game's own raw NT open spells)",
-        my_games_docs.display()
-    );
-    eprintln!(
-        "  root 1 resolves via GetFinalPathNameByHandleW → {}",
+        "  root 1:    {}  (virtual; served from {})",
+        my_games_docs.display(),
         profiles_target.display()
     );
-    if resolved_target_matches(&profiles_target, &profiles) {
-        eprintln!(
-            "  root 1 resolution OK: matches the configured profiles dir ({})",
-            profiles.display()
-        );
-    } else {
-        eprintln!(
-            "  WARNING: root 1's resolved target does not match the configured profiles dir \
-({}) — verify the junction (`mklink /J` output above) before trusting this run's root-1 numbers",
-            profiles.display()
-        );
-    }
     // A single `DiskProvider` covering the whole of `profiles_target` is the
     // right shape for this root's *content* (unlike the root-0 mistake a
     // prior review flagged — `DiskProvider::new(root)` mounted at `/`
@@ -346,7 +338,7 @@ component match sees exactly what the game's own raw NT open spells)",
     // from root 0 and deliberate: root 0's write layer and the shim's overlay
     // are the same physical directory, so there is nothing to choose between;
     // root 1's are different directories, and saves must keep landing in
-    // `profiles` (that is what the junction measurement is about). As the
+    // `profiles` (that is what the root-1 measurement is about). As the
     // base, the shim's overlay is visible to reads and is copied up into
     // `profiles` on first write, instead of diverting the save away from the
     // directory this harness exists to observe.
@@ -384,6 +376,19 @@ component match sees exactly what the game's own raw NT open spells)",
         root1_shim_overlay.display()
     );
     session.declare_root(1, my_games_docs.clone());
+
+    // Root 2: `%LOCALAPPDATA%\Skyrim Special Edition` (plugins.txt and the
+    // like), purely virtual too, served from `profiles\LocalAppData`.
+    session
+        .kernel()
+        .mount(RootId(2), Arc::new(DiskProvider::new(&local_backing)))
+        .map_err(|st| format!("mount root2 status {st}"))?;
+    session.declare_root(2, local_sse.clone());
+    eprintln!(
+        "  root 2:    {}  (virtual; served from {})",
+        local_sse.display(),
+        local_backing.display()
+    );
 
     // Prove steam_appid is visible through the director (what the shim FUSE sees).
     match session.kernel().getattr(RootId::DEFAULT, "steam_appid.txt") {
@@ -478,7 +483,6 @@ component match sees exactly what the game's own raw NT open spells)",
                 staged.staged().join(", ")
             );
             let exe = staged.exe().to_string_lossy().into_owned();
-            std::env::set_var(vfs_env::LAUNCH_IMAGE, &exe);
             _staged = staged;
             exe
         }
@@ -505,7 +509,10 @@ component match sees exactly what the game's own raw NT open spells)",
         args: vec![],
         wait,
         shim_dll: None,
-        env: Default::default(),
+        // The staged image's directory is a second spelling of root 0 for the
+        // shim (`VFS_LAUNCH_IMAGE`), in the child's environment only.
+        env: [(vfs_env::LAUNCH_IMAGE.to_string(), host.clone())].into(),
+        env_remove: child_env_remove,
         ..Default::default()
     })?;
 
@@ -620,63 +627,6 @@ fn mount_low_priority_disk_layers(
         .mount("", Arc::new(DiskProvider::new(staged_dir_path)))
         .map_err(|st| format!("mount staging-disk status {st}"))?;
     Ok(())
-}
-
-/// Resolve `docs` (the `Documents\My Games\Skyrim Special Edition` junction
-/// `setup_my_games_junctions` just created) to the real directory it
-/// currently points at, via `GetFinalPathNameByHandleW`
-/// (`vfs_win::final_path_for_open`) — the same authoritative, OS-consulted
-/// resolution `vfs-redirect` itself uses for a junction/8.3/subst spelling,
-/// rather than trusting that `profiles` (this project's own configured
-/// target) is necessarily still what the junction resolves to.
-///
-/// **Deliberately not used for `declare_root`.** `Session::declare_root`'s
-/// path is matched *literally*, component-by-component, against whatever a
-/// real NT open spells (`RootMap::match_canonical`) — it is never itself
-/// resolved through a junction (see `vfs-redirect`'s
-/// `root_itself_being_a_reparse_point_is_never_aliased`, which proves a
-/// declared root's own path is excluded from the junction-alias scan on
-/// purpose). The gate-1 baseline's own captured log shows the game's raw
-/// save open spelled exactly as the junction's own path
-/// (`\??\c:\users\...\documents\my games\skyrim special edition\saves\...`),
-/// never the resolved target — so declaring root 1 with the *resolved*
-/// path here would build a `RootMap` entry the shim's literal match can
-/// never satisfy, silently leaving the save exactly as invisible as before.
-/// What resolution *is* for: the **provider** backing root 1 needs a real
-/// directory, and asking the OS once, explicitly and verifiably, is more
-/// honest than assuming `profiles` is still correct or relying a second time
-/// on the disk layer's own transparent junction-following.
-#[cfg(windows)]
-fn resolve_second_root_target(docs: &Path) -> Result<PathBuf, String> {
-    let raw = docs.to_string_lossy().into_owned();
-    let resolved = vfs_win::final_path_for_open(&raw).ok_or_else(|| {
-        format!(
-            "could not resolve {} via GetFinalPathNameByHandleW (does the junction exist yet?)",
-            docs.display()
-        )
-    })?;
-    // `GetFinalPathNameByHandleW`'s default form is VOLUME_NAME_DOS
-    // (`\\?\`-prefixed) — strip it for an ordinary Win32 path, the same
-    // convention `Session::launch`'s own `strip_verbatim` already applies to
-    // this exact API's output shape.
-    let stripped = resolved.strip_prefix(r"\\?\").unwrap_or(&resolved);
-    Ok(PathBuf::from(stripped))
-}
-
-#[cfg(not(windows))]
-fn resolve_second_root_target(_docs: &Path) -> Result<PathBuf, String> {
-    Err("GetFinalPathNameByHandleW is not available on this platform".to_string())
-}
-
-/// Whether `resolved` (root 1's OS-resolved real location) is the same
-/// directory as `expected` (this process's own configured `profiles` dir),
-/// canonicalising both first so a trailing separator or an alternate-but-
-/// equivalent spelling does not read as a mismatch.
-fn resolved_target_matches(resolved: &Path, expected: &Path) -> bool {
-    let a = std::fs::canonicalize(resolved).unwrap_or_else(|_| resolved.to_path_buf());
-    let b = std::fs::canonicalize(expected).unwrap_or_else(|_| expected.to_path_buf());
-    a.to_string_lossy()
-        .eq_ignore_ascii_case(&b.to_string_lossy())
 }
 
 /// Wraps another provider, tallying getattr/open/read/write traffic
@@ -1521,93 +1471,15 @@ fn wipe_files(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Returns the `Documents\My Games\Skyrim Special Edition` path (the
-/// junction this function creates, pointing at `profiles`) so `run` can
-/// declare it as the second managed root without re-deriving `%USERPROFILE%`
-/// a second time and risking drift between the two computations.
-fn setup_my_games_junctions(profiles: &Path, saves: &Path) -> Result<PathBuf, String> {
-    let docs = std::env::var_os("USERPROFILE")
+/// `<env var's folder>\<parts…>`: the path of a folder in the user's profile
+/// (`USERPROFILE`, `LOCALAPPDATA`) that this harness declares as a purely
+/// virtual root location. Only the path is computed; nothing there is
+/// created, read or changed.
+fn user_folder(var: &str, parts: &[&str]) -> Result<PathBuf, String> {
+    let base = std::env::var_os(var)
         .map(PathBuf::from)
-        .ok_or_else(|| "USERPROFILE unset".to_string())?
-        .join("Documents")
-        .join("My Games")
-        .join("Skyrim Special Edition");
-
-    // Ensure nested Saves junction target exists under profiles before swapping.
-    let profiles_saves = profiles.join("Saves");
-
-    // Migrate existing real Saves → c:\tmp\skyrim-data\saves
-    let old_saves = docs.join("Saves");
-    if old_saves.is_dir() && !is_reparse_point(&old_saves) {
-        eprintln!("  migrating existing Saves → {}", saves.display());
-        merge_dir(&old_saves, saves)?;
-        std::fs::remove_dir_all(&old_saves).map_err(|e| format!("remove old Saves: {e}"))?;
-    }
-
-    // Migrate other My Games content into profiles (if real directory).
-    if docs.is_dir() && !is_reparse_point(&docs) {
-        eprintln!("  migrating My Games SSE → {}", profiles.display());
-        for ent in std::fs::read_dir(&docs)
-            .map_err(|e| e.to_string())?
-            .flatten()
-        {
-            let name = ent.file_name();
-            if name == "Saves" {
-                continue;
-            }
-            let dest = profiles.join(&name);
-            let src = ent.path();
-            if src.is_dir() {
-                merge_dir(&src, &dest)?;
-                let _ = std::fs::remove_dir_all(&src);
-            } else if src.is_file() {
-                let _ = std::fs::copy(&src, &dest);
-                let _ = std::fs::remove_file(&src);
-            }
-        }
-        // Remove empty shell if possible.
-        let _ = std::fs::remove_dir_all(&docs);
-    }
-
-    // profiles\Saves → saves
-    if profiles_saves.exists() && !is_reparse_point(&profiles_saves) {
-        merge_dir(&profiles_saves, saves)?;
-        let _ = std::fs::remove_dir_all(&profiles_saves);
-    }
-    ensure_junction(&profiles_saves, saves)?;
-
-    // My Games\Skyrim Special Edition → profiles
-    if let Some(parent) = docs.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    ensure_junction(&docs, profiles)?;
-    eprintln!("  junction: {}  ⇒  {}", docs.display(), profiles.display());
-    eprintln!(
-        "  junction: {}  ⇒  {}",
-        profiles_saves.display(),
-        saves.display()
-    );
-    Ok(docs)
-}
-
-fn setup_localappdata_junction(profiles: &Path) -> Result<(), String> {
-    let local_sse = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .ok_or_else(|| "LOCALAPPDATA unset".to_string())?
-        .join("Skyrim Special Edition");
-    let target = profiles.join("LocalAppData");
-    std::fs::create_dir_all(&target).map_err(|e| e.to_string())?;
-    if local_sse.is_dir() && !is_reparse_point(&local_sse) {
-        merge_dir(&local_sse, &target)?;
-        let _ = std::fs::remove_dir_all(&local_sse);
-    }
-    ensure_junction(&local_sse, &target)?;
-    eprintln!(
-        "  junction: {}  ⇒  {}",
-        local_sse.display(),
-        target.display()
-    );
-    Ok(())
+        .ok_or_else(|| format!("{var} unset"))?;
+    Ok(parts.iter().fold(base, |p, c| p.join(c)))
 }
 
 /// `SkyrimPrefs.ini` settings this harness seeds before launch, so a
@@ -1902,71 +1774,6 @@ mod profile_seed_tests {
         let got: Vec<(&str, &str)> = SEEDED_PREFS.iter().map(|(s, k, _)| (*s, *k)).collect();
         assert_eq!(got, expect.to_vec());
     }
-}
-
-fn merge_dir(src: &Path, dest: &Path) -> Result<(), String> {
-    std::fs::create_dir_all(dest).map_err(|e| e.to_string())?;
-    for ent in std::fs::read_dir(src).map_err(|e| e.to_string())?.flatten() {
-        let from = ent.path();
-        let to = dest.join(ent.file_name());
-        if from.is_dir() {
-            merge_dir(&from, &to)?;
-        } else if from.is_file() && !to.exists() {
-            std::fs::copy(&from, &to).map_err(|e| format!("copy {}: {e}", from.display()))?;
-        }
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn is_reparse_point(path: &Path) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-    // symlink_metadata does not follow junctions/symlinks.
-    std::fs::symlink_metadata(path)
-        .map(|m| m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
-        .unwrap_or(false)
-}
-
-#[cfg(not(windows))]
-fn is_reparse_point(_path: &Path) -> bool {
-    false
-}
-
-fn ensure_junction(link: &Path, target: &Path) -> Result<(), String> {
-    if link.exists() || is_reparse_point(link) {
-        if is_reparse_point(link) {
-            // Already a reparse point — leave it (assume correct).
-            return Ok(());
-        }
-        // Real path still there.
-        return Err(format!(
-            "cannot create junction {}; path exists and is not a junction",
-            link.display()
-        ));
-    }
-    if let Some(parent) = link.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    // cmd mklink /J
-    let status = std::process::Command::new("cmd")
-        .args([
-            "/C",
-            "mklink",
-            "/J",
-            &link.to_string_lossy(),
-            &target.to_string_lossy(),
-        ])
-        .status()
-        .map_err(|e| format!("mklink: {e}"))?;
-    if !status.success() {
-        return Err(format!(
-            "mklink /J {} {} failed: {status}",
-            link.display(),
-            target.display()
-        ));
-    }
-    Ok(())
 }
 
 #[cfg(test)]
