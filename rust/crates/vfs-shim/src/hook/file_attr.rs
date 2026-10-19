@@ -3,7 +3,8 @@
 
 use super::{
     allow_disk_fallthrough, attributes, caller_buf, in_hook_reenter, path_file_id, path_of,
-    put_basic, put_network_open, BASIC_LEN, NETWORK_OPEN_LEN, TRAMP_QATTR, TRAMP_QFULL, TRAMP_QIBN,
+    put_basic, put_network_open, steam_appid_trace, BASIC_LEN, NETWORK_OPEN_LEN, TRAMP_QATTR,
+    TRAMP_QFULL, TRAMP_QIBN,
 };
 use crate::ntdef::{
     FileBasicInformation, FileNetworkOpenInformation, ObjectAttributes,
@@ -112,10 +113,14 @@ pub(super) unsafe fn qibn_hook_body(
         return unsafe { tramp(oa, iosb, info, length, class_raw) };
     }
     // SAFETY: same NT-pointer contract as this fn (hook/mod.rs).
-    if let Some(path) = match unsafe { path_of(oa) } {
+    let decoded = match unsafe { path_of(oa) } {
         Ok(p) => p,
         Err(st) => return st,
-    } {
+    };
+    // Diagnostics only (no behaviour change): record any steam_appid.txt query.
+    // SAFETY: same NT-pointer contract as this fn (hook/mod.rs).
+    unsafe { steam_appid_trace("NtQueryInformationByName", oa, decoded.as_deref()) };
+    if let Some(path) = decoded {
         // A path the director has, in a class it cannot fill: answered here, never by the real
         // tree behind the root (which a purely virtual location does not have, and must not be
         // touched). A class it fills, into too short a buffer, is a length mismatch; any other
@@ -188,10 +193,15 @@ pub(super) unsafe fn qattr_hook_body(
         return unsafe { tramp(oa, info) };
     }
     // SAFETY: same NT-pointer contract as this fn (hook/mod.rs).
-    if let Some(path) = match unsafe { path_of(oa) } {
+    let decoded = match unsafe { path_of(oa) } {
         Ok(p) => p,
         Err(st) => return st,
-    } {
+    };
+    // Diagnostics only (no behaviour change): record any steam_appid.txt query.
+    // GetFileAttributes/_access land here, so this is the likeliest existence probe.
+    // SAFETY: same NT-pointer contract as this fn (hook/mod.rs).
+    unsafe { steam_appid_trace("NtQueryAttributesFile", oa, decoded.as_deref()) };
+    if let Some(path) = decoded {
         // Under-root: director only (zip/overrides). Never host Steam metadata.
         let answer = stat_by_path(
             &path,
@@ -227,10 +237,14 @@ pub(super) unsafe fn qfull_hook_body(
         return unsafe { tramp(oa, info) };
     }
     // SAFETY: same NT-pointer contract as this fn (hook/mod.rs).
-    if let Some(path) = match unsafe { path_of(oa) } {
+    let decoded = match unsafe { path_of(oa) } {
         Ok(p) => p,
         Err(st) => return st,
-    } {
+    };
+    // Diagnostics only (no behaviour change): record any steam_appid.txt query.
+    // SAFETY: same NT-pointer contract as this fn (hook/mod.rs).
+    unsafe { steam_appid_trace("NtQueryFullAttributesFile", oa, decoded.as_deref()) };
+    if let Some(path) = decoded {
         let answer = stat_by_path(
             &path,
             |event| crate::hookstats::note_stat(&path, plain_label(event)),

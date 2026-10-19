@@ -1,7 +1,9 @@
 //! Directory enumeration: `NtQueryDirectoryFile` and `NtQueryDirectoryFileEx`.
 #![deny(unsafe_op_in_unsafe_fn)]
 
-use super::{path_of_handle, strip_whiteout_markers, HANDLES, TRAMP_QDIR, TRAMP_QDIREX};
+use super::{
+    is_steam_appid, path_of_handle, strip_whiteout_markers, HANDLES, TRAMP_QDIR, TRAMP_QDIREX,
+};
 use crate::ntdef::{
     UnicodeString, SL_RESTART_SCAN, SL_RETURN_SINGLE_ENTRY, STATUS_BUFFER_OVERFLOW,
     STATUS_NO_MORE_FILES, STATUS_SUCCESS, STATUS_UNSUCCESSFUL,
@@ -27,6 +29,27 @@ pub(super) struct EnumState {
 pub(super) struct DirTracked {
     pub(super) dir_nt_path: String,
     pub(super) state: Option<EnumState>,
+}
+
+/// Diagnostics only (no behaviour change): log a directory enumeration that
+/// names `steam_appid.txt` — either the search filter is `steam_appid.txt`
+/// (`FindFirstFile("steam_appid.txt")`) or a returned entry is. Catches an
+/// existence check done by enumeration rather than by an attribute query or
+/// open. `dir` is the directory being listed; `entry_hit` is whether a built
+/// entry named `steam_appid.txt`.
+fn steam_appid_dir_trace(hook: &str, dir: &str, wildcard: Option<&str>, entry_hit: bool) {
+    let filter_hit = wildcard.is_some_and(is_steam_appid);
+    if !(filter_hit || entry_hit) {
+        return;
+    }
+    let what = match (filter_hit, entry_hit) {
+        (true, true) => "filter+entry",
+        (true, false) => "filter",
+        _ => "entry",
+    };
+    crate::loadlog::note(&format!(
+        "steam_appid.txt {hook}: dir=\"{dir}\" filter={wildcard:?} match={what}"
+    ));
 }
 
 /// Extract a search wildcard from a `PUNICODE_STRING`. Null/empty/`*`/`*.*`
@@ -148,12 +171,20 @@ unsafe fn serve_dir_query(
                 // Untracked: a directory outside the managed root, so the OS
                 // answers. Worth recording anyway — "the game listed a Data
                 // that isn't ours" is the diagnosis for an empty load order.
+                let dir = path_of_handle(handle).unwrap_or_else(|| "<unknown>".to_string());
+                // SAFETY: same NT-pointer contract as this fn (hook/mod.rs).
+                let wc = unsafe { wildcard_of(file_name) }.ok().flatten();
+                // Diagnostics only (no behaviour change): a steam_appid.txt filter here.
+                steam_appid_dir_trace(
+                    "NtQueryDirectoryFile(untracked)",
+                    &dir,
+                    wc.as_deref(),
+                    false,
+                );
                 if crate::hookstats::enabled() {
-                    let dir = path_of_handle(handle).unwrap_or_else(|| "<unknown>".to_string());
                     crate::hookstats::note_readdir(
                         &dir,
-                        // SAFETY: same NT-pointer contract as this fn (hook/mod.rs).
-                        unsafe { wildcard_of(file_name) }.ok().flatten().as_deref(),
+                        wc.as_deref(),
                         0,
                         crate::hookstats::ReadDirSource::Os,
                     );
@@ -214,6 +245,14 @@ unsafe fn serve_dir_query(
                 };
                 // Not fixed here: a marker still does not hide its target from an open through
                 // the director. See docs/shim-invariants.md, "Enumeration containment".
+                // Diagnostics only (no behaviour change): steam_appid.txt by enumeration —
+                // the filter named it, or a returned entry is it.
+                steam_appid_dir_trace(
+                    "NtQueryDirectoryFile",
+                    &dir_path,
+                    wildcard.as_deref(),
+                    items.iter().any(|i| is_steam_appid(&i.name)),
+                );
                 Some((items, crate::hookstats::ReadDirSource::Director))
             }
             None => Some((

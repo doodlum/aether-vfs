@@ -309,19 +309,26 @@ fn drm_exe_trace(nt_or_win_path: &str, rel: bool, write: bool) {
 /// Called once per open from `route_open`, so the cheap basename test comes
 /// first; `steam_appid.txt` opens are rare, so logging each is cheap.
 ///
+/// Whether a path's basename is `steam_appid.txt` (any case).
+pub(super) fn is_steam_appid(name: &str) -> bool {
+    std::path::Path::new(name)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .is_some_and(|b| b.eq_ignore_ascii_case("steam_appid.txt"))
+}
+
 /// # Safety
 /// `oa` is the caller's `OBJECT_ATTRIBUTES`, and `resolved` its decoded path, per
-/// the NT-pointer contract (hook/mod.rs).
-unsafe fn steam_appid_trace(oa: *const ObjectAttributes, resolved: Option<&str>) {
-    fn is_appid(name: &str) -> bool {
-        std::path::Path::new(name)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .is_some_and(|b| b.eq_ignore_ascii_case("steam_appid.txt"))
-    }
+/// the NT-pointer contract (hook/mod.rs). `hook` names the entry point for the
+/// log line (e.g. `"NtQueryAttributesFile"`).
+pub(super) unsafe fn steam_appid_trace(
+    hook: &str,
+    oa: *const ObjectAttributes,
+    resolved: Option<&str>,
+) {
     // SAFETY: the caller's OA name, per the contract.
     let caller = unsafe { object_name_str(oa) };
-    if !(resolved.is_some_and(is_appid) || caller.as_deref().is_some_and(is_appid)) {
+    if !(resolved.is_some_and(is_steam_appid) || caller.as_deref().is_some_and(is_steam_appid)) {
         return;
     }
     // SAFETY: reading the OA's RootDirectory field, per the contract.
@@ -349,7 +356,7 @@ unsafe fn steam_appid_trace(oa: *const ObjectAttributes, resolved: Option<&str>)
         None => "passthrough (outside every managed root)".to_string(),
     };
     crate::loadlog::note(&format!(
-        "steam_appid.txt open: caller={caller:?} {rel} resolved={resolved:?} -> {route}"
+        "steam_appid.txt {hook}: caller={caller:?} {rel} resolved={resolved:?} -> {route}"
     ));
 }
 
@@ -654,7 +661,7 @@ unsafe fn route_open(
 
     // Diagnostics only (no behaviour change): record any steam_appid.txt open.
     // SAFETY: same NT-pointer contract as this fn (hook/mod.rs).
-    unsafe { steam_appid_trace(oa, path) };
+    unsafe { steam_appid_trace(if create { "NtCreateFile" } else { "NtOpenFile" }, oa, path) };
 
     // Directory create under the managed root → ring OP_MKDIR (must precede the
     // generic file open below, which would otherwise create a FILE named as the
