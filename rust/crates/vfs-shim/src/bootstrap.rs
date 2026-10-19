@@ -56,6 +56,13 @@ pub fn bootstrap_from_config_path(path: &str) -> Result<HookGuard, BootstrapErro
             return Err(BootstrapError::Fuse(msg));
         }
     }
+    // The program was started from its root's backing directory: now that the
+    // loader is done with the real path, tell it where it is.
+    // SAFETY: no thread of the program has run yet (see `rename_image`).
+    #[allow(unsafe_code)]
+    unsafe {
+        crate::whereami::rename_image()
+    };
     let guard = install().map_err(BootstrapError::Install)?;
     // Tell any spawning parent (that force-suspended us) our hooks are live.
     crate::child::signal_ready();

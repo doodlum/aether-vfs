@@ -413,9 +413,16 @@ impl FuseClient {
         // junction scan's own `CreateFileW` calls cannot re-enter this path.
         // Scoped to *every* declared root, not just root 0 — see
         // `resolve_volume_map_for`.
-        let scan: Vec<&str> = decls.iter().map(|(_, p)| p.as_str()).collect();
+        // Each root's backing directory, where the program was really started
+        // (`vfs_env::ROOT_BACKINGS`), routes like the root but is never the
+        // name a handle is given: a final path names the root's location,
+        // which is all the program is meant to know. So these join the
+        // matching table only, not `declared`.
+        let mut routing = decls.clone();
+        routing.extend(backings_from_env());
+        let scan: Vec<&str> = routing.iter().map(|(_, p)| p.as_str()).collect();
         let volumes = vfs_redirect::resolve_volume_map_for(&scan);
-        let refs: Vec<(RootId, &str)> = decls.iter().map(|(id, p)| (*id, p.as_str())).collect();
+        let refs: Vec<(RootId, &str)> = routing.iter().map(|(id, p)| (*id, p.as_str())).collect();
         let roots = RootMap::with_roots(&refs, volumes)
             .map_err(|e| format!("managed root is not a usable path: {e:?}"))?;
 
@@ -953,6 +960,25 @@ fn merge_extra_roots(virtual_dir: &str, spec: Option<&str>) -> Vec<(RootId, Stri
         }
     }
     out
+}
+
+/// Each root's backing directory where it differs from the root's location
+/// ([`vfs_env::ROOT_BACKINGS`]): `id=path;id=path`, malformed entries skipped.
+pub(crate) fn backings_from_env() -> Vec<(RootId, String)> {
+    parse_backings(vfs_env::text(vfs_env::ROOT_BACKINGS).as_deref())
+}
+
+/// The parsing half of [`backings_from_env`].
+fn parse_backings(spec: Option<&str>) -> Vec<(RootId, String)> {
+    spec.unwrap_or_default()
+        .split(';')
+        .filter_map(|entry| {
+            let (id, path) = entry.trim().split_once('=')?;
+            let id = id.trim().parse::<u32>().ok()?;
+            let path = path.trim();
+            (!path.is_empty()).then(|| (RootId(id), normalize_path_for_root(path)))
+        })
+        .collect()
 }
 
 /// Directory holding the staged launch image, derived from [`vfs_env::LAUNCH_IMAGE`].

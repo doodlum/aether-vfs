@@ -268,51 +268,17 @@ fn launch_opts_are_constructible_from_this_crate() {
     assert!(opts.env.is_empty());
 }
 
-/// Declaring root 0 must **do** something.
+/// Declaring root 0 must **do** something, and the same thing on both
+/// targets: it sets root 0's **location** — the path the launched program
+/// sees it at, purely virtual — and leaves its backing directory (`set_root`'s)
+/// alone. It must not land in the extra-roots list either: root 0 has one
+/// home, not two.
 ///
-/// Accepting the call, recording it in `declared_roots()`, and then dropping it
-/// on the way to the environment the child inherits is the one outcome that
-/// cannot be right, and invisible to a host that has every reason to believe
-/// the call took. Root 0's host directory is the managed root, so that is where the
-/// declaration goes; a host walking its roots and declaring all of them gets
-/// what it asked for rather than a silent no-op on the first one.
-///
-/// Windows only: there a root's declared path *is* its host directory. On
-/// unix it is the root's location inside the Wine prefix — see
-/// `declaring_root_zero_on_unix_sets_its_location_not_the_managed_root`.
-#[cfg(not(unix))]
+/// (Accepting the call and then dropping it on the way to the child is the
+/// one outcome that cannot be right; before locations were virtual on
+/// Windows, declaring root 0 there moved the backing directory instead.)
 #[test]
-fn declaring_root_zero_repoints_the_managed_root_instead_of_being_discarded() {
-    let game = dir("declare0-game", &[]);
-    let docs = dir("declare0-docs", &[]);
-
-    let mut session = Session::new();
-    session.declare_root(0, &game);
-    assert_eq!(
-        session.virtual_root(),
-        game.as_path(),
-        "root 0 is the managed root; declaring it must move the managed root"
-    );
-    assert!(
-        session.declared_roots().is_empty(),
-        "root 0 has one home, not two — it must not also sit in the extra-roots list, \
-         which is the list that gets published to the child"
-    );
-
-    // Re-declaring replaces, and the other roots are unaffected either way.
-    session.declare_root(1, &docs);
-    session.declare_root(0, docs.join("elsewhere"));
-    assert_eq!(session.virtual_root(), docs.join("elsewhere").as_path());
-    assert_eq!(session.declared_roots(), [(1u32, docs.clone())]);
-}
-
-/// On unix a declared path is a **location** (`C:\\…`, as the Wine child sees
-/// it), and root 0's host backing directory stays `set_root`'s. Declaring root
-/// 0 must still do something — move its location — and must still not land in
-/// the extra-roots list.
-#[cfg(unix)]
-#[test]
-fn declaring_root_zero_on_unix_sets_its_location_not_the_managed_root() {
+fn declaring_root_zero_sets_its_location_not_the_managed_root() {
     let mut session = Session::new();
     let host_root = session.virtual_root().to_path_buf();
     session.declare_root(0, r"C:\Games\Fixture");

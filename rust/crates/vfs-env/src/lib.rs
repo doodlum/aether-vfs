@@ -96,6 +96,13 @@ pub const VIRTUAL_DIR: &str = "VFS_VIRTUAL_DIR";
 /// `0` overrides [`VIRTUAL_DIR`]'s path for that root rather than being
 /// silently ignored.
 pub const VIRTUAL_ROOTS: &str = "VFS_VIRTUAL_ROOTS";
+/// Each root's **backing directory** where it differs from the root's
+/// location, `id=path;id=path` like [`VIRTUAL_ROOTS`]. The launched program is
+/// really started in, and from, these real directories (`CreateProcess` needs a
+/// real image and working directory) and then told it is at its locations, so
+/// the shim recognises each backing directory as a second spelling of its
+/// root. Unset: every root's location is its backing directory.
+pub const ROOT_BACKINGS: &str = "VFS_ROOT_BACKINGS";
 /// Directory for session state (ready flag, configs, logs).
 pub const STATE_DIR: &str = "VFS_STATE_DIR";
 /// Base directory aether-vfs owns: downloaded Proton runtimes, per-session
@@ -558,6 +565,11 @@ pub const ALL: &[Var] = &[
         name: VIRTUAL_ROOTS,
         kind: Kind::Handshake,
         default: "none (root 0 only)",
+    },
+    Var {
+        name: ROOT_BACKINGS,
+        kind: Kind::Handshake,
+        default: "none (each root's location is its backing directory)",
     },
     Var {
         name: STATE_DIR,
@@ -1052,6 +1064,7 @@ pub mod handshake {
         FUSE_CFG,
         VIRTUAL_DIR,
         VIRTUAL_ROOTS,
+        ROOT_BACKINGS,
         REGISTRY,
     ];
 

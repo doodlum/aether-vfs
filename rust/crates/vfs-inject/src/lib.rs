@@ -14,6 +14,7 @@ mod env_block;
 mod inject;
 mod map;
 mod pe;
+mod procparams;
 mod steam_helper;
 mod tree;
 
@@ -39,6 +40,16 @@ pub struct RunConfig {
     /// regard to case. The launch's own variables (`VFS_SHIM_CONFIG`,
     /// `VFS_SHIM_READY`, ...) are added first, so an entry here overrides them.
     pub env_set: Vec<(String, String)>,
+    /// The path the target is told its image has, in its command line's
+    /// first argument, when it is not `target_exe`: an image staged into a
+    /// root's backing directory is named by its path under the root's
+    /// (virtual) location. The target is created suspended and rewritten
+    /// before any of its code runs.
+    pub virtual_image: Option<String>,
+    /// The directory the target is told it starts in, when it is not
+    /// `current_dir` (a root's virtual location, where nothing real exists
+    /// to start in). Rewritten like [`Self::virtual_image`].
+    pub virtual_cwd: Option<String>,
     /// Variables the target does not inherit from this process.
     pub env_remove: Vec<String>,
 }

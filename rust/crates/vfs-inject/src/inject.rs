@@ -528,6 +528,12 @@ fn start_target(
             job.adopt(pi.hProcess);
         }
 
+        // Before process initialisation reads them: kernelbase keeps its own
+        // copy of the command line from then on.
+        if let Err(e) = tell_where(pi.hProcess, cfg) {
+            return Err(fail_closed(&pi, e));
+        }
+
         // Best-effort — a failure resumes with the stock stack rather than
         // refusing to launch.
         if let Err(e) = expand_primary_stack(pi.hProcess, pi.hThread, PRIMARY_STACK_BYTES) {
@@ -582,11 +588,31 @@ fn start_target(
 
 /// The target's command line: its path and each argument, quoted.
 fn command_line(cfg: &RunConfig) -> String {
-    let mut cmdline = format!("\"{}\"", cfg.target_exe);
+    command_line_for(&cfg.target_exe, cfg)
+}
+
+/// [`command_line`] with `image` as the first argument.
+fn command_line_for(image: &str, cfg: &RunConfig) -> String {
+    let mut cmdline = format!("\"{image}\"");
     for a in &cfg.args {
         cmdline.push_str(&format!(" \"{a}\""));
     }
     cmdline
+}
+
+/// Tell the suspended target its virtual image path and working directory,
+/// if it has them (see `procparams`).
+///
+/// # Safety
+/// `process` is the suspended target's `CreateProcessW` handle.
+unsafe fn tell_where(process: HANDLE, cfg: &RunConfig) -> Result<(), InjectError> {
+    let cmd = cfg
+        .virtual_image
+        .as_deref()
+        .map(|v| command_line_for(v, cfg));
+    // SAFETY: as this function's contract.
+    unsafe { crate::procparams::rewrite(process, cmd.as_deref(), cfg.virtual_cwd.as_deref()) }
+        .map_err(InjectError::Bootstrap)
 }
 
 /// Start a target whose exe imports the shim first. No payload, no remote
@@ -606,7 +632,13 @@ fn start_import_activated(
     let app_w = wide(&cfg.target_exe);
     let cwd_w = cfg.current_dir.as_ref().map(|s| wide(s));
     let started = Instant::now();
-    let flags = if job.is_some() { CREATE_SUSPENDED } else { 0 };
+    // Suspended to be put in `job`, or to be told where it is, before it runs.
+    let rewrite = cfg.virtual_image.is_some() || cfg.virtual_cwd.is_some();
+    let flags = if job.is_some() || rewrite {
+        CREATE_SUSPENDED
+    } else {
+        0
+    };
     // SAFETY: CreateProcessW with valid, NUL-terminated buffers; the thread
     // handle is closed here and the process handle handed to the caller.
     unsafe {
@@ -633,6 +665,11 @@ fn start_import_activated(
         }
         if let Some(job) = job {
             job.adopt(pi.hProcess);
+        }
+        if flags & CREATE_SUSPENDED != 0 {
+            if let Err(e) = tell_where(pi.hProcess, cfg) {
+                return Err(fail_closed(&pi, e));
+            }
             ResumeThread(pi.hThread);
         }
         CloseHandle(pi.hThread);

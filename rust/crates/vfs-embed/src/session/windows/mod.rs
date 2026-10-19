@@ -102,7 +102,7 @@ impl Session {
         );
         let ipc =
             IpcServe::start_with_workers(Arc::clone(&self.kernel), section, self.io_workers())?;
-        let root_s = self.virtual_root.to_string_lossy().into_owned();
+        let root_s = self.root0_location();
         let thin = self.state_dir.join("fuse.cfg");
         ipc.write_thin_config(&thin, &root_s)?;
 
@@ -223,19 +223,42 @@ impl Session {
         check_image(opts)?;
         let _starting = self.begin_launch()?;
 
-        // Root 0 may have been declared after `serve`, which created the
-        // managed root it had then; resolving (and staging) needs this one.
-        std::fs::create_dir_all(&self.virtual_root)
-            .map_err(|e| format!("launch: create root {}: {e}", self.virtual_root.display()))?;
-        let target = match self.resolve_launch_image(opts)? {
-            ResolvedImage::InRoot { host, .. } => host,
-            ResolvedImage::Outside(p) => PathBuf::from(p),
+        // Root 0's backing directory: where staging writes and where the
+        // program really starts. Its location — which may be somewhere else
+        // entirely, and is never created — is what the program is told.
+        std::fs::create_dir_all(&self.virtual_root).map_err(|e| {
+            format!(
+                "launch: create root 0's backing directory {}: {e}",
+                self.virtual_root.display()
+            )
+        })?;
+        let root_s = self.root0_location();
+        let (target, virtual_image) = match self.resolve_launch_image(opts)? {
+            ResolvedImage::InRoot { root, vpath, host } => {
+                let location = self
+                    .root_locations()
+                    .into_iter()
+                    .find(|l| l.id == root)
+                    .map(|l| l.location)
+                    .unwrap_or_else(|| root_s.clone());
+                let virt = virtual_path(&location, &vpath);
+                (host, Some(virt))
+            }
+            ResolvedImage::Outside(p) => (PathBuf::from(p), None),
         };
+        // The program is told it runs in root 0's location, though it really
+        // starts in the backing directory: an absent or virtual location has
+        // no real directory to start in.
+        let backing_s = self.virtual_root.to_string_lossy().into_owned();
+        let moved = !backing_s.eq_ignore_ascii_case(&root_s);
+        let virtual_cwd = moved.then(|| root_s.clone());
+        // Named only where it differs from the real path it was started by.
+        let virtual_image =
+            virtual_image.filter(|v| !v.eq_ignore_ascii_case(&target.to_string_lossy()));
         // `serve` wrote the thin config from root 0's location as it was then;
         // root 0 may have been declared since. Write `shim.cfg` and rewrite the
         // thin config from the current one so the shim is told the root this
         // child sees.
-        let root_s = self.virtual_root.to_string_lossy().into_owned();
         let config_path = self.write_shim_config(&root_s)?;
         let thin = self.state_dir.join("fuse.cfg");
         ipc.write_thin_config(&thin, &root_s)?;
@@ -270,6 +293,7 @@ impl Session {
         for (name, value) in ipc.env_roots(
             &root_s,
             &self.extra_roots_env(),
+            &self.root_backings(),
             &thin,
             self.registry_attached(),
         ) {
@@ -290,7 +314,9 @@ impl Session {
         let spawned = vfs_inject::spawn_target_with_shim(vfs_inject::RunConfig {
             target_exe: target.to_string_lossy().into_owned(),
             args: opts.args.clone(),
-            current_dir: Some(root_s),
+            current_dir: Some(backing_s),
+            virtual_image,
+            virtual_cwd,
             dll_path: dll,
             config_path: config_path_s,
             ready_path: ready_path_s.clone(),
@@ -444,4 +470,15 @@ pub(super) fn locate_shim(opts: &LaunchOpts) -> Result<String, String> {
     vfs_inject::find_near(&exe, "vfs_shim_dll.dll")
         .map(|p| p.to_string_lossy().into_owned())
         .ok_or_else(|| "vfs_shim_dll.dll not found (set LaunchOpts.shim_dll)".to_string())
+}
+
+/// `vpath` (`/`-separated, relative) under `location`, in Windows spelling.
+#[cfg(windows)]
+fn virtual_path(location: &str, vpath: &str) -> String {
+    let mut p = location.trim_end_matches(['\\', '/']).to_string();
+    for c in vpath.split('/').filter(|c| !c.is_empty()) {
+        p.push('\\');
+        p.push_str(c);
+    }
+    p
 }

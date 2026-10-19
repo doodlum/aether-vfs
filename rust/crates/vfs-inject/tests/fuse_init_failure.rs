@@ -62,6 +62,8 @@ fn fuse_init_failure_aborts_the_launch() {
         detach: false,
         env_set: vec![(vfs_env::TEST_FUSE_INIT_FAIL.into(), "1".into())],
         env_remove: Vec::new(),
+        virtual_image: None,
+        virtual_cwd: None,
     });
 
     match result {

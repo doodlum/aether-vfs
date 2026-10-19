@@ -452,8 +452,10 @@ fn an_image_only_the_provider_graph_holds_launches_from_an_empty_managed_root() 
 /// disk — failed in `CreateProcess`.
 ///
 /// Root 0 is set with `declare_root(0, …)`, the form a config uses, and the
-/// content comes from a disk directory mounted into the graph — not from the
-/// root's own directory, which stays empty until staging writes the image.
+/// content comes from a disk directory mounted into the graph. Declared that
+/// way, root 0's location is purely virtual: staging writes the image into
+/// root 0's backing directory, and nothing appears at the location — not
+/// even the real (empty) directory this test made there.
 // Needs a live ring and a real `CreateProcess` + inject.
 #[cfg(windows)]
 #[test]
@@ -502,9 +504,15 @@ fn an_absolute_image_inside_root_zero_that_only_the_graph_holds_is_staged_and_la
         code, 0,
         "the child must read root 0's hello.txt (5 bytes) through the ring"
     );
+    // Root 0's location is purely virtual: the image was staged into root 0's
+    // backing directory at its vpath, and nothing was written at the location.
     assert!(
-        image.is_file(),
-        "the image must have been staged into root 0 at its vpath"
+        s.virtual_root().join("vfs-fixture-read.exe").is_file(),
+        "the image must have been staged into root 0's backing directory at its vpath"
+    );
+    assert!(
+        !image.exists(),
+        "nothing may be written at root 0's location, which is virtual"
     );
 
     s.stop_serve();

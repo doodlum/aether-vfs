@@ -28,6 +28,7 @@ mod sync;
 mod synth_file;
 mod synth_section;
 mod tramp;
+mod whereami;
 
 pub use bootstrap::{bootstrap_failed_content, bootstrap_from_config_path, BootstrapError};
 pub use child::{finish_ready_handshake, signal_bootstrap_failed};

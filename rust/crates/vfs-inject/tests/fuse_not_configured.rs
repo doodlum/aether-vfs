@@ -68,6 +68,8 @@ fn no_ring_configured_aborts_the_launch() {
         detach: false,
         env_set: Vec::new(),
         env_remove: Vec::new(),
+        virtual_image: None,
+        virtual_cwd: None,
     });
 
     match result {

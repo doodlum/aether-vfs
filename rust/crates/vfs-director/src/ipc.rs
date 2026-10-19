@@ -396,7 +396,9 @@ impl IpcServe {
     /// block. Nothing here writes this process's environment.
     ///
     /// `extra_roots` is `(id, path)` for every root **beyond root 0**, which
-    /// `virtual_root` names. The shim needs the full set because the root id
+    /// `virtual_root` names, and `backings` is `(id, path)` for each root whose
+    /// backing directory differs from its location (see
+    /// [`vfs_env::ROOT_BACKINGS`]). The shim needs the full set because the root id
     /// is what its ring requests now carry: a root it has never been told
     /// about is one whose paths it classifies as belonging to no one.
     ///
@@ -415,6 +417,7 @@ impl IpcServe {
         &self,
         virtual_root: &str,
         extra_roots: &[(u32, String)],
+        backings: &[(u32, String)],
         thin_cfg: &std::path::Path,
         registry: bool,
     ) -> Vec<(&'static str, Option<String>)> {
@@ -432,6 +435,9 @@ impl IpcServe {
         // Set only while a registry layer is attached.
         if registry {
             set.push((vfs_env::REGISTRY, "1".to_string()));
+        }
+        if let Some(spec) = vfs_env::handshake::encode_roots(backings) {
+            set.push((vfs_env::ROOT_BACKINGS, spec));
         }
         if let Some(spec) = vfs_env::handshake::encode_roots(extra_roots) {
             set.push((vfs_env::VIRTUAL_ROOTS, spec));

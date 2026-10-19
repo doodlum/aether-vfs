@@ -65,8 +65,10 @@ impl Session {
         source: &dyn ImageSource,
         opts: &StageOpts,
     ) -> Result<PathBuf, String> {
-        // Into the virtual root, at the image's own vpath — not a sibling
-        // staging directory. A staged EXE outside the root drags everything
+        // Into root 0's backing directory at the image's own vpath — not a
+        // sibling staging directory — and, on Windows, the program is then told
+        // it runs from root 0's location at that vpath. A staged EXE whose path
+        // is outside the root drags everything
         // the process resolves relative to its own module path out of the
         // VFS with it, which is what stopped Cyberpunk 2077 and Stardew
         // Valley booting while Skyrim (EXE at the root, content found via
@@ -269,16 +271,15 @@ impl Session {
 
 /// What [`Session::resolve_launch_image`] resolved an image to, with only what
 /// each target launches from: unix names the child's image by `root`'s location
-/// and `vpath`, Windows launches the real file `host`. (Tests read `host` on
+/// and `vpath`, Windows launches the real file `host` and tells the program it
+/// is `root`'s location joined with `vpath`. (Tests read `host` on
 /// both.)
 #[derive(Debug)]
 pub(super) enum ResolvedImage {
     /// Inside `root`'s location at `vpath`; `host` is the real file backing
     /// it — already there, or just staged into root 0's backing directory.
     InRoot {
-        #[cfg(unix)]
         root: u32,
-        #[cfg(unix)]
         vpath: String,
         #[cfg(any(windows, test))]
         host: PathBuf,
@@ -288,12 +289,10 @@ pub(super) enum ResolvedImage {
 }
 
 impl ResolvedImage {
-    fn in_root(_root: u32, _vpath: String, _host: PathBuf) -> Self {
+    fn in_root(root: u32, vpath: String, _host: PathBuf) -> Self {
         ResolvedImage::InRoot {
-            #[cfg(unix)]
-            root: _root,
-            #[cfg(unix)]
-            vpath: _vpath,
+            root,
+            vpath,
             #[cfg(any(windows, test))]
             host: _host,
         }

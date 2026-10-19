@@ -50,6 +50,8 @@ fn a_config_version_mismatch_kills_the_process_with_the_message() {
         detach: false,
         env_set: Vec::new(),
         env_remove: Vec::new(),
+        virtual_image: None,
+        virtual_cwd: None,
     });
 
     match result {

@@ -82,6 +82,13 @@ pub struct Session {
     /// Everything the session holds only for the Proton (Wine) delivery.
     #[cfg(unix)]
     proton: ProtonState,
+    /// Root 0's **location** on Windows, when declared apart from its backing
+    /// directory (`virtual_root`): the path the launched program sees it at,
+    /// which nothing creates, opens or writes on real disk. `None`: root 0's
+    /// location is `virtual_root` itself, as before roots could be purely
+    /// virtual.
+    #[cfg(windows)]
+    root0_location: Option<PathBuf>,
     /// The launch a Windows session runs (one at a time), for `stop_launch` and `Drop`.
     #[cfg(windows)]
     windows: WindowsState,
@@ -127,6 +134,8 @@ impl Session {
             proton: ProtonState::default(),
             #[cfg(windows)]
             windows: WindowsState::default(),
+            #[cfg(windows)]
+            root0_location: None,
             staged: Mutex::new(None),
         }
     }
@@ -204,40 +213,38 @@ impl Session {
         overlay_layer_dir(&self.overlay, root)
     }
 
-    /// Declare a managed root: the host directory that `RootId(id)`
-    /// virtualizes.
+    /// Declare a managed root: the **location** `RootId(id)` is seen at by the
+    /// launched program — a path it names, and nothing more.
     ///
     /// This is the *shim-facing* half of a multi-root session and it is
     /// separate from mounting a provider on that root
     /// (`kernel().mount(RootId(id), …)`) on purpose, because they answer
     /// different questions: the mount says what root `n` serves, this says
-    /// which real filesystem location the injected process should recognise
-    /// *as* root `n`. Declare without mounting and the root serves nothing;
-    /// mount without declaring and the shim never classifies any path into
-    /// that root at all, so every path under it falls through to real disk —
-    /// silently, which is why this is not optional plumbing.
+    /// which path the injected process should recognise *as* root `n`.
+    /// Declare without mounting and the root serves nothing; mount without
+    /// declaring and the shim never classifies any path into that root.
     ///
-    /// **Root 0 is [`Session::set_root`]**, and declaring it here does exactly
-    /// that rather than being recorded separately. Root 0's host directory is
-    /// `virtual_root` — there is no second place to keep it — so a host that
-    /// walks its roots and declares all of them, id 0 included, gets the
-    /// meaning it asked for. It previously did not: the call was accepted,
-    /// stored in [`Session::declared_roots`], and then dropped on the way to
-    /// the environment the child inherits, so root 0 silently stayed wherever
-    /// `set_root` had left it. Accepting-then-discarding is the one behaviour
-    /// that cannot be right, and a fallible signature would force every host
-    /// to special-case the id that needs it least.
+    /// **A location is purely virtual**, on both targets. Nothing is created,
+    /// opened, read, listed or written on real disk at or under it: if a real
+    /// directory is there, the program cannot see it and it stays as it is.
+    /// What the root holds comes from its providers. Each root also has a real
+    /// **backing directory** the host owns: root 0's is [`Session::set_root`]'s
+    /// directory, root N's is `state_dir/roots/N`. Staging writes a launched
+    /// image there, and on Windows the program is really started there
+    /// (`CreateProcess` needs a real image and directory) and then told it is
+    /// at its location. Locations may nest — a root inside another root's
+    /// location — and the most specific (longest) one wins for every path.
     ///
-    /// Re-declaring an id replaces its path. Takes effect at the next
-    /// [`Session::serve`] or [`Session::launch`], which is what publishes it
-    /// into the environment the child inherits.
+    /// Root 0 not declared: its location is [`Session::set_root`]'s
+    /// directory, which is then both its location and its backing directory,
+    /// as before locations could be virtual. On unix, root 0's location is
+    /// then `C:\vfs-session\root`.
     ///
-    /// **On unix `path` is a location, not a host directory**: the `C:\…`
-    /// path the Wine child sees the root at. `launch` backs it with a host
-    /// directory (root 0: `virtual_root`, still set by [`Session::set_root`];
-    /// root N: `state_dir/roots/N`) symlinked into the prefix at that
-    /// location. So on unix `declare_root(0, …)` sets root 0's **location**
-    /// and leaves `virtual_root` alone. See [`Session::root_locations`].
+    /// Re-declaring an id replaces its location. Takes effect at the next
+    /// [`Session::serve`] or [`Session::launch`].
+    ///
+    /// **On unix a location is a `C:\…` path** inside the Wine prefix, where
+    /// `launch` symlinks the backing directory. See [`Session::root_locations`].
     pub fn declare_root(&mut self, id: u32, path: impl Into<PathBuf>) {
         let path = path.into();
         if id == 0 {
@@ -246,9 +253,9 @@ impl Session {
                 self.proton
                     .set_root0_location(path.to_string_lossy().into_owned());
             }
-            #[cfg(not(unix))]
+            #[cfg(windows)]
             {
-                self.virtual_root = path;
+                self.root0_location = Some(path);
             }
             return;
         }
@@ -269,16 +276,20 @@ impl Session {
     /// Every root's **location** — the path the launched program sees it at —
     /// root 0 first, then the extra roots in declaration order.
     ///
-    /// On Windows root 0's location is `virtual_root` and each extra root's is
-    /// its declared host directory. On unix root 0's is its declared location,
-    /// else `C:\vfs-session\root`, and each extra root's is its declared
-    /// `C:\…` location. [`crate::image::classify_image`] resolves launch
+    /// Root 0's is its declared location, else (Windows) `set_root`'s
+    /// directory or (unix) `C:\vfs-session\root`; each extra root's is its
+    /// declared location. [`crate::image::classify_image`] resolves launch
     /// images against exactly this list.
     pub fn root_locations(&self) -> Vec<RootLocation> {
         #[cfg(unix)]
         let root0 = self.proton.root0_location();
-        #[cfg(not(unix))]
-        let root0 = self.virtual_root.to_string_lossy().into_owned();
+        #[cfg(windows)]
+        let root0 = self
+            .root0_location
+            .as_ref()
+            .unwrap_or(&self.virtual_root)
+            .to_string_lossy()
+            .into_owned();
         std::iter::once(RootLocation {
             id: 0,
             location: root0,
@@ -290,23 +301,36 @@ impl Session {
         .collect()
     }
 
-    /// The host directory that backs `root`: root 0's is `virtual_root`; a
-    /// declared extra root's is its declared path on Windows and
-    /// `state_dir/roots/<id>` on unix. `None` for an undeclared root.
+    /// Root 0's location, as [`Session::root_locations`] gives it.
+    pub(crate) fn root0_location(&self) -> String {
+        self.root_locations().swap_remove(0).location
+    }
+
+    /// The real host directory that backs `root`: root 0's is `virtual_root`
+    /// ([`Session::set_root`]), a declared extra root's is
+    /// `state_dir/roots/<id>`. `None` for an undeclared root.
     fn root_backing_dir(&self, root: u32) -> Option<PathBuf> {
         if root == 0 {
             return Some(self.virtual_root.clone());
         }
-        let (_, declared) = self.extra_roots.iter().find(|(id, _)| *id == root)?;
-        #[cfg(unix)]
-        {
-            let _ = declared;
-            Some(self.state_dir.join("roots").join(root.to_string()))
-        }
-        #[cfg(not(unix))]
-        {
-            Some(declared.clone())
-        }
+        self.extra_roots.iter().find(|(id, _)| *id == root)?;
+        Some(self.state_dir.join("roots").join(root.to_string()))
+    }
+
+    /// Each root's backing directory where it differs from its location —
+    /// the second spelling of the root the shim must recognise, since the
+    /// launched program is really started there (Windows). Root 0 first.
+    #[cfg(windows)]
+    pub(crate) fn root_backings(&self) -> Vec<(u32, String)> {
+        let locations = self.root_locations();
+        locations
+            .iter()
+            .filter_map(|loc| {
+                let backing = self.root_backing_dir(loc.id)?;
+                let b = backing.to_string_lossy().into_owned();
+                (!b.eq_ignore_ascii_case(&loc.location)).then_some((loc.id, b))
+            })
+            .collect()
     }
 
     pub fn state_dir(&self) -> &Path {
