@@ -81,7 +81,7 @@ jobs:
         # and fails LNK1181. A developer tree hides this: the lib is already
         # there from an earlier build. Nothing downstream can self-heal it the
         # way `needed` does, because the failure is in the outer compile.
-        run: cargo build -p vfs-inject -p vfs-shim-dll -p vfs-fixture-read -p vfs-fixture-writepath -p vfs-fixture-escape -p vfs-fixture-prefs -p vfs-fixture-vproxy -p vfs-bench
+        run: cargo build -p vfs-inject -p vfs-shim-dll -p vfs-fixture-read -p vfs-fixture-writepath -p vfs-fixture-escape -p vfs-fixture-prefs -p vfs-fixture-vproxy -p vfs-bench && cargo build -p vfs-fixture-staticimp
         working-directory: rust
       # `--no-fail-fast` is not optional here. Without it cargo stops after the
       # first test binary that fails, and this suite is 689 tests across 116

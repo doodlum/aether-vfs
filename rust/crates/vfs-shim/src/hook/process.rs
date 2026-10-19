@@ -145,7 +145,16 @@ pub(super) unsafe fn cpiw_hook_body(
         // A patched child loads the shim through its own import table, and the
         // loader refuses to start it without one, so it is not injected:
         // injecting would load a second copy.
-        if child_imports_shim(hprocess) {
+        let patched = child_imports_shim(hprocess);
+        crate::loadlog::note(&format!(
+            "child {pid}: created from {:?} (cmd {:?}), told cwd {:?}, import-patched {patched}",
+            // SAFETY: NUL-terminated strings or null, as the caller's.
+            unsafe { super::child_start::wide_opt(app_eff) },
+            // SAFETY: as above.
+            unsafe { super::child_start::wide_opt(cmd) },
+            plan.as_ref().and_then(|p| p.virtual_cwd.as_deref()),
+        ));
+        if patched {
             if !caller_suspended {
                 // SAFETY: FFI call with valid arguments.
                 unsafe { ResumeThread(hthread) };
@@ -158,9 +167,13 @@ pub(super) unsafe fn cpiw_hook_body(
             pid,
             SELF_DLL.get().map(String::as_str),
             child_ready_timeout_ms(),
+            caller_suspended,
         ) {
             Ok(()) => {
-                // Injection never resumed the primary thread.
+                // Remote injection never resumed the primary thread; the
+                // in-memory patch path already did (and left it running, so
+                // this resume is then a no-op). Either way a child the caller
+                // did not ask to keep suspended runs now.
                 if !caller_suspended {
                     // SAFETY: FFI call with valid arguments.
                     unsafe { ResumeThread(hthread) };

@@ -51,6 +51,9 @@ fn a_shim_that_never_reports_ready_gets_the_process_killed() {
         env_remove: Vec::new(),
         virtual_image: None,
         virtual_cwd: None,
+        // This test injects a full-path fake shim; the in-memory patch (which
+        // imports the real shim by name) does not apply, so force injection.
+        force_injection: true,
     });
 
     assert!(

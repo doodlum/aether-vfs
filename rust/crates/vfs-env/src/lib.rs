@@ -390,6 +390,9 @@ pub const FIXTURE_PROBE_OUT: &str = "VFS_FIXTURE_PROBE_OUT";
 pub const FIXTURE_OPS: &str = "VFS_FIXTURE_OPS";
 /// `vfs-fixture-read`: where the ops phase writes what each operation did.
 pub const FIXTURE_OPS_OUT: &str = "VFS_FIXTURE_OPS_OUT";
+/// `vfs-fixture-vproxy`: a file that must be beside the program when the DLL
+/// is initialised, or its load fails.
+pub const FIXTURE_VPROXY_NEEDS: &str = "VFS_FIXTURE_VPROXY_NEEDS";
 /// `vfs-fixture-read`: a file read on slow threads while others read
 /// `FIXTURE_PATH` (the concurrent-read e2e).
 pub const FIXTURE_SLOW_PATH: &str = "VFS_FIXTURE_SLOW_PATH";
@@ -845,6 +848,11 @@ pub const ALL: &[Var] = &[
         name: FIXTURE_OPS_OUT,
         kind: Kind::Fixture,
         default: "unset: no ops",
+    },
+    Var {
+        name: FIXTURE_VPROXY_NEEDS,
+        kind: Kind::Fixture,
+        default: "unset: no requirement",
     },
     Var {
         name: FIXTURE_SLOW_PATH,

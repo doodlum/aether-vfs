@@ -241,6 +241,8 @@ pub fn ensure_inject_artifacts() {
         "vfs-fixture-writepath.exe",
         "vfs-fixture-escape.exe",
         "vfs-fixture-prefs.exe",
+        "vproxy.dll",
+        "vfs-staticimp.exe",
     ];
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
 
@@ -287,6 +289,31 @@ pub fn ensure_inject_artifacts() {
             "fixture/artifact build failed: {status}{}",
             lock_holders_hint()
         );
+    }
+
+    // `vfs-staticimp` links `vproxy.dll`'s import library with no Cargo edge
+    // to the cdylib (cargo#6313; see that crate's Cargo.toml), so the two are
+    // built in order, in two invocations.
+    let static_stale = [
+        ("vproxy.dll", "vfs-fixture-vproxy"),
+        ("vfs-staticimp.exe", "vfs-fixture-staticimp"),
+    ]
+    .iter()
+    .any(|(artifact, crate_name)| {
+        artifact_is_stale(
+            &profile.join(artifact),
+            &workspace.join("crates").join(crate_name),
+        )
+    });
+    if static_stale {
+        for krate in ["vfs-fixture-vproxy", "vfs-fixture-staticimp"] {
+            let status = std::process::Command::new(&cargo)
+                .current_dir(&workspace)
+                .args(["build", "-p", krate, "--quiet"])
+                .status()
+                .expect("spawn cargo");
+            assert!(status.success(), "{krate} build failed: {status}");
+        }
     }
 
     // Copy into profile root so Session::launch's find_near works from the

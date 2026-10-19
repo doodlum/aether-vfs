@@ -333,6 +333,7 @@ impl Session {
             detach: true,
             env_set,
             env_remove,
+            force_injection: false,
         });
 
         // Children the shim killed because it could not inject them, one
@@ -529,6 +530,15 @@ impl Session {
         let stager: vfs_director::ExecStager = Arc::new(move |root: RootId, vpath: &str| {
             let kernel = kernel.upgrade().ok_or_else(vfs_provider::not_found)?;
             let dir = backings.get(&root.0).ok_or_else(vfs_provider::not_found)?;
+            // Staged under the name as it is stored (`SkyrimSE.exe`), not the
+            // folded path the shim routed (`skyrimse.exe`): the staged file's
+            // name is what the child's module path ends with.
+            let stored = kernel
+                .stored_names(root, vpath, 0)
+                .ok()
+                .filter(|n| n.len() == vpath.split('/').filter(|c| !c.is_empty()).count())
+                .map(|n| n.join("/"));
+            let vpath = stored.as_deref().unwrap_or(vpath);
             let host = vpath.split('/').fold(dir.clone(), |p, c| p.join(c));
             if host.is_file() {
                 return Ok(host.to_string_lossy().into_owned());

@@ -1,9 +1,10 @@
 //! Pure PE byte parsing.
 
 mod import_patch;
+pub mod mem_patch;
 pub use import_patch::{
-    add_first_import, first_import_is, raise_stack_reserve, steamstub_flags, SHIM_IMPORT_DLL,
-    SHIM_IMPORT_SYMBOL,
+    add_first_import, decode_steamstub_header, first_import_is, raise_stack_reserve,
+    steamstub_flags, SHIM_IMPORT_DLL, SHIM_IMPORT_SYMBOL, STEAMSTUB_NO_MODULE_VERIFICATION,
 };
 
 fn rd_u16(b: &[u8], o: usize) -> u16 {

@@ -70,6 +70,7 @@ fn no_ring_configured_aborts_the_launch() {
         env_remove: Vec::new(),
         virtual_image: None,
         virtual_cwd: None,
+        force_injection: false,
     });
 
     match result {

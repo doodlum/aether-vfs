@@ -44,6 +44,12 @@ pub extern "system" fn DllMain(_dll: HINSTANCE, reason: u32, _reserved: *mut c_v
             if reason != DLL_PROCESS_ATTACH {
                 return TRUE;
             }
+            vfs_shim::loadlog::note(&format!(
+                "DllMain attach: image {}",
+                std::env::current_exe()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default()
+            ));
             let ok = bootstrap();
             vfs_shim::finish_ready_handshake();
             if ok {
@@ -117,9 +123,8 @@ fn log_boot(msg: &str) {
         let path = format!("{ready}.boot.log");
         let _ = std::fs::write(&path, msg.as_bytes());
     }
-    // Also try a fixed temp path so we always have a breadcrumb.
-    let _ = std::fs::write(
-        std::env::temp_dir().join("vfs_shim_boot.log"),
-        msg.as_bytes(),
-    );
+    // And the load log in the state directory, which a child that has no
+    // ready file of its own still reaches. Never `%TEMP%`: that is under the
+    // user's profile.
+    vfs_shim::loadlog::note(msg);
 }

@@ -78,6 +78,7 @@ fn main() {
         env_remove: Vec::new(),
         virtual_image: None,
         virtual_cwd: None,
+        force_injection: false,
     })
     .unwrap_or_else(|e| {
         eprintln!("[vfs-injector] inject error: {e:?}");

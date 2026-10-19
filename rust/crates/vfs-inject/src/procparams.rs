@@ -118,9 +118,12 @@ pub unsafe fn rewrite(
     Ok(())
 }
 
-/// The address of `process`'s `RTL_USER_PROCESS_PARAMETERS`.
+/// The base address of `process`'s PEB.
+///
+/// # Safety
+/// `process` is a live process handle with `PROCESS_QUERY_INFORMATION`.
 #[allow(unsafe_code)]
-unsafe fn process_parameters(process: HANDLE) -> Result<usize, String> {
+pub(crate) unsafe fn peb_base(process: HANDLE) -> Result<u64, String> {
     let ntdll = GetModuleHandleW(wide("ntdll.dll").as_ptr());
     let query = GetProcAddress(ntdll, c"NtQueryInformationProcess".as_ptr().cast())
         .ok_or("ntdll has no NtQueryInformationProcess")?;
@@ -136,10 +139,14 @@ unsafe fn process_parameters(process: HANDLE) -> Result<usize, String> {
     if st < 0 || info.peb_base_address == 0 {
         return Err(format!("NtQueryInformationProcess: {st:#x}"));
     }
-    let params: u64 = read(
-        process,
-        info.peb_base_address as usize + PEB_PROCESS_PARAMETERS,
-    )?;
+    Ok(info.peb_base_address)
+}
+
+/// The address of `process`'s `RTL_USER_PROCESS_PARAMETERS`.
+#[allow(unsafe_code)]
+unsafe fn process_parameters(process: HANDLE) -> Result<usize, String> {
+    let peb = peb_base(process)? as usize;
+    let params: u64 = read(process, peb + PEB_PROCESS_PARAMETERS)?;
     if params == 0 {
         return Err("the target has no process parameters yet".into());
     }

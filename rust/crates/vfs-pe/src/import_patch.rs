@@ -270,7 +270,7 @@ pub fn add_first_import(raw: &[u8], dll: &str, func: &str) -> Result<Vec<u8>, &'
 }
 
 /// SteamStub's `NoModuleVerification` flag: the wrapper does not check the file.
-const STEAMSTUB_NO_MODULE_VERIFICATION: u32 = 0x02;
+pub const STEAMSTUB_NO_MODULE_VERIFICATION: u32 = 0x02;
 /// SteamStub 3.1's header signature, once decoded.
 const STEAMSTUB_SIGNATURE: u32 = 0xC0DE_C0DF;
 
@@ -300,7 +300,22 @@ pub fn steamstub_flags(raw: &[u8]) -> Option<u32> {
         let raw_ptr = rd_u32(raw, s + 20).ok()? as usize;
         (entry >= va && entry < va + vsize.max(raw_size)).then(|| entry - va + raw_ptr)
     })?;
-    let mut h = raw.get(entry_off.checked_sub(HEADER)?..entry_off)?.to_vec();
+    let h = raw.get(entry_off.checked_sub(HEADER)?..entry_off)?;
+    decode_steamstub_header(h)
+}
+
+/// SteamStub 3.1's flags from the `0xF0`-byte header that sits just before the
+/// entry point, still encoded: each dword XOR-ed with the previous encoded
+/// dword, the first being the key. `None` when the decoded signature does not
+/// match, so the bytes are not that header. Shared by the file check
+/// ([`steamstub_flags`]) and the in-memory one, which reads the header from
+/// the mapped image instead of the file.
+pub fn decode_steamstub_header(encoded: &[u8]) -> Option<u32> {
+    const HEADER: usize = 0xF0;
+    if encoded.len() < HEADER {
+        return None;
+    }
+    let mut h = encoded[..HEADER].to_vec();
     let mut key = rd_u32(&h, 0).ok()?;
     for i in (4..HEADER).step_by(4) {
         let v = rd_u32(&h, i).ok()?;
@@ -512,5 +527,40 @@ mod tests {
         buf[1] = b'Z';
         buf[0x3C..0x40].copy_from_slice(&0xFFFF_FFF0u32.to_le_bytes());
         assert!(add_first_import(&buf, "a.dll", "f").is_err());
+    }
+
+    /// A SteamStub header encodes each dword against the previous encoded one.
+    /// Build one that decodes to the signature with a given flags word, so the
+    /// in-memory gate (which reads these bytes from the mapped image) reads the
+    /// verification flag the same way the file check does.
+    fn encode_steamstub(flags: u32) -> Vec<u8> {
+        let mut plain = vec![0u8; 0xF0];
+        plain[4..8].copy_from_slice(&STEAMSTUB_SIGNATURE.to_le_bytes());
+        plain[60..64].copy_from_slice(&flags.to_le_bytes());
+        // Encode: enc[0] = plain[0] (the key); enc[i] = plain[i] ^ enc[i-1].
+        let mut enc = plain.clone();
+        for i in (4..0xF0).step_by(4) {
+            let p = u32::from_le_bytes(plain[i..i + 4].try_into().unwrap());
+            let prev = u32::from_le_bytes(enc[i - 4..i].try_into().unwrap());
+            enc[i..i + 4].copy_from_slice(&(p ^ prev).to_le_bytes());
+        }
+        enc
+    }
+
+    #[test]
+    fn decode_steamstub_header_reads_the_verification_flag() {
+        // NoModuleVerification set: the wrapper does not check its file.
+        let no_verify = encode_steamstub(STEAMSTUB_NO_MODULE_VERIFICATION);
+        assert_eq!(
+            decode_steamstub_header(&no_verify),
+            Some(STEAMSTUB_NO_MODULE_VERIFICATION)
+        );
+        // Cleared: it verifies, so the in-memory patch (and the file patch)
+        // must refuse.
+        let verify = encode_steamstub(0);
+        assert_eq!(decode_steamstub_header(&verify), Some(0));
+        // Not a SteamStub header, and too short.
+        assert_eq!(decode_steamstub_header(&[0u8; 0xF0]), None);
+        assert_eq!(decode_steamstub_header(&[0u8; 0x10]), None);
     }
 }

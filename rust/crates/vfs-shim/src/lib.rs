@@ -15,6 +15,7 @@ mod handle_tags;
 mod hook;
 mod hookstats;
 mod lazy_section;
+pub mod loadlog;
 mod ntbuf;
 mod ntdef;
 mod read_cache;

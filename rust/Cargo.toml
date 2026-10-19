@@ -41,6 +41,9 @@ members = [
   "crates/vfs-fixture-escape",
   "crates/vfs-fixture-prefs",
   "crates/vfs-fixture-vproxy",
+  # An exe that imports vproxy.dll statically: what a program's static
+  # imports see while the loader initialises them, before its own code runs.
+  "crates/vfs-fixture-staticimp",
   # Steam API probe for the Proton launch path: loads a game's own
   # steam_api64.dll and reports what it sees of the Steam client.
   "crates/vfs-fixture-steam",

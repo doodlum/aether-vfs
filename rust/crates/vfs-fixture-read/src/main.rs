@@ -18,8 +18,9 @@
 //! `VFS_FIXTURE_SLOW_RELEASE` is looked up once they have all finished, which
 //! is the host's cue to let the slow reads go.
 //!
-//! `VFS_FIXTURE_SPAWN_CHILD` runs a second copy of the fixture after the first
-//! read and exits 1 unless that copy, which the shim injects, also reads the
+//! `VFS_FIXTURE_SPAWN_CHILD=1` runs a second copy of the fixture after the first
+//! read (any other value names the program to run instead, as given), and exits
+//! 1 unless that copy, which the shim injects, also reads the
 //! file.
 //!
 //! `VFS_FIXTURE_ORPHAN_DIR` starts a copy of the fixture after the first read
@@ -182,10 +183,15 @@ fn concurrent_phase(path: &str, slow_path: &str, expect_len: usize, fill: Option
 /// if the process-creation hook injected it: the file exists only in the
 /// provider. A refused spawn (the hook failing closed) is a failure too.
 fn spawn_copy_of_self() {
-    let me = std::env::current_exe().unwrap_or_else(|e| {
-        eprintln!("FIXTURE FAIL: current_exe: {e}");
-        exit(1);
-    });
+    // `1` is this fixture again; any other value is the program to start,
+    // spelled exactly as given (a launcher's doubled separator included).
+    let me = match std::env::var("VFS_FIXTURE_SPAWN_CHILD") {
+        Ok(p) if p != "1" => std::path::PathBuf::from(p),
+        _ => std::env::current_exe().unwrap_or_else(|e| {
+            eprintln!("FIXTURE FAIL: current_exe: {e}");
+            exit(1);
+        }),
+    };
     match std::process::Command::new(me)
         .env_remove("VFS_FIXTURE_SPAWN_CHILD")
         .status()

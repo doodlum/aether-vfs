@@ -5,7 +5,7 @@
 use core::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::os::windows::ffi::OsStrExt;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::Diagnostics::Debug::{
@@ -253,6 +253,23 @@ pub unsafe fn inject_dll(
     dll_path: &str,
     timeout_ms: u32,
 ) -> Result<(), InjectError> {
+    // SAFETY: as this function's contract.
+    unsafe { inject_dll_exit_code(process, dll_path, timeout_ms) }.map(|_| ())
+}
+
+/// [`inject_dll`], returning the remote `LoadLibraryW` thread's exit code: the
+/// low 32 bits of the shim's `HMODULE`, so `0` means the load failed, and an
+/// `NTSTATUS` (`0xC…`) means the process's initialisation, which that thread
+/// ran first, failed. For a diagnosis; whether the shim came up is its own
+/// signal's to say.
+///
+/// # Safety
+/// As [`inject_dll`].
+pub unsafe fn inject_dll_exit_code(
+    process: HANDLE,
+    dll_path: &str,
+    timeout_ms: u32,
+) -> Result<u32, InjectError> {
     // SAFETY: standard remote LoadLibrary injection; `process` is a live process
     // handle with the needed rights (per the contract above).
     unsafe {
@@ -306,11 +323,14 @@ pub unsafe fn inject_dll(
             return Err(InjectError::RemoteThread);
         }
         let done = WaitForSingleObject(hthread, timeout_ms) == 0;
-        CloseHandle(hthread);
         // The thread's exit code is only the low 32 bits of the HMODULE, so it
-        // cannot tell a load from a failure; the shim's own signal does.
+        // cannot tell a load from a failure for certain; the shim's own signal
+        // does. It is still the best clue when that signal never comes.
+        let mut code = 0u32;
+        windows_sys::Win32::System::Threading::GetExitCodeThread(hthread, &mut code);
+        CloseHandle(hthread);
         if done {
-            Ok(())
+            Ok(code)
         } else {
             Err(InjectError::Timeout)
         }
@@ -542,6 +562,37 @@ fn start_target(
             );
         }
 
+        // Prefer the in-memory import patch: the loader then loads the shim
+        // first, so its `DllMain` runs before the target's own static imports
+        // initialise. Remote-thread injection runs those imports first (they
+        // read the game's files, which are in the VFS, before the shim is up),
+        // which is what refused `SkyrimSE.exe`. Fall back to it only when the
+        // in-memory patch is refused, and say which path was taken.
+        if !cfg.force_injection {
+            match crate::patch_imports_in_memory(pi.hProcess) {
+                Ok(()) => {
+                    eprintln!("vfs-inject: activation: in-memory import patch");
+                    ResumeThread(pi.hThread);
+                    // The shim bootstraps as the loader processes imports, after
+                    // the resume, and writes the ready file. Poll it to the
+                    // deadline, as the import-activated path does.
+                    let state = poll_ready(pi.hProcess, &cfg.ready_path, cfg.ready_timeout);
+                    if let Err(e) = state {
+                        return Err(fail_closed(&pi, e));
+                    }
+                    CloseHandle(pi.hThread);
+                    return Ok(Started {
+                        process: pi.hProcess,
+                        pid: pi.dwProcessId,
+                        import_activated: false,
+                    });
+                }
+                Err(e) => eprintln!(
+                "vfs-inject: activation: remote injection (in-memory import patch refused: {e:?})"
+            ),
+            }
+        }
+
         if let Err(e) = inject_dll(pi.hProcess, &cfg.dll_path, timeout_ms) {
             if let Some(code) = exited(pi.hProcess) {
                 CloseHandle(pi.hThread);
@@ -583,6 +634,39 @@ fn start_target(
             pid: pi.dwProcessId,
             import_activated: false,
         })
+    }
+}
+
+/// Poll `ready_path` until the shim writes its verdict, the target exits, or
+/// `timeout` passes. For the in-memory import patch, where the shim runs only
+/// after the primary thread is resumed.
+///
+/// # Safety
+/// `process` is the live, resumed target.
+#[allow(unsafe_code)]
+unsafe fn poll_ready(
+    process: HANDLE,
+    ready_path: &str,
+    timeout: Duration,
+) -> Result<(), InjectError> {
+    let began = Instant::now();
+    loop {
+        match std::fs::read_to_string(ready_path)
+            .map(|c| classify_ready(&c))
+            .unwrap_or(ReadyState::Pending)
+        {
+            ReadyState::Ready => return Ok(()),
+            ReadyState::Failed(e) => return Err(e),
+            ReadyState::Pending => {}
+        }
+        // SAFETY: a zero-timeout poll of a handle we own.
+        if let Some(code) = exited(process) {
+            return Err(InjectError::TargetExited(code));
+        }
+        if began.elapsed() > timeout {
+            return Err(InjectError::Timeout);
+        }
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 
@@ -694,6 +778,19 @@ fn start_import_activated(
             pid: pi.dwProcessId,
             import_activated: true,
         })
+    }
+}
+
+/// Resume a suspended thread (the child's primary, after an in-memory import
+/// patch). A no-op on a thread that is already running.
+///
+/// # Safety
+/// `thread` is a live thread handle with `THREAD_SUSPEND_RESUME`.
+#[allow(unsafe_code)]
+pub unsafe fn resume_primary_thread(thread: HANDLE) {
+    // SAFETY: a resume of a thread handle we own.
+    unsafe {
+        ResumeThread(thread);
     }
 }
 

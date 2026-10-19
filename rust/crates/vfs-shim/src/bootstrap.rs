@@ -35,16 +35,28 @@ pub fn bootstrap_failed_content(e: &BootstrapError) -> String {
 /// Read a config file, attach the director's client, and install the hooks. Returns the
 /// guard keeping the hooks alive (the shim DLL leaks it).
 pub fn bootstrap_from_config_path(path: &str) -> Result<HookGuard, BootstrapError> {
+    let result = bootstrap_steps(path);
+    crate::loadlog::note(&match &result {
+        Ok(_) => "bootstrap: ready".to_string(),
+        Err(e) => format!("bootstrap: FAILED {e:?}"),
+    });
+    result
+}
+
+/// [`bootstrap_from_config_path`]'s steps, each noted in the load log.
+fn bootstrap_steps(path: &str) -> Result<HookGuard, BootstrapError> {
     let bytes = std::fs::read(path).map_err(|_| BootstrapError::Io)?;
+    crate::loadlog::note("bootstrap: config read");
     // The root is the director's to answer for (the client's roots come from the environment), so
     // decoding is only the version and shape check: a config from another build fails here, loudly.
     shimcfg::decode_config(&bytes).map_err(BootstrapError::Config)?;
+    crate::loadlog::note("bootstrap: config ok");
     // Attach to the parent director's FUSE ring. A process that names no ring at all is refused
     // like a ring that failed to attach: a shim with no director would run the program
     // un-virtualised while appearing to work. The client's roots
     // (`director::roots_from_env`) are the only notion of "under a root" the hooks have.
     match crate::director::try_init_from_env() {
-        Ok(()) => {}
+        Ok(()) => crate::loadlog::note("bootstrap: director attached"),
         Err(crate::director::FuseInitError::NotConfigured) => {
             return Err(BootstrapError::Fuse(
                 "no VFS_RING_SECTION configured: standalone (no-director) shim launches are \
@@ -64,6 +76,7 @@ pub fn bootstrap_from_config_path(path: &str) -> Result<HookGuard, BootstrapErro
         crate::whereami::rename_image()
     };
     let guard = install().map_err(BootstrapError::Install)?;
+    crate::loadlog::note("bootstrap: hooks installed");
     // Tell any spawning parent (that force-suspended us) our hooks are live.
     crate::child::signal_ready();
     Ok(guard)
