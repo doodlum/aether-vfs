@@ -358,3 +358,75 @@ fn an_unpatchable_childs_static_imports_see_the_vfs_when_they_initialise() {
         "the child's static import must see needs.txt as it initialises; load log:\n{log}"
     );
 }
+
+/// The exact SKSE/Skyrim shape: an import-patched launcher at a virtual
+/// location starts an unpatchable child **suspended** (as SKSE creates
+/// SkyrimSE.exe) and resumes it itself. The in-memory import patch must make
+/// the loader load the shim first on that resume — so the child's static
+/// imports (needing a VFS-only file) see the VFS — without the hook resuming
+/// the child or waiting for a signal that only comes after the caller's
+/// resume. This is what the first two TPF launches got wrong.
+#[cfg(windows)]
+#[test]
+fn a_suspended_unpatchable_child_is_import_patched_in_memory_and_runs() {
+    ensure_inject_artifacts();
+    let _launches = lock_launches();
+
+    let content = vfs_testkit::scratch_dir("vloc-susp-content");
+    std::fs::copy(
+        locate_artifact("vfs-fixture-read.exe"),
+        content.join("game.exe"),
+    )
+    .unwrap();
+    let mut child = std::fs::read(locate_artifact("vfs-staticimp.exe")).unwrap();
+    child.extend(std::iter::repeat_n(0xA5u8, 4096));
+    std::fs::write(content.join("Child.exe"), &child).unwrap();
+    std::fs::copy(locate_artifact("vproxy.dll"), content.join("vproxy.dll")).unwrap();
+    std::fs::write(content.join("needs.txt"), b"only in the VFS").unwrap();
+    std::fs::write(content.join("hello.txt"), b"hello").unwrap();
+    let world = vfs_testkit::scratch_dir("vloc-susp-world");
+    let location = world.join("Haskill").join("list").join("game");
+
+    let mut session = LiveSession::create("vloc-susp");
+    session.declare_root(0, &location);
+    session
+        .add_source(0, "/", 0, Arc::new(DiskProvider::new(&*content)))
+        .expect("add source");
+
+    let env: BTreeMap<String, String> = [
+        ("VFS_FIXTURE_PATH", "hello.txt".to_string()),
+        ("VFS_FIXTURE_EXPECT", "5".to_string()),
+        (
+            "VFS_FIXTURE_SPAWN_CHILD",
+            format!("{}\\Child.exe", location.display()),
+        ),
+        ("VFS_FIXTURE_SPAWN_SUSPENDED", "1".to_string()),
+        ("VFS_FIXTURE_VPROXY_NEEDS", "needs.txt".to_string()),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect();
+    let code = launch_bounded(
+        session.shared(),
+        LaunchOpts {
+            image: "game.exe".into(),
+            env,
+            ..Default::default()
+        },
+        "suspended unpatchable child",
+    );
+    let log =
+        std::fs::read_to_string(session.state_dir().join("shim-load.log")).unwrap_or_default();
+    assert_eq!(
+        code, 0,
+        "a suspended unpatchable child must be in-memory import-patched and run; load log:\n{log}"
+    );
+    assert!(
+        log.contains("left suspended for the caller"),
+        "the suspended child should take the in-memory patch and be left for the caller:\n{log}"
+    );
+    assert!(
+        !log.contains("remote injection"),
+        "the suspended child must not fall back to remote injection:\n{log}"
+    );
+}

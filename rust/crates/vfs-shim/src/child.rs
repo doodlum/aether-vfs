@@ -103,32 +103,43 @@ pub(crate) fn inject_child(
         let _ = vfs_inject::expand_primary_stack(process, thread, vfs_inject::PRIMARY_STACK_BYTES);
         // Prefer the in-memory import patch: the loader loads the shim before
         // the child's own static imports initialise (those read the game's
-        // files, which are in the VFS). Remote injection runs them first,
-        // which is what refused SkyrimSE.exe. Fall back to injection when the
-        // patch is refused, and record which path.
-        if !caller_suspended {
-            match vfs_inject::patch_imports_in_memory(process) {
-                Ok(()) => {
+        // files, which are in the VFS). Remote injection runs them first, on
+        // the injected thread, which is what refused SkyrimSE.exe — its
+        // imports fault before the shim is up. Fall back to injection only
+        // when the patch is refused, and record which path.
+        match vfs_inject::patch_imports_in_memory(process) {
+            Ok(()) => {
+                if caller_suspended {
+                    // The caller (SKSE) created the child suspended and will
+                    // resume it itself. The shim is first in the import order,
+                    // so when it is resumed the loader loads and bootstraps the
+                    // shim before any game code — and a failed bootstrap returns
+                    // FALSE, which fails process start (the loader's own
+                    // fail-closed, the same guarantee file import-patching
+                    // relies on). We do not resume, and cannot wait for a
+                    // signal that only comes on the caller's later resume.
                     crate::loadlog::note(&format!(
-                        "child {pid}: activation in-memory import patch"
+                        "child {pid}: activation in-memory import patch (left suspended for the caller)"
                     ));
-                    // The shim runs as the loader processes imports, so the
-                    // primary thread must run; the caller does not resume an
-                    // unsuspended child again.
-                    vfs_inject::resume_primary_thread(thread);
-                    let wait = wait_ready(process, pid, timeout_ms);
-                    crate::loadlog::note(&format!("child {pid}: ready wait {wait:?}"));
-                    return match wait {
-                        ReadyWait::Ready => Ok(()),
-                        ReadyWait::BootstrapFailed => Err(ChildInjectError::BootstrapFailed),
-                        ReadyWait::Exited => Err(ChildInjectError::ChildExited),
-                        ReadyWait::TimedOut => Err(ChildInjectError::ReadyTimeout),
-                    };
+                    return Ok(());
                 }
-                Err(e) => crate::loadlog::note(&format!(
-                    "child {pid}: activation remote injection (in-memory import patch refused: {e:?})"
-                )),
+                crate::loadlog::note(&format!("child {pid}: activation in-memory import patch"));
+                // Not caller-suspended: the shim runs as the loader processes
+                // imports, so the primary thread must run; the caller does not
+                // resume an unsuspended child again.
+                vfs_inject::resume_primary_thread(thread);
+                let wait = wait_ready(process, pid, timeout_ms);
+                crate::loadlog::note(&format!("child {pid}: ready wait {wait:?}"));
+                return match wait {
+                    ReadyWait::Ready => Ok(()),
+                    ReadyWait::BootstrapFailed => Err(ChildInjectError::BootstrapFailed),
+                    ReadyWait::Exited => Err(ChildInjectError::ChildExited),
+                    ReadyWait::TimedOut => Err(ChildInjectError::ReadyTimeout),
+                };
             }
+            Err(e) => crate::loadlog::note(&format!(
+                "child {pid}: activation remote injection (in-memory import patch refused: {e:?})"
+            )),
         }
         match vfs_inject::inject_dll_exit_code(process, full_shim_dll, timeout_ms) {
             Ok(code) => crate::loadlog::note(&format!(

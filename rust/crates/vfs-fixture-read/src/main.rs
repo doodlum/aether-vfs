@@ -192,6 +192,14 @@ fn spawn_copy_of_self() {
             exit(1);
         }),
     };
+    // `VFS_FIXTURE_SPAWN_SUSPENDED` creates the child suspended and resumes it
+    // itself, the way SKSE starts SkyrimSE.exe — the shape that needs the
+    // in-memory import patch to work on a suspended child.
+    #[cfg(windows)]
+    if std::env::var_os("VFS_FIXTURE_SPAWN_SUSPENDED").is_some() {
+        spawn_suspended(&me);
+        return;
+    }
     match std::process::Command::new(me)
         .env_remove("VFS_FIXTURE_SPAWN_CHILD")
         .status()
@@ -203,6 +211,70 @@ fn spawn_copy_of_self() {
         }
         Err(e) => {
             eprintln!("FIXTURE FAIL: could not spawn the child: {e}");
+            exit(1);
+        }
+    }
+}
+
+/// Create the child suspended, then resume it — SKSE's shape. The shim's
+/// process hook injects it while it is suspended; the in-memory import patch
+/// leaves it suspended for this resume, and the shim bootstraps as the loader
+/// runs. Exits 0 iff the child exits 0.
+#[cfg(windows)]
+fn spawn_suspended(exe: &std::path::Path) {
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+    };
+    use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
+    const CREATE_SUSPENDED: u32 = 0x4;
+
+    // std builds the CreateProcessW call (correct structures) and it goes
+    // through the shim's process hook, which injects the child while it is
+    // suspended — exactly SKSE's shape. The child must not spawn again.
+    let child = std::process::Command::new(exe)
+        .env_remove("VFS_FIXTURE_SPAWN_CHILD")
+        .env_remove("VFS_FIXTURE_SPAWN_SUSPENDED")
+        .creation_flags(CREATE_SUSPENDED)
+        .spawn();
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("FIXTURE FAIL: suspended spawn: {e}");
+            exit(1);
+        }
+    };
+    // Resume every thread the child owns (just its primary, at this point),
+    // the way SKSE resumes the game after injecting.
+    // SAFETY: a ToolHelp thread walk; each opened handle is closed.
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if snap != INVALID_HANDLE_VALUE {
+            let mut te: THREADENTRY32 = core::mem::zeroed();
+            te.dwSize = core::mem::size_of::<THREADENTRY32>() as u32;
+            let mut ok = Thread32First(snap, &mut te);
+            while ok != 0 {
+                if te.th32OwnerProcessID == child.id() {
+                    let h = OpenThread(THREAD_SUSPEND_RESUME, 0, te.th32ThreadID);
+                    if !h.is_null() {
+                        ResumeThread(h);
+                        CloseHandle(h);
+                    }
+                }
+                ok = Thread32Next(snap, &mut te);
+            }
+            CloseHandle(snap);
+        }
+    }
+    match child.wait() {
+        Ok(s) if s.success() => println!("FIXTURE CHILD OK"),
+        Ok(s) => {
+            eprintln!("FIXTURE FAIL: suspended child exited with {s}");
+            exit(1);
+        }
+        Err(e) => {
+            eprintln!("FIXTURE FAIL: waiting on suspended child: {e}");
             exit(1);
         }
     }

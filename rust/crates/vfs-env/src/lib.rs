@@ -375,6 +375,9 @@ pub const FIXTURE_LINGER_MS: &str = "VFS_FIXTURE_LINGER_MS";
 /// `vfs-fixture-read`: after the first read, run a second copy of the fixture
 /// and fail unless it succeeds (it can only if the shim injected it).
 pub const FIXTURE_SPAWN_CHILD: &str = "VFS_FIXTURE_SPAWN_CHILD";
+/// `vfs-fixture-read`: create the spawned child suspended and resume it, the
+/// way SKSE starts the game.
+pub const FIXTURE_SPAWN_SUSPENDED: &str = "VFS_FIXTURE_SPAWN_SUSPENDED";
 /// `vfs-fixture-read`: after the first read, start a copy of the fixture that
 /// outlives it (the process-tree e2e), signalling through files in this
 /// directory: `parent-gone`, `release`, `child-released`.
@@ -823,6 +826,11 @@ pub const ALL: &[Var] = &[
         name: FIXTURE_SPAWN_CHILD,
         kind: Kind::Fixture,
         default: "unset: no child",
+    },
+    Var {
+        name: FIXTURE_SPAWN_SUSPENDED,
+        kind: Kind::Fixture,
+        default: "unset: resumed spawn",
     },
     Var {
         name: FIXTURE_ORPHAN_DIR,
