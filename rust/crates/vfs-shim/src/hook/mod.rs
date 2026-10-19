@@ -66,7 +66,13 @@ use std::sync::OnceLock;
 /// come from the director (zip/overrides), never the Steam library tree.
 fn allow_disk_fallthrough() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| vfs_env::opt_in(vfs_env::ALLOW_DISK_FALLTHROUGH))
+    // Never with a purely virtual location (one started from a backing
+    // directory): there is nothing real at it to fall through to, and touching
+    // it is exactly what a virtual location rules out.
+    *FLAG.get_or_init(|| {
+        vfs_env::opt_in(vfs_env::ALLOW_DISK_FALLTHROUGH)
+            && vfs_env::text(vfs_env::ROOT_BACKINGS).is_none()
+    })
 }
 
 /// Whether a child process we inject starts with its working directory set to

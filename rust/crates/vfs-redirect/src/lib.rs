@@ -18,7 +18,9 @@ pub use cache::UncachedScope;
 pub use canon::{canonicalise, split_stream_suffix, VolumeMap};
 pub use nt::{counted_units, nt_to_volume_relative, to_nt, utf16_to_string, CountedErr};
 pub use rootmap::RootMap;
-pub use volumes::{expand_short_name, resolve_volume_map, resolve_volume_map_for};
+pub use volumes::{
+    expand_short_component, expand_short_name, resolve_volume_map, resolve_volume_map_for,
+};
 pub use whiteout::{is_whiteout, WHITEOUT_SUFFIX};
 
 /// What a [`RootMap`] lookup answers with: which declared root the path fell

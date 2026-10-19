@@ -155,6 +155,33 @@ pub fn expand_long_path(path: &str) -> Option<String> {
     })
 }
 
+/// The long name of the entry `name` (an 8.3 short name, say) in the
+/// directory `dir`, from one `FindFirstFileW` there: only `dir`'s listing is
+/// read, and nothing below it is opened. `None` if nothing matches.
+pub fn long_name_in(dir: &str, name: &str) -> Option<String> {
+    use windows_sys::Win32::Storage::FileSystem::{FindClose, FindFirstFileW, WIN32_FIND_DATAW};
+    if name.contains(['*', '?']) {
+        return None;
+    }
+    let pattern = to_wide(&format!("{}\\{name}", dir.trim_end_matches(['\\', '/'])));
+    // SAFETY: FFI. `pattern` is NUL-terminated; `data` is a valid out
+    // buffer; the find handle is closed before returning.
+    unsafe {
+        let mut data: WIN32_FIND_DATAW = core::mem::zeroed();
+        let h = FindFirstFileW(pattern.as_ptr(), &mut data);
+        if h == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        FindClose(h);
+        let len = data
+            .cFileName
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(data.cFileName.len());
+        Some(String::from_utf16_lossy(&data.cFileName[..len]))
+    }
+}
+
 /// The short (8.3) form of `path`, if the filesystem has one. Exposed for
 /// tests that need to construct a real short name to round-trip through
 /// [`expand_long_path`] / [`final_path_for_open`]; not used by the

@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use vfs_core::{fold, normalize_vpath, PathError};
 
 use crate::cache::{cache_suppressed, OsConsultGuard, PathCache, DEFAULT_CACHE_CAPACITY};
-use crate::{canonicalise, expand_short_name, RootHit, RootId, VolumeMap};
+use crate::{canonicalise, expand_short_component, RootHit, RootId, VolumeMap};
 
 /// One declared root: the [`RootId`] it answers with and its normalized path
 /// components in original case, e.g. `["C:", "Games", "Skyrim"]`.
@@ -293,21 +293,16 @@ impl RootMap {
         let Some(_guard) = OsConsultGuard::enter() else {
             return Resolution::OsConsulted(None);
         };
-        // `canon` is already an absolute, NT/DOS-prefix-free, drive-letter
-        // form (e.g. `C:/Games~1/Data/a.esp`); backslashes make it a path
-        // `CreateFileW` (behind `expand_short_name`) accepts directly.
-        let win32_candidate = canon.replace('/', "\\");
-        let Some(resolved) = expand_short_name(&win32_candidate) else {
+        // Each `~` component is asked of its parent directory's listing
+        // (`expand_short_component`), and only while that parent is above
+        // every root: a location may be purely virtual, so nothing at or
+        // under one is opened, listed or read, and content served under a
+        // root has no 8.3 names to look up anyway. So it is the spelling of a
+        // root's own ancestors (`HASKIL~1` for `Haskill`) that this resolves.
+        let Some(expanded) = self.expand_above_roots(&canon) else {
             return Resolution::OsConsulted(None);
         };
-        // The OS's answer may itself carry an NT/DOS prefix (`final_path_for_open`
-        // returns VOLUME_NAME_DOS, `\\?\`-prefixed) — canonicalise strips
-        // whatever recognised prefix is present rather than requiring the
-        // caller to know which one, so this is not a second special case.
-        let Ok(canon2) = canonicalise(&resolved, &self.volumes) else {
-            return Resolution::OsConsulted(None);
-        };
-        Resolution::OsConsulted(self.match_canonical(&canon2))
+        Resolution::OsConsulted(self.match_canonical(&expanded))
     }
 
     /// Fold-compare an already-canonicalised path's components against every
@@ -317,6 +312,28 @@ impl RootMap {
     /// is "deepest match" — a nested root wins over the root it sits inside,
     /// which is the only ordering that does not let a shallow root swallow a
     /// deep one.
+    /// `canon` (`/`-separated, drive first) with each `~` component replaced
+    /// by the long name its parent directory lists for it, for as long as
+    /// that parent lies outside every root; from the first component whose
+    /// parent is at or under a root, the rest is kept as spelled. `None` if a
+    /// component that is asked about matches nothing.
+    fn expand_above_roots(&self, canon: &str) -> Option<String> {
+        let comps: Vec<&str> = canon.split('/').collect();
+        let mut out: Vec<String> = comps.first().map(|c| c.to_string()).into_iter().collect();
+        for (i, c) in comps.iter().enumerate().skip(1) {
+            if c.contains('~') {
+                if self.match_canonical(&out.join("/")).is_some() {
+                    out.extend(comps[i..].iter().map(|c| c.to_string()));
+                    break;
+                }
+                out.push(expand_short_component(&out.join("\\"), c)?);
+            } else {
+                out.push(c.to_string());
+            }
+        }
+        Some(out.join("/"))
+    }
+
     fn match_canonical(&self, canon: &str) -> Option<RootHit> {
         let comps: Vec<&str> = if canon.is_empty() {
             Vec::new()

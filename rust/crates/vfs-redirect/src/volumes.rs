@@ -414,6 +414,20 @@ pub fn expand_short_name(path: &str) -> Option<String> {
     vfs_win::final_path_for_open(path).or_else(|| vfs_win::expand_long_path(path))
 }
 
+/// The long name its directory `dir` lists for the entry `name` (an 8.3
+/// short name): one `FindFirstFileW` in `dir`, so only `dir`'s listing is
+/// read and nothing is opened. `None` if nothing there matches.
+#[cfg(windows)]
+pub fn expand_short_component(dir: &str, name: &str) -> Option<String> {
+    vfs_win::long_name_in(dir, name)
+}
+
+/// Non-Windows hosts have no 8.3 names.
+#[cfg(not(windows))]
+pub fn expand_short_component(_dir: &str, _name: &str) -> Option<String> {
+    None
+}
+
 /// Non-Windows hosts have no 8.3 names or Win32 path expansion.
 #[cfg(not(windows))]
 pub fn expand_short_name(_path: &str) -> Option<String> {

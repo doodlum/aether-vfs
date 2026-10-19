@@ -19,7 +19,7 @@ use windows_sys::Win32::Foundation::{HANDLE, NTSTATUS};
 /// The cache is keyed on the vpath and the image's bytes
 /// ([`vfs_pe::image_cache_name`]), so an assembly loaded repeatedly
 /// materialises once and a changed build of the same size never reuses it.
-/// Files live under the shim's own temp directory and are left for the OS to
+/// Files live in the session's state directory ([`pe_cache_dir`]) and are left for the host to
 /// reclaim; they are content, not secrets, and the process
 /// may still have sections open on them at exit.
 #[allow(clippy::too_many_arguments)]
@@ -43,7 +43,7 @@ unsafe fn real_image_section(
     // Named by the vpath and the image's bytes: a same-size different build
     // (a patch, an update) never reuses a stale copy.
     let name = vfs_pe::image_cache_name(&vpath, pe);
-    let dir = std::env::temp_dir().join("vfs-pe-cache");
+    let dir = pe_cache_dir();
     std::fs::create_dir_all(&dir).ok()?;
     let path = dir.join(&name);
 
@@ -453,4 +453,23 @@ pub(super) unsafe fn unmap_view_hook_body(process: HANDLE, base: *mut c_void) ->
     }
     // SAFETY: the original NT function, called with valid NT arguments.
     unsafe { tramp(process, base) }
+}
+
+/// Where images served from the VFS are written for the loader to map: beside
+/// the shim's config, in the session's state directory, which the host owns.
+/// Not `%TEMP%`: that is under the user's profile, which a host may serve
+/// purely virtually, and the shim's own writes go to real disk. `%TEMP%` only
+/// for a shim started without a config.
+fn pe_cache_dir() -> std::path::PathBuf {
+    static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        vfs_env::text(vfs_env::SHIM_CONFIG)
+            .and_then(|c| {
+                std::path::Path::new(&c)
+                    .parent()
+                    .map(|p| p.join("pe-cache"))
+            })
+            .unwrap_or_else(|| std::env::temp_dir().join("vfs-pe-cache"))
+    })
+    .clone()
 }

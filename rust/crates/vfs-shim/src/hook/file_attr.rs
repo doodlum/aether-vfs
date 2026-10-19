@@ -7,7 +7,8 @@ use super::{
 };
 use crate::ntdef::{
     FileBasicInformation, FileNetworkOpenInformation, ObjectAttributes,
-    STATUS_OBJECT_NAME_NOT_FOUND, STATUS_SUCCESS, STATUS_UNSUCCESSFUL,
+    STATUS_INFO_LENGTH_MISMATCH, STATUS_INVALID_INFO_CLASS, STATUS_OBJECT_NAME_NOT_FOUND,
+    STATUS_SUCCESS, STATUS_UNSUCCESSFUL,
 };
 use core::ffi::c_void;
 use vfs_ntlayout::SYNTH_FILETIME;
@@ -115,6 +116,11 @@ pub(super) unsafe fn qibn_hook_body(
         Ok(p) => p,
         Err(st) => return st,
     } {
+        // A path the director has, in a class it cannot fill: answered here, never by the real
+        // tree behind the root (which a purely virtual location does not have, and must not be
+        // touched). A class it fills, into too short a buffer, is a length mismatch; any other
+        // class is one this query does not answer by name.
+        let mut refusal: Option<NTSTATUS> = None;
         let answer = stat_by_path(
             &path,
             |event| match event {
@@ -133,6 +139,16 @@ pub(super) unsafe fn qibn_hook_body(
                 let buf = unsafe { caller_buf(info, length as usize) };
                 let Some(n) = vfs_ntlayout::by_name_info(class_raw, buf, st.is_dir, st.size) else {
                     crate::hookstats::note_stat(&path, &format!("byname{class_raw}-UNSUP"));
+                    let mut probe = [0u8; 512];
+                    refusal = Some(
+                        if vfs_ntlayout::by_name_info(class_raw, &mut probe, st.is_dir, st.size)
+                            .is_some()
+                        {
+                            STATUS_INFO_LENGTH_MISMATCH
+                        } else {
+                            STATUS_INVALID_INFO_CLASS
+                        },
+                    );
                     return false;
                 };
                 // Classes 68 and 77 open with the file id. By handle
@@ -150,7 +166,7 @@ pub(super) unsafe fn qibn_hook_body(
                 true
             },
         );
-        if let Some(st) = answer {
+        if let Some(st) = answer.or(refusal) {
             return st;
         }
     }
