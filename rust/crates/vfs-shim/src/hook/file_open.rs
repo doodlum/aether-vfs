@@ -299,6 +299,60 @@ fn drm_exe_trace(nt_or_win_path: &str, rel: bool, write: bool) {
     );
 }
 
+/// Diagnostics (no behaviour change): log every open whose basename is
+/// `steam_appid.txt` to the shim load log — the pid, the name the caller gave,
+/// whether it is relative to a handle (and whether a FUSE synthetic one), the
+/// path the shim resolved it to, how it routes (a managed root + vpath, or a
+/// passthrough outside every root), and whether the VFS has the file. This
+/// answers whether SteamStub / `steam_api64` reads `steam_appid.txt` and by
+/// which path — the thing that makes `RestartAppIfNecessary` return false.
+/// Called once per open from `route_open`, so the cheap basename test comes
+/// first; `steam_appid.txt` opens are rare, so logging each is cheap.
+///
+/// # Safety
+/// `oa` is the caller's `OBJECT_ATTRIBUTES`, and `resolved` its decoded path, per
+/// the NT-pointer contract (hook/mod.rs).
+unsafe fn steam_appid_trace(oa: *const ObjectAttributes, resolved: Option<&str>) {
+    fn is_appid(name: &str) -> bool {
+        std::path::Path::new(name)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(|b| b.eq_ignore_ascii_case("steam_appid.txt"))
+    }
+    // SAFETY: the caller's OA name, per the contract.
+    let caller = unsafe { object_name_str(oa) };
+    if !(resolved.is_some_and(is_appid) || caller.as_deref().is_some_and(is_appid)) {
+        return;
+    }
+    // SAFETY: reading the OA's RootDirectory field, per the contract.
+    let root_dir = unsafe { (*oa).root_directory };
+    let rel = if root_dir.is_null() {
+        "absolute".to_string()
+    // SAFETY: querying whether that handle is a FUSE synthetic one, per the contract.
+    } else if unsafe { fuse_root_directory(oa) } {
+        format!("handle-relative (fuse synthetic {:#x})", root_dir as usize)
+    } else {
+        format!("handle-relative (real handle {:#x})", root_dir as usize)
+    };
+    let for_route = resolved.or(caller.as_deref()).unwrap_or("");
+    let route = match crate::director::global()
+        .and_then(|c| c.route(for_route).map(|(root, vp)| (c, root, vp)))
+    {
+        Some((c, root, vp)) => {
+            let vfs = match c.getattr(root, &vp) {
+                Ok(a) if a.found => "found",
+                Ok(_) => "not-found",
+                Err(_) => "query-error",
+            };
+            format!("root {} vpath=\"{vp}\" vfs={vfs}", root.0)
+        }
+        None => "passthrough (outside every managed root)".to_string(),
+    };
+    crate::loadlog::note(&format!(
+        "steam_appid.txt open: caller={caller:?} {rel} resolved={resolved:?} -> {route}"
+    ));
+}
+
 /// Append `<epoch seconds>\t<head>\t<path>` to the diagnostic log at `log`. The shim's own file
 /// I/O is wrapped in `ShimIoGuard`, so the append is not itself traced.
 fn append_trace_line(log: &std::path::Path, head: &str, path: &str) {
@@ -597,6 +651,10 @@ unsafe fn route_open(
     // `note_passthrough_outcome`) must not be cached under it. See
     // `vfs_redirect::UncachedScope`'s doc comment.
     let _uncached_guard = os_consulted.then(vfs_redirect::UncachedScope::enter);
+
+    // Diagnostics only (no behaviour change): record any steam_appid.txt open.
+    // SAFETY: same NT-pointer contract as this fn (hook/mod.rs).
+    unsafe { steam_appid_trace(oa, path) };
 
     // Directory create under the managed root → ring OP_MKDIR (must precede the
     // generic file open below, which would otherwise create a FILE named as the
