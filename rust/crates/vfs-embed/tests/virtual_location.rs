@@ -430,3 +430,85 @@ fn a_suspended_unpatchable_child_is_import_patched_in_memory_and_runs() {
         "the suspended child must not fall back to remote injection:\n{log}"
     );
 }
+
+/// Rename the first section of a PE to `.bind`, the section SteamStub's wrapper
+/// leaves — so the shim treats the image as DRM-wrapped. The bytes are
+/// otherwise unchanged, so the exe still runs; this only exercises the path a
+/// SteamStub exe (SkyrimSE.exe) takes.
+#[cfg(windows)]
+fn mark_bind_section(pe: &mut [u8]) {
+    let e_lfanew = u32::from_le_bytes(pe[0x3C..0x40].try_into().unwrap()) as usize;
+    let size_opt =
+        u16::from_le_bytes(pe[e_lfanew + 20..e_lfanew + 22].try_into().unwrap()) as usize;
+    let sect = e_lfanew + 24 + size_opt;
+    pe[sect..sect + 8].copy_from_slice(b".bind\0\0\0");
+}
+
+/// A DRM-wrapped game (a `.bind` SteamStub section) is import-patched in memory
+/// anyway: the patch never touches the file, which is what the wrapper
+/// verifies, so the shim loads first and the game's imports (needing the VFS)
+/// resolve through it. Before, the shim refused such an image and fell back to
+/// remote injection — which fails for exactly this kind of exe. This is the
+/// SkyrimSE.exe shape; the exe here still runs because only its section name is
+/// changed.
+#[cfg(windows)]
+#[test]
+fn a_steamstub_marked_child_is_import_patched_in_memory_not_refused() {
+    ensure_inject_artifacts();
+    let _launches = lock_launches();
+
+    let content = vfs_testkit::scratch_dir("vloc-bind-content");
+    std::fs::copy(
+        locate_artifact("vfs-fixture-read.exe"),
+        content.join("game.exe"),
+    )
+    .unwrap();
+    let mut child = std::fs::read(locate_artifact("vfs-staticimp.exe")).unwrap();
+    mark_bind_section(&mut child);
+    child.extend(std::iter::repeat_n(0xA5u8, 4096));
+    std::fs::write(content.join("Child.exe"), &child).unwrap();
+    std::fs::copy(locate_artifact("vproxy.dll"), content.join("vproxy.dll")).unwrap();
+    std::fs::write(content.join("needs.txt"), b"only in the VFS").unwrap();
+    std::fs::write(content.join("hello.txt"), b"hello").unwrap();
+    let world = vfs_testkit::scratch_dir("vloc-bind-world");
+    let location = world.join("Haskill").join("list").join("game");
+
+    let mut session = LiveSession::create("vloc-bind");
+    session.declare_root(0, &location);
+    session
+        .add_source(0, "/", 0, Arc::new(DiskProvider::new(&*content)))
+        .expect("add source");
+
+    let env: BTreeMap<String, String> = [
+        ("VFS_FIXTURE_PATH", "hello.txt".to_string()),
+        ("VFS_FIXTURE_EXPECT", "5".to_string()),
+        (
+            "VFS_FIXTURE_SPAWN_CHILD",
+            format!("{}\\Child.exe", location.display()),
+        ),
+        ("VFS_FIXTURE_SPAWN_SUSPENDED", "1".to_string()),
+        ("VFS_FIXTURE_VPROXY_NEEDS", "needs.txt".to_string()),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect();
+    let code = launch_bounded(
+        session.shared(),
+        LaunchOpts {
+            image: "game.exe".into(),
+            env,
+            ..Default::default()
+        },
+        "steamstub-marked suspended child",
+    );
+    let log =
+        std::fs::read_to_string(session.state_dir().join("shim-load.log")).unwrap_or_default();
+    assert_eq!(
+        code, 0,
+        "a .bind-marked child must still be in-memory import-patched and run; load log:\n{log}"
+    );
+    assert!(
+        !log.contains("remote injection"),
+        "a .bind section must no longer force remote injection:\n{log}"
+    );
+}

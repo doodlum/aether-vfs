@@ -34,8 +34,6 @@ pub enum MemPatchRefused {
     /// known-good path under Wine and makes the Linux TPF launch work. So the
     /// in-memory patch is native-Windows only.
     UnderWine,
-    /// The image is a self-verifying SteamStub wrapper.
-    SteamStubVerifies,
     /// The image's version of SteamStub could not be read.
     SteamStubUnknown,
     /// The headers, PEB or descriptors could not be read or parsed.
@@ -76,12 +74,22 @@ pub unsafe fn patch_imports_in_memory(process: HANDLE) -> Result<(), MemPatchRef
         .ok_or_else(|| Unreadable("read headers".into()))?;
     let plan = vfs_pe::mem_patch::plan_mem_patch(&headers).map_err(|e| Unreadable(e.into()))?;
 
+    // A SteamStub wrapper (`.bind` section) is NOT a reason to refuse the
+    // in-memory patch. SteamStub verifies the on-disk FILE (which is why file
+    // import-patching trips it, and this patch never touches the file); only a
+    // rare version that also hashes its live headers would notice, and then
+    // the stub aborts on its own — no worse than the injection fallback, which
+    // fails for this exe anyway. Patching in memory is in fact how a shim
+    // coexists with SteamStub: the loader loads the shim first, then the stub
+    // unpacks and resolves the real game imports through it. So we proceed, and
+    // only note what we found for the record.
     if plan.has_bind_section {
-        match steamstub_verifies(process, base, &headers) {
-            Some(false) => {}
-            Some(true) => return Err(MemPatchRefused::SteamStubVerifies),
-            None => return Err(MemPatchRefused::SteamStubUnknown),
-        }
+        let verify = match steamstub_verifies(process, base, &headers) {
+            Some(true) => "verifies-its-file",
+            Some(false) => "no-module-verification",
+            None => "unreadable-header",
+        };
+        eprintln!("vfs-inject: in-memory patch over a SteamStub wrapper ({verify})");
     }
 
     // The existing descriptors, read at their RVA (base + rva: the image is
