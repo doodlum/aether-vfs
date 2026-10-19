@@ -116,15 +116,17 @@ pub const PROXY_DLL_NAMES: &[&str] = &[
     "winmm.dll",
     "winhttp.dll",
     "dbghelp.dll",
-    "xinput1_3.dll",
     "xinput1_4.dll",
-    "x3daudio1_7.dll",
     "hid.dll",
     "dwmapi.dll",
     "uxtheme.dll",
     "wintrust.dll",
     "userenv.dll",
     // Common proxy names the import walk would stage only on a direct import.
+    // (The DirectX June 2010 runtime is not system-classified: a direct
+    // import of it is walked, and staged from the VFS or a fallback folder.)
+    "xinput1_3.dll",
+    "x3daudio1_7.dll",
     "d3d8.dll",
     "d3d9.dll",
     "d3d10.dll",
@@ -991,6 +993,48 @@ mod tests {
         );
         assert!(staged.staged().iter().any(|s| s == "SkyrimSE.exe"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// SKSE's shape on native Windows: the launcher stages SkyrimSE.exe
+    /// beside it, whose own imports of the DirectX June 2010 runtime are in
+    /// neither the VFS nor Windows 10/11, only in the host's fallback folder.
+    #[test]
+    fn a_staged_targets_directx_imports_come_from_the_fallback_folder() {
+        let root = tmp_root("dx-fallback");
+        let fb = tmp_root("dx-fallback-dir");
+        std::fs::write(fb.join("xinput1_3.dll"), bare_pe()).unwrap();
+        std::fs::write(fb.join("x3daudio1_7.dll"), bare_pe()).unwrap();
+        std::fs::write(fb.join("kernel32.dll"), bare_pe()).unwrap();
+        let mut m = HashMap::new();
+        m.insert("skse64_loader.exe".to_string(), bare_pe());
+        m.insert(
+            "SkyrimSE.exe".to_string(),
+            pe_importing(&["XINPUT1_3.dll", "X3DAudio1_7.dll", "KERNEL32.dll"]),
+        );
+        let src = Fake(m);
+        let staged = stage_launch_into(
+            &src,
+            "skse64_loader.exe",
+            &["SkyrimSE.exe"],
+            &root,
+            std::slice::from_ref(&fb),
+        )
+        .expect("stage");
+        let has = |n: &str| {
+            std::fs::read_dir(staged.dir())
+                .unwrap()
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().eq_ignore_ascii_case(n))
+        };
+        assert!(
+            has("xinput1_3.dll"),
+            "a direct import of xinput1_3 is staged"
+        );
+        assert!(has("x3daudio1_7.dll"), "and of x3daudio1_7");
+        assert!(!has("kernel32.dll"), "a Windows DLL is left to the loader");
+        drop(staged);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&fb);
     }
 
     #[test]

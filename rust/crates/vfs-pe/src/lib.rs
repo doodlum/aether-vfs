@@ -254,6 +254,12 @@ pub fn image_cache_name(vpath: &str, pe: &[u8]) -> String {
     format!("{path_hash:016x}-{content:016x}-{:x}.bin", pe.len())
 }
 
+/// Whether `name` (an import as a PE names it) is part of Windows, so the
+/// staging walk leaves it to the loader. Not the DirectX June 2010 runtime
+/// (`xinput1_3.dll`, `x3daudio1_7.dll`, `xaudio2_7.dll`, the `d3dx*`):
+/// Windows 10 and 11 do not have it, so a game importing one gets it staged
+/// from the VFS or a host's fallback folder, or fails to start. (Wine has
+/// builtins of them, so a Proton launch with neither still starts.)
 pub fn is_system_import_dll(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
     // Not `Path::file_name()`: that treats `\` as a separator only on Windows,
@@ -283,9 +289,7 @@ pub fn is_system_import_dll(name: &str) -> bool {
                 | "d3d11.dll"
                 | "dxgi.dll"
                 | "dinput8.dll"
-                | "xinput1_3.dll"
                 | "xinput1_4.dll"
-                | "x3daudio1_7.dll"
                 | "msvcp140.dll"
                 | "vcruntime140.dll"
                 | "vcruntime140_1.dll"
@@ -388,6 +392,15 @@ mod tests {
         assert!(is_system_import_dll("C:\\Windows\\System32\\kernel32.dll"));
         assert!(is_system_import_dll("System32/kernel32.dll"));
         assert!(!is_system_import_dll("steam_api64.dll"));
+        // Windows 10 and 11 lack the DirectX June 2010 runtime.
+        for redist in [
+            "XINPUT1_3.dll",
+            "X3DAudio1_7.dll",
+            "xaudio2_7.dll",
+            "d3dx11_43.dll",
+        ] {
+            assert!(!is_system_import_dll(redist), "{redist}");
+        }
         assert!(!is_system_import_dll("C:\\game\\steam_api64.dll"));
     }
 
