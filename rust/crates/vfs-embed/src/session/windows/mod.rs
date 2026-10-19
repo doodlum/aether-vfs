@@ -312,6 +312,15 @@ impl Session {
             }
         }
         env_set.extend(opts.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+        // `Activation::Inject`: the shim goes into the target and every child
+        // by remote `LoadLibrary` on the suspended process, never by the
+        // in-memory import patch, the same path a launch under Wine takes.
+        let force_injection = opts.activation == super::Activation::Inject;
+        if force_injection {
+            env_set.push((vfs_env::FORCE_INJECTION.to_string(), "1".to_string()));
+        } else {
+            env_remove.push(vfs_env::FORCE_INJECTION.to_string());
+        }
 
         let ready_timeout = opts.ready_timeout.unwrap_or_else(|| {
             vfs_env::text(vfs_env::READY_TIMEOUT_SECS)
@@ -333,7 +342,7 @@ impl Session {
             detach: true,
             env_set,
             env_remove,
-            force_injection: false,
+            force_injection,
         });
 
         // Children the shim killed because it could not inject them, one

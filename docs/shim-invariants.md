@@ -880,6 +880,20 @@ shim through the import and refuses to start the process if it cannot, so the
 rule holds without the hook. Injecting it as well would load a second shim.
 Every other child is injected as above.
 
+**`Activation::Inject` is remote injection everywhere.** A launch with
+`Activation::Inject` sets `RunConfig::force_injection` for the target and
+`VFS_FORCE_INJECTION=1` in its environment, which every descendant inherits.
+With it, neither the injector nor the child hook tries the in-memory import
+patch: the target and each child are created suspended, get the shim by remote
+`LoadLibrary`, and only then run (or, for a child its caller created suspended,
+are left suspended for the caller to resume). That is the path every launch
+under Wine takes, where the in-memory patch is refused (`UnderWine`), so Proton
+and native Windows run the same activation. It is the one Haskill uses for
+`skse64_loader.exe` and the `SkyrimSE.exe` it creates suspended: SkyrimSE's
+Steam DRM rejects an in-memory-patched image ("Application load error
+3:0000065432"), and SKSE injects its own DLL into the suspended child after the
+shim is in.
+
 **Nothing is skipped on purpose.** The hook does not exempt system processes,
 helpers or anything else; `VFS_INJECT_*` switches (`INJECT_CWD`,
 `INJECT_STEAM_HELPER`) belong to the top-level injector, which starts the Steam

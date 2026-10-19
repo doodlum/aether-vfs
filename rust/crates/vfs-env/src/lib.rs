@@ -179,6 +179,11 @@ pub const SHIM_READY: &str = "VFS_SHIM_READY";
 pub const CHILD_REFUSED_LOG: &str = "VFS_CHILD_REFUSED_LOG";
 /// Appended to the ready file's path to name [`CHILD_REFUSED_LOG`]'s file.
 pub const CHILD_REFUSED_SUFFIX: &str = ".child-refused";
+/// Set (`1`) by a launch with `Activation::Inject`: the shim's process hook
+/// gives every child the shim by remote `LoadLibrary`, as it always does under
+/// Wine, and never tries the in-memory import patch. Every descendant
+/// inherits it.
+pub const FORCE_INJECTION: &str = "VFS_FORCE_INJECTION";
 /// Test-only: force `vfs_shim::director::try_init_from_env` to report a
 /// connect failure, regardless of ring configuration. Exists to exercise a
 /// director-launched process's abort path without a director that is
@@ -641,6 +646,11 @@ pub const ALL: &[Var] = &[
         name: CHILD_REFUSED_LOG,
         kind: Kind::Handshake,
         default: "unset: refusals are only counted",
+    },
+    Var {
+        name: FORCE_INJECTION,
+        kind: Kind::Handshake,
+        default: "unset: children prefer the in-memory import patch",
     },
     Var {
         name: TEST_FUSE_INIT_FAIL,
@@ -1115,6 +1125,7 @@ pub mod handshake {
         SHIM_CONFIG,
         SHIM_READY,
         CHILD_REFUSED_LOG,
+        FORCE_INJECTION,
     ];
 
     /// Every handshake name.

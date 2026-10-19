@@ -34,6 +34,9 @@ pub enum MemPatchRefused {
     /// known-good path under Wine and makes the Linux TPF launch work. So the
     /// in-memory patch is native-Windows only.
     UnderWine,
+    /// The launch asked for remote injection only (`VFS_FORCE_INJECTION`,
+    /// from `Activation::Inject`): not tried.
+    Forced,
     /// The image's version of SteamStub could not be read.
     SteamStubUnknown,
     /// The headers, PEB or descriptors could not be read or parsed.

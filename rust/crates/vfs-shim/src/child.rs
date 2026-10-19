@@ -107,7 +107,13 @@ pub(crate) fn inject_child(
         // the injected thread, which is what refused SkyrimSE.exe — its
         // imports fault before the shim is up. Fall back to injection only
         // when the patch is refused, and record which path.
-        match vfs_inject::patch_imports_in_memory(process) {
+        // `VFS_FORCE_INJECTION`: the launch asked for remote injection only.
+        let patched = if vfs_env::opt_in(vfs_env::FORCE_INJECTION) {
+            Err(vfs_inject::MemPatchRefused::Forced)
+        } else {
+            vfs_inject::patch_imports_in_memory(process)
+        };
+        match patched {
             Ok(()) => {
                 if caller_suspended {
                     // The caller (SKSE) created the child suspended and will
