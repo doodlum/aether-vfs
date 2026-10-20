@@ -215,12 +215,93 @@
   (dotimes [s slots]
     (put-i32 seg (+ p/ring-header-size (* (long s) (long stride))) p/st-free)))
 
+;; --- warm-up -------------------------------------------------------------------
+;;
+;; A game's startup is the ring's busiest moment and the JVM's coldest: the
+;; first few thousand requests would run before the JIT has compiled the
+;; handlers. So before serving, the director drives synthetic requests through
+;; the same code (serve-pass, dispatch, every read-side handler) on a private
+;; copy of the ring, over paths from the real tree. Each reply is checked, so
+;; the warm-up is also a self-test of the index.
+
+(defn- request!
+  "Writes a request into `slot` of a private ring and marks it SUBMITTED, as a
+  client would."
+  [^MemorySegment seg stride slot op flags ^bytes payload]
+  (let [base (+ p/ring-header-size (* (long slot) (long stride)))]
+    (put-i32 seg (+ base p/sh-opcode) op)
+    (put-i32 seg (+ base p/sh-flags) flags)
+    (put-i32 seg (+ base p/sh-payload-len) (alength payload))
+    (MemorySegment/copy payload (int 0) seg ValueLayout/JAVA_BYTE (+ base p/slot-header-size) (alength payload))
+    (Native/setRelease seg (+ base p/sh-state) p/st-submitted)))
+
+(defn- le-bytes ^bytes [& fields]
+  (let [out (java.io.ByteArrayOutputStream.)]
+    (doseq [[kind v] (partition 2 fields)]
+      (case kind
+        :u32  (let [b (.order (java.nio.ByteBuffer/allocate 4) java.nio.ByteOrder/LITTLE_ENDIAN)]
+                (.write out (.array (.putInt b (unchecked-int v)))))
+        :u64  (let [b (.order (java.nio.ByteBuffer/allocate 8) java.nio.ByteOrder/LITTLE_ENDIAN)]
+                (.write out (.array (.putLong b (long v)))))
+        :utf8 (.write out (.getBytes ^String v StandardCharsets/UTF_8))))
+    (.toByteArray out)))
+
+(defn warm-up!
+  "Runs `rounds` rounds of synthetic requests (8 per round; 3 when the tree
+  has no files) through the server's code on a private ring over `tree`.
+  Returns {:requests :ms}; throws if a reply is wrong."
+  [tree {:keys [rounds] :or {rounds 3000}}]
+  (with-open [arena (java.lang.foreign.Arena/ofConfined)]
+    (let [g      (p/geometry)
+          seg    (.allocate arena (long (:map-bytes g)) 64)
+          stride (long (:stride g))
+          _      (init-header! seg g)
+          r      (Ring. seg stride (:cap g) (:arena-offset g) (:bank-size g)
+                        tree (ConcurrentHashMap.) (AtomicLong.)
+                        0 0 0 (AtomicBoolean.) (AtomicLong.))
+          {:keys [files dirs]} (tree/sample tree 64)
+          slot   (long-array 1)
+          n      (long-array 1)
+          call   (fn [op flags ^bytes payload]
+                   (let [s (rem (aget slot 0) p/slot-count)
+                         base (+ p/ring-header-size (* s stride))]
+                     (aset slot 0 (inc (aget slot 0)))
+                     (aset n 0 (inc (aget n 0)))
+                     (request! seg stride s op flags payload)
+                     (when-not (= 1 (serve-pass r))
+                       (throw (ex-info "warm-up: request not served" {:op op})))
+                     (let [status (.get seg ValueLayout/JAVA_INT_UNALIGNED (+ base p/sh-status))
+                           fh     (.get seg ValueLayout/JAVA_LONG_UNALIGNED (+ base p/slot-header-size))]
+                       (Native/setRelease seg (+ base p/sh-state) p/st-free)
+                       [status fh])))
+          ok!    (fn [[status fh] what]
+                   (when-not (zero? (long status))
+                     (throw (ex-info (str "warm-up: " what " failed with status " status) {})))
+                   fh)
+          t0     (System/nanoTime)]
+      (dotimes [i rounds]
+        (let [^String d (nth dirs (rem i (count dirs)))]       ; there's always the root
+          (ok! (call p/op-heartbeat 0 (byte-array 0)) "heartbeat")
+          (ok! (call p/op-getattr 0 (le-bytes :u32 0 :utf8 (str d "/no-such-file"))) "getattr (miss)")
+          (ok! (call p/op-readdir 0 (le-bytes :u32 0 :utf8 d)) "readdir")
+          (when-let [^String f (when (seq files) (nth files (rem i (count files))))]
+            (ok! (call p/op-getattr 0 (le-bytes :u32 0 :utf8 f)) "getattr")
+            (let [fh (ok! (call p/op-open 1 (le-bytes :u32 0 :u32 1 :utf8 f)) "open")]
+            (ok! (call p/op-read 0 (le-bytes :u64 fh :u64 0 :u32 4096 :u32 0)) "read")
+            (ok! (call p/op-read p/flag-read-bulk (le-bytes :u64 fh :u64 0 :u32 4096 :u32 0)) "bulk read")
+            (ok! (call p/op-close 0 (le-bytes :u64 fh)) "close")))))
+      {:requests (aget n 0) :ms (/ (- (System/nanoTime) t0) 1e6)})))
+
 (defn start
   "Creates the section `name` (e.g. \"Local\\\\vfs_ring_…\") and its events,
   and serves `tree` on `workers` platform threads. Returns a server map; the
-  shim needs :name and :map-bytes (VFS_RING_SECTION / VFS_RING_BYTES)."
-  [tree {:keys [name workers spin-us] :or {workers 16 spin-us 400}}]
-  (let [g       (p/geometry)
+  shim needs :name and :map-bytes (VFS_RING_SECTION / VFS_RING_BYTES).
+
+  First runs `warm-up` rounds of synthetic requests (see warm-up!; 0 skips
+  it), so the handlers are compiled before the first real request."
+  [tree {:keys [name workers spin-us warm-up] :or {workers 16 spin-us 400 warm-up 3000}}]
+  (let [warmed  (when (pos? (long warm-up)) (warm-up! tree {:rounds warm-up}))
+        g       (p/geometry)
         section (Native/createSection name (:map-bytes g))
         seg     (.view section)
         _       (init-header! seg g)
@@ -234,7 +315,7 @@
                        (doto (Thread. ^Runnable #(worker ring) (str "ring-worker-" i))
                          (.setDaemon true)
                          (.start))))]
-    (merge g {:name name :ring ring :section section :threads threads
+    (merge g {:name name :ring ring :section section :threads threads :warm-up warmed
               :server-event (str name "_srv") :client-event (str name "_cli")})))
 
 (defn stop [{:keys [^Ring ring ^Native$Section section threads]}]

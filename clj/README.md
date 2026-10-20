@@ -20,7 +20,7 @@ Rust injector), writes.
 | `src/aether/director/proto.clj` | The wire contract: header and slot layout, geometry, opcodes, statuses. |
 | `src/aether/director/path.clj` | `fold` (exactly Rust's `char::to_lowercase`, per code point) and vpath normalization. |
 | `src/aether/director/tree.clj` | The content index: folded vpath to file or directory, every directory's READDIR reply encoded once. The layering a Rust provider stack does per request has already happened by the time a tree is built. |
-| `src/aether/director/ring.clj` | Section, header, events, worker threads, the opcode handlers. Requests are read in place and replies written over them; bulk reads go straight into the slot's arena bank. |
+| `src/aether/director/ring.clj` | Section, header, events, worker threads, the opcode handlers. Requests are read in place and replies written over them; bulk reads go straight into the slot's arena bank. Also the warm-up (below). |
 | `src/aether/director/main.clj` | Serves the benchmark fixture: prints `SECTION <name> <map_bytes>`, serves until stdin closes. |
 
 Read-only so far: HEARTBEAT, GETATTR, READDIR, OPEN, READ (inline and bulk),
@@ -65,13 +65,24 @@ then run it with `-XX:AOTCache=target/director.aot`.
 Neither server had a stall over 1 ms. Max latencies of ~300–500 µs are about
 the same for both.
 
-**Cold**, the first 2,000 GETATTRs after start:
+**Cold**, the first 2,000 requests after start (GETATTR, then 4 KiB READ):
 
-| | p50 | p90 | p99 | max |
-|---|---|---|---|---|
-| Rust | 1.4 µs | 2.0 µs | 4–5 µs | 74–86 µs |
-| Clojure (jar) | 3.3 µs | 36 µs | 108 µs | 0.53–0.91 ms |
-| Clojure (jar + AOT cache) | **1.9 µs** | **12 µs** | 51–77 µs | 0.34–0.47 ms |
+| | GETATTR p50 / p90 / max | READ 4 KiB p50 / p90 |
+|---|---|---|
+| Rust | 1.4 / 2.0 / 74–86 µs | 2.6 / 3.1–3.4 µs |
+| Clojure (jar) | 3.3 / 36 / 530–910 µs | 4.9–5.9 / 9–12 µs |
+| Clojure (jar + AOT cache) | 1.9 / 12 / 340–470 µs | 3.4–3.6 / 6–7 µs |
+| Clojure (jar + warm-up) | **1.0–1.5 / 1.9–2.7 / 70–240 µs** | **2.2–2.9 / 4–6 µs** |
+| Clojure (jar + warm-up + AOT cache) | **0.8–1.2 / 1.2–1.9 / 90–150 µs** | **1.6 / 2.0–2.1 µs** |
+
+**The warm-up** (`ring/warm-up!`, run by `ring/start` unless `:warm-up 0`)
+drives 3,000 rounds of synthetic requests through the real code before the
+section exists: the slot scan and CAS, dispatch, and every read-side handler,
+on a private copy of the ring, over paths from the real tree. That is 24,000
+requests in 120–170 ms, inside the ~0.7 s that staging and injection take
+anyway. Each reply is checked, so it's also a self-test of the index. With
+it, a cold Clojure director answers its first requests about as fast as the
+Rust one.
 
 **What this does and doesn't show:**
 - **It isn't a language comparison alone.** Warm, the Clojure director is faster
@@ -79,12 +90,10 @@ the same for both.
   the Rust director's provider stack (a mutex and a lookup per layer, a `Vec`
   per reply, a global stats mutex). It does show that the ring mechanics
   (atomics, events, arena copies) cost no more on the JVM.
-- **Cold is the JVM's real cost.** The first few thousand requests run before
-  the JIT has compiled the handlers. That is exactly a game's startup. The AOT
-  cache, trained on this workload, brings p50 close to Rust; the tail stays
-  higher. The next mitigation is a warm-up pass: run synthetic requests
-  through the handlers while launch is staging and injecting (~0.7 s that
-  happens anyway).
+- **Cold was the JVM's real cost, and the warm-up removes it.** Without it,
+  the first few thousand requests (a game's startup, exactly) ran before the
+  JIT had compiled the handlers. The warm-up compiles them first; the AOT
+  cache then trims what's left.
 - **The content is in memory.** A real director reads disk and Stored zips;
   positional reads (`FileChannel.read(dst, pos)`) or mapped zips, and no
   provider-wide lock, are the plan there.

@@ -61,3 +61,11 @@
     (doseq [[dir ^java.util.Map m] children]
       (.put nodes dir (Dir. (encode-listing (vals m)))))
     (Tree. nodes)))
+
+(defn sample
+  "Up to `n` file and `n` directory vpaths (folded), for warm-up requests."
+  [^Tree t n]
+  (let [nodes (.entrySet ^HashMap (.-nodes t))
+        pick  (fn [cls] (->> nodes (filter #(instance? cls (.getValue ^java.util.Map$Entry %)))
+                             (map #(.getKey ^java.util.Map$Entry %)) (take n) vec))]
+    {:files (pick File) :dirs (pick Dir)}))
