@@ -26,6 +26,35 @@ Rust injector), writes.
 Read-only so far: HEARTBEAT, GETATTR, READDIR, OPEN, READ (inline and bulk),
 CLOSE. Write opcodes answer `ST_READ_ONLY`.
 
+## Launching a game
+
+`aether.director.run` serves layered content (Stored zips and folders, later
+wins), stages the launch image with its import closure, and starts it through
+rust/'s `vfs-injector` with **remote-thread injection** (`VFS_FORCE_INJECTION`):
+the shim is loaded into the suspended process by full path. The injector's
+other mode patches the image's import table in memory, and a self-verifying
+SteamStub wrapper (SkyrimSE.exe) refuses to run under it ("Application load
+error 3:0000065432").
+
+Skyrim SE from the Stored zip, with the profile folders (INIs, plugins.txt)
+served from a clean copy as roots 1 and 2, so nothing real is read or changed:
+
+```bash
+clojure -M:run --session 'C:\tmp\skyrim-clj' --natives <rust/target/release> \
+  --zip 'C:\tmp\skyrimse.zip' --layer 'C:\tmp\skyrim-data\dx-redist' \
+  --layer 'C:\tmp\skyrim-data\overrides\root-0' \
+  --stage SkyrimSE.exe --fallback 'C:\tmp\skyrim-data\dx-redist' \
+  --root '1=C:\Users\<you>\Documents\My Games\Skyrim Special Edition' --root-layer '1=<profile>\mygames' \
+  --root '2=C:\Users\<you>\AppData\Local\Skyrim Special Edition' --root-layer '2=<profile>\localappdata'
+```
+
+Result (2026-10-19): the game window in 4.1 s from the `clojure` command
+(Clojure CLI and JVM start included; the director itself is serving 0.32 s
+after its JVM starts), 9,383 requests, and a stable game. `--trace` counts
+requests by op, outcome and path and prints the top 25 at exit: that is how a
+stale 1,907-plugin Vortex `plugins.txt` in the real profile was found behind
+3.2 million failed opens.
+
 ## Running
 
 ```bash
