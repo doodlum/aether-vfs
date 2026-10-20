@@ -19,6 +19,7 @@ mod hook_dir_write_open;
 mod hook_direnum;
 mod hook_enum_parity;
 mod hook_handle_relative_unseen;
+mod hook_handle_times;
 mod hook_identity;
 mod hook_relative_paths;
 mod hook_stat_agreement;

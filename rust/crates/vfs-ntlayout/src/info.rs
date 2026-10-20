@@ -140,13 +140,25 @@ pub fn by_name_info(class_raw: u32, buf: &mut [u8], is_dir: bool, size: u64) -> 
     Some(need)
 }
 
-/// The fixed prefix of `FILE_ALL_INFORMATION` (100 bytes), the trailing name left empty:
-/// attributes (including DIRECTORY), size and the Standard `Directory` flag, `IndexNumber` at 64
-/// and `CurrentByteOffset` at 80. The rest is zeroed. Times stay zero.
-pub fn put_all_prefix(b: &mut [u8], is_dir: bool, size: u64, index_number: i64, position: i64) {
+/// The fixed prefix of `FILE_ALL_INFORMATION` (100 bytes), the trailing name left empty: the
+/// four times, attributes (including DIRECTORY), size and the Standard `Directory` flag,
+/// `IndexNumber` at 64 and `CurrentByteOffset` at 80. The rest is zeroed.
+///
+/// `time` must be what `FILE_BASIC_INFORMATION` reports for the same file: this is what
+/// `GetFileInformationByHandle` reads, and a caller that compares its times with
+/// `GetFileAttributesEx`'s (the .NET Framework binder does, before it accepts a file) sees a
+/// file whose times disagree as one that changed under it.
+pub fn put_all_prefix(
+    b: &mut [u8],
+    time: i64,
+    is_dir: bool,
+    size: u64,
+    index_number: i64,
+    position: i64,
+) {
     let b = &mut b[..ALL_PREFIX_LEN];
     b.fill(0);
-    put_basic(&mut b[..BASIC_LEN], 0, attributes(is_dir));
+    put_basic(&mut b[..BASIC_LEN], time, attributes(is_dir));
     put_standard(&mut b[BASIC_LEN..BASIC_LEN + STANDARD_LEN], size, is_dir);
     put_i64(b, 64, index_number);
     put_i64(b, 80, position);
@@ -382,9 +394,15 @@ mod tests {
     #[test]
     fn the_all_prefix_places_basic_standard_index_and_position() {
         let mut b = [0xFFu8; 100];
-        put_all_prefix(&mut b, true, 4096, 99, 12);
+        put_all_prefix(&mut b, 0x01D0_0000_0000_0000, true, 4096, 99, 12);
         assert_eq!(u32_at(&b, 32), FILE_ATTRIBUTE_DIRECTORY); // Basic.FileAttributes
-        assert_eq!(i64_at(&b, 0), 0); // Basic times stay zero
+        for off in [0, 8, 16, 24] {
+            assert_eq!(
+                i64_at(&b, off),
+                0x01D0_0000_0000_0000,
+                "Basic time at {off}"
+            );
+        }
         assert_eq!(i64_at(&b, 40), 4096); // Standard.AllocationSize
         assert_eq!(b[40 + 21], 1); // Standard.Directory
         assert_eq!(i64_at(&b, 64), 99); // Internal.IndexNumber

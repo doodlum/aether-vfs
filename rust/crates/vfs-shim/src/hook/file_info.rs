@@ -239,8 +239,9 @@ unsafe fn fuse_query_information(
         }
         FILE_ALL_INFORMATION => {
             // GetFileInformationByHandle (Rust `metadata`) issues this. Fill the
-            // fixed prefix callers read — attributes (incl. DIRECTORY), size, the
-            // Standard.Directory flag — and leave the trailing name empty. Prefix
+            // fixed prefix callers read — the times (the same ones FileBasicInformation
+            // reports: the .NET binder compares the two), attributes (incl. DIRECTORY),
+            // size, the Standard.Directory flag — and leave the trailing name empty. Prefix
             // layout: Basic 40 | Standard 24 | Internal 8 | Ea 4 | Access 4 |
             // Position 8 | Mode 4 | Alignment 4 | Name 4 = 100.
             if (length as usize) < ALL_PREFIX_LEN {
@@ -248,7 +249,14 @@ unsafe fn fuse_query_information(
             }
             // SAFETY: `info` is non-null and `length` covers the prefix (checked above).
             let buf = unsafe { caller_buf(info, ALL_PREFIX_LEN) };
-            put_all_prefix(buf, is_dir, size, synth_file_id(handle), pos as i64);
+            put_all_prefix(
+                buf,
+                SYNTH_FILETIME,
+                is_dir,
+                size,
+                synth_file_id(handle),
+                pos as i64,
+            );
             // SAFETY: same NT-pointer contract as this fn (hook/mod.rs).
             unsafe { crate::ntbuf::iosb_set(iosb, STATUS_SUCCESS, ALL_PREFIX_LEN) };
             STATUS_SUCCESS
