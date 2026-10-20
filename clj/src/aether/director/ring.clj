@@ -34,32 +34,56 @@
 
 (deftype Ring [^MemorySegment seg ^long stride ^long cap
                ^long arena-offset ^long bank-size
-               tree                                 ; aether.director.tree.Tree
+               ^objects roots                       ; root id -> aether.director.tree.Tree (or nil)
                ^ConcurrentHashMap handles ^AtomicLong next-fh
                ^long srv-event ^long cli-event ^long spin-ns
                ^AtomicBoolean stop ^AtomicLong served
-               stage-exec])                         ; (fn [vpath] real-path-or-nil), or nil
+               stage-exec                           ; (fn [vpath] real-path-or-nil), or nil
+               ^ConcurrentHashMap trace])           ; "op status path" -> LongAdder, or nil (off)
 
 ;; A handler gets the slot's payload offset and request length, writes its
 ;; reply at the payload offset, and returns (status << 32) | reply-length.
 (defmacro ^:private reply [status len] `(bit-or (bit-shift-left (long ~status) 32) (long ~len)))
+
+(def ^:const max-roots 16)
+
+(defn- tree-of
+  "The tree serving root `root`, or nil for a root this director doesn't serve."
+  [^Ring r ^long root]
+  (let [^objects roots (.-roots r)]
+    (when (< root (alength roots)) (aget roots root))))
+
+(defn- roots-array ^objects [root-trees]
+  (let [a (object-array max-roots)]
+    (doseq [[id t] root-trees] (aset a (int id) t))
+    a))
 
 (defn- path-req
   "The vpath of a `root:u32 | path` request starting at `off`, normalized and
   folded; nil for a root this tree doesn't serve or a path that escapes it."
   [^Ring r ^long off ^long len]
   (let [^MemorySegment seg (.-seg r)]
-    (when (and (>= len 4) (zero? (u32 seg off)))
+    (when (and (>= len 4) (tree-of r (u32 seg off)))
       (let [n (- len 4)
             b (byte-array n)]
         (MemorySegment/copy seg ValueLayout/JAVA_BYTE (+ off 4) b (int 0) (int n))
         (let [s (String. b StandardCharsets/UTF_8)]
           (some-> (path/normalize s) path/fold))))))
 
+(defn- trace!
+  "Counts one request by op, outcome and path, when tracing is on."
+  [^Ring r op status vp]
+  (when-let [^ConcurrentHashMap t (.-trace r)]
+    (.increment ^java.util.concurrent.atomic.LongAdder
+                (.computeIfAbsent t (str op " " status " " vp)
+                                  (reify java.util.function.Function
+                                    (apply [_ _] (java.util.concurrent.atomic.LongAdder.)))))))
+
 (defn- op-getattr ^long [^Ring r ^long off ^long len]
   (let [^MemorySegment seg (.-seg r)
         vp   (path-req r off len)
-        node (when vp (tree/lookup (.-tree r) vp))]
+        node (when vp (tree/lookup (tree-of r (u32 seg off)) vp))]
+    (trace! r "getattr" (if node "found" "missing") vp)
     ;; not found is OK with found=0, not an error status
     (put-u8 seg off (if node 1 0))
     (put-u8 seg (+ off 1) (if (instance? Dir node) 1 0))
@@ -69,7 +93,8 @@
 
 (defn- op-readdir ^long [^Ring r ^long off ^long len]
   (let [vp   (path-req r off len)
-        node (when vp (tree/lookup (.-tree r) vp))]
+        node (when vp (tree/lookup (tree-of r (u32 (.-seg r) off)) vp))]
+    (trace! r "readdir" (if node "found" "missing") vp)
     (cond
       (instance? Dir node)
       (let [^bytes b (.-listing ^Dir node)]
@@ -94,8 +119,10 @@
           b      (byte-array n)
           _      (MemorySegment/copy seg ValueLayout/JAVA_BYTE (+ off 8) b (int 0) (int n))
           raw    (String. b StandardCharsets/UTF_8)
-          node   (when (and (zero? (u32 seg off)) (wellformed? raw))
-                   (some->> (path/normalize raw) path/fold (tree/lookup (.-tree r))))]
+          t      (tree-of r (u32 seg off))
+          node   (when (and t (wellformed? raw))
+                   (some->> (path/normalize raw) path/fold (tree/lookup t)))]
+      (trace! r "open" (cond (nil? node) "missing" (not (zero? (bit-and flags p/open-write))) "write" :else "ok") raw)
       (cond
         (not (wellformed? raw))                       (reply p/bad-request 0)
         (nil? node)                                   (reply p/not-found 0)
@@ -177,11 +204,11 @@
   from `skip` on, joined by `/` (for GetFinalPathNameByHandle)."
   ^long [^Ring r ^long off ^long len]
   (let [^MemorySegment seg (.-seg r)]
-    (if (or (< len 8) (not (zero? (u32 seg off))))
+    (if (or (< len 8) (nil? (tree-of r (u32 seg off))))
       (reply p/not-found 0)
       (let [skip    (u32 seg (+ off 4))
             vp      (some-> (path/normalize (utf8-at seg (+ off 8) (- len 8))) path/fold)
-            spelled (when vp (tree/spelling (.-tree r) vp))]
+            spelled (when vp (tree/spelling (tree-of r (u32 seg off)) vp))]
         (if (nil? spelled)
           (reply p/not-found 0)
           (let [parts (if (= "" spelled) [] (vec (.split spelled "/")))]
@@ -329,8 +356,8 @@
           stride (long (:stride g))
           _      (init-header! seg g 1)
           r      (Ring. seg stride (:cap g) (:arena-offset g) (:bank-size g)
-                        tree (ConcurrentHashMap.) (AtomicLong.)
-                        0 0 0 (AtomicBoolean.) (AtomicLong.) nil)
+                        (roots-array {0 tree}) (ConcurrentHashMap.) (AtomicLong.)
+                        0 0 0 (AtomicBoolean.) (AtomicLong.) nil nil)
           {:keys [files dirs]} (tree/sample tree 64)
           slot   (long-array 1)
           n      (long-array 1)
@@ -372,8 +399,9 @@
 
   First runs `warm-up` rounds of synthetic requests (see warm-up!; 0 skips
   it), so the handlers are compiled before the first real request.
-  `stage-exec` answers STAGE_EXEC: (fn [vpath] real-path-or-nil)."
-  [tree {:keys [name workers spin-us warm-up stage-exec] :or {workers 16 spin-us 400 warm-up 3000}}]
+  `stage-exec` answers STAGE_EXEC: (fn [vpath] real-path-or-nil). `roots`
+  serves more roots than root 0: {root-id tree}, ids below 16."
+  [tree {:keys [name workers spin-us warm-up stage-exec trace roots] :or {workers 16 spin-us 400 warm-up 3000}}]
   (let [warmed  (when (pos? (long warm-up)) (warm-up! tree {:rounds warm-up}))
         g       (p/geometry)
         section (Native/createSection name (:map-bytes g))
@@ -382,9 +410,10 @@
         srv     (Native/createEvent (str name "_srv"))
         cli     (Native/createEvent (str name "_cli"))
         ring    (Ring. seg (:stride g) (:cap g) (:arena-offset g) (:bank-size g)
-                       tree (ConcurrentHashMap.) (AtomicLong.)
+                       (roots-array (assoc roots 0 tree)) (ConcurrentHashMap.) (AtomicLong.)
                        srv cli (* 1000 (long spin-us))
-                       (AtomicBoolean.) (AtomicLong.) stage-exec)
+                       (AtomicBoolean.) (AtomicLong.) stage-exec
+                       (when trace (ConcurrentHashMap.)))
         threads (vec (for [i (range workers)]
                        (doto (Thread. ^Runnable #(worker ring) (str "ring-worker-" i))
                          (.setDaemon true)
@@ -398,6 +427,12 @@
   (Native/closeHandle (.-srv-event ring))
   (Native/closeHandle (.-cli-event ring))
   (.close section))
+
+(defn trace-top
+  "The `n` most frequent traced requests: [[\"op outcome path\" count] …]."
+  [{:keys [^Ring ring]} n]
+  (when-let [^ConcurrentHashMap t (.-trace ring)]
+    (->> t (map (fn [[k ^java.util.concurrent.atomic.LongAdder v]] [k (.sum v)])) (sort-by (comp - second)) (take n))))
 
 (defn stats [{:keys [^Ring ring]}]
   {:served (.get ^AtomicLong (.-served ring))

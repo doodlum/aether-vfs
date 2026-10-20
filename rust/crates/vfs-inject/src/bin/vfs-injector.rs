@@ -78,7 +78,10 @@ fn main() {
         env_remove: Vec::new(),
         virtual_image: None,
         virtual_cwd: None,
-        force_injection: false,
+        // Remote-thread injection when the host asks for it: the in-memory
+        // import patch edits the image's headers, which a SteamStub wrapper
+        // that verifies itself (SkyrimSE.exe) refuses to run under.
+        force_injection: vfs_env::opt_in(vfs_env::FORCE_INJECTION),
     })
     .unwrap_or_else(|e| {
         eprintln!("[vfs-injector] inject error: {e:?}");

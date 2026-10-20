@@ -46,8 +46,9 @@
 (defn session
   "Creates the session's directories under `dir`: root/ (the managed root,
   empty), overlay/ and state/, and writes shim.cfg and fuse.cfg for `server`
-  (from ring/start). Returns the session map launch takes."
-  [server dir]
+  (from ring/start). Returns the session map launch takes. `roots` declares
+  the roots beyond root 0 to the shim: {id path-the-program-uses}."
+  [server dir & [{:keys [roots]}]]
   (let [[root state] (for [d ["root" "state"]] (doto (io/file dir d) (.mkdirs)))
         root-s  (canonical root)
         shim    (io/file state "shim.cfg")
@@ -67,7 +68,8 @@
            "VFS_SERVER_EV"        server-event
            "VFS_CLIENT_EV"        client-event
            "VFS_FUSE_CFG"         (canonical fuse)
-           "VFS_VIRTUAL_DIR"      root-s}}))
+           "VFS_VIRTUAL_DIR"      root-s
+           "VFS_VIRTUAL_ROOTS"    (str/join ";" (for [[id at] (sort roots)] (str id "=" at)))}}))
 
 (defn launch
   "Runs `exe` (a real file) with `args` under `session`, via the injector at
@@ -95,6 +97,12 @@
       (.remove "VFS_REGISTRY")
       (.putAll ^java.util.Map (:env session))
       (.put "VFS_INJECT_CWD" (:root session))
+      ;; Remote-thread injection, always: the shim is loaded into the
+      ;; suspended process by full path. (The injector's alternative patches
+      ;; the image's import table in memory, which a self-verifying SteamStub
+      ;; wrapper such as SkyrimSE.exe refuses: "Application load error
+      ;; 3:0000065432".)
+      (.put "VFS_FORCE_INJECTION" "1")
       ;; The shim is activated by patching the target's imports in memory, by
       ;; DLL name: the loader must find vfs_shim_dll.dll, and a staged EXE's
       ;; folder doesn't hold it.
