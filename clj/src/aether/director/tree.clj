@@ -1,88 +1,116 @@
 (ns aether.director.tree
-  "The content the director serves, indexed for the ring: folded vpath ->
-  file or directory. This replaces the Rust director's provider stack (mount
-  graph, overlay, layered): the layering has already happened (in Cairn, the
-  projection) by the time a tree is built, so serving is one lookup.
+  "An index provider: content that never changes while served (Stored zip
+  entries, memory-mapped files), indexed once by folded vpath. Serving is a
+  lookup; a directory's READDIR reply is encoded once, here; a read is one
+  copy from the content's MemorySegment into the arena.
 
-  A directory's READDIR reply is encoded once, here, and copied per request."
-  (:require [aether.director.path :as path])
-  (:import (java.io ByteArrayOutputStream)
+  Read-only: every mutation answers ST_READ_ONLY. Put a writable layer over
+  it (aether.director.compose/overlay) for writes."
+  (:require [aether.director.path :as path]
+            [aether.director.proto :as p]
+            [aether.director.provider :as prov])
+  (:import (aether.director.provider Entry Stat)
            (java.lang.foreign Arena MemorySegment)
            (java.nio.channels FileChannel FileChannel$MapMode)
            (java.nio.file Files LinkOption OpenOption Path StandardOpenOption)
-           (java.nio ByteBuffer ByteOrder)
-           (java.nio.charset StandardCharsets)
            (java.util HashMap)))
 
-(deftype File [^long size ^MemorySegment data])
-(deftype Dir [^bytes listing])              ; the encoded READDIR reply
+(deftype File [^Stat stat ^MemorySegment data])
+(deftype Dir [^bytes listing entries])          ; the encoded READDIR reply, and its Entries
 
-(deftype Tree [^HashMap nodes                ; folded vpath -> File | Dir; the root is ""
-               ^HashMap spellings])         ; folded vpath -> the path as the content spells it
+(deftype SegmentHandle [^Stat stat ^MemorySegment data]
+  prov/Handle
+  (handle-stat [_] stat)
+  (immutable? [_] true)
+  (read-into [_ dst dst-off pos len]
+    (let [n (max 0 (min (long len) (- (.-size stat) (long pos))))]
+      (when (pos? n) (MemorySegment/copy data (long pos) ^MemorySegment dst (long dst-off) n))
+      n))
+  (write-from [_ _ _ _ _] p/read-only)
+  (truncate! [_ _] p/read-only)
+  (close! [_] nil))
 
-(defn lookup [^Tree t ^String vpath] (.get ^HashMap (.-nodes t) vpath))
+(deftype DirHandle []
+  prov/Handle
+  (handle-stat [_] prov/dir-stat)
+  (immutable? [_] true)
+  (read-into [_ _ _ _ _] p/is-dir)
+  (write-from [_ _ _ _ _] p/is-dir)
+  (truncate! [_ _] p/is-dir)
+  (close! [_] nil))
 
-(defn spelling
-  "`vpath` (folded) as the content spells it, or nil."
-  ^String [^Tree t ^String vpath]
-  (.get ^HashMap (.-spellings t) vpath))
+(def dir-handle (DirHandle.))
 
-(defn- encode-listing
-  "count:u32, then per entry name_len:u32 name is_dir:u8 size:u64 mtime:i64."
-  ^bytes [entries]
-  (let [out (ByteArrayOutputStream.)
-        le  (fn [^long n ^long v]
-              (let [b (.order (ByteBuffer/allocate n) ByteOrder/LITTLE_ENDIAN)]
-                (if (= n 4) (.putInt b (int v)) (.putLong b v))
-                (.write out (.array b))))]
-    (le 4 (count entries))
-    (doseq [{:keys [^String name dir? size]} entries
-            :let [nb (.getBytes name StandardCharsets/UTF_8)]]
-      (le 4 (alength nb))
-      (.write out nb)
-      (.write out (int (if dir? 1 0)))
-      (le 8 size)
-      (le 8 0))
-    (.toByteArray out)))
+(deftype Tree [^HashMap nodes                   ; folded vpath -> File | Dir; the root is ""
+               ^HashMap spellings]              ; folded vpath -> the path as the content spells it
+  prov/Provider
+  (stat [_ vp]
+    (let [n (.get nodes vp)]
+      (cond (instance? File n) (.-stat ^File n)
+            (instance? Dir n)  prov/dir-stat)))
+  (list-dir [_ vp]
+    (let [n (.get nodes vp)]
+      (cond (instance? Dir n) (.-entries ^Dir n)
+            (nil? n)          nil
+            :else             p/not-a-directory)))
+  (spelling [_ vp] (.get spellings vp))
+  (open [_ vp flags]
+    (let [n (.get nodes (path/fold vp))]
+      (cond
+        (not (zero? (bit-and (long flags) (bit-or p/open-write p/open-create p/open-trunc p/open-append))))
+        (if (and (nil? n) (zero? (bit-and (long flags) p/open-create))) p/not-found p/read-only)
+        (instance? File n) (SegmentHandle. (.-stat ^File n) (.-data ^File n))
+        (instance? Dir n)  dir-handle
+        :else              p/not-found)))
+  (mkdir! [_ vp] (if (.containsKey nodes (path/fold vp)) p/exists p/read-only))
+  (delete! [_ vp] (if (.containsKey nodes (path/fold vp)) p/read-only p/not-found))
+  (rename! [_ from _] (if (.containsKey nodes (path/fold from)) p/read-only p/not-found))
+
+  prov/Listing
+  (listing-bytes [_ vp]
+    (let [n (.get nodes vp)] (when (instance? Dir n) (.-listing ^Dir n)))))
+
+(defn lookup
+  "The File or Dir at folded `vpath`, or nil."
+  [^Tree t ^String vpath] (.get ^HashMap (.-nodes t) vpath))
 
 (defn build
-  "A tree from `files`, a seq of [path ^MemorySegment data] with paths as the
-  game spells them (`/`, any case). Parent directories are implied. Entries
-  keep their spelling; lookups go by folded path."
+  "An index of `files`, a seq of [path ^MemorySegment data] with paths as the
+  content spells them (`/`, any case). Parent directories are implied. A later
+  file at the same path (ignoring case) wins; the first spelling of a path is
+  the one kept."
   [files]
-  (let [;; folded dir -> {folded child name -> entry}, in insertion order
-        children (HashMap.)
-        add!     (fn [^String dir entry]
+  (let [children (HashMap.)                     ; folded dir -> {folded name -> Entry}, in order
+        add!     (fn [^String dir ^String folded ^Entry e replace?]
                    (let [^java.util.Map m (or (.get children dir)
                                               (let [m (java.util.LinkedHashMap.)] (.put children dir m) m))]
-                     (.putIfAbsent m (path/fold (:name entry)) entry)))
+                     (if-let [^Entry old (.get m folded)]
+                       (when replace? (.put m folded (Entry. (.-name old) (.-stat e))))
+                       (.put m folded e))))
         nodes    (HashMap.)
         spelled  (HashMap.)]
     (.put children "" (java.util.LinkedHashMap.))
     (.put spelled "" "")
     (doseq [[p ^MemorySegment data] files
-            :let [p (path/normalize p)]]
-      (.put nodes (path/fold p) (File. (.byteSize data) data))
-      (loop [q p]                               ; first spelling of each path wins, like listings
+            :let [p  (path/normalize p)
+                  fp (path/fold p)
+                  st (Stat. false (.byteSize data) 0)]]
+      (.put nodes fp (File. st data))
+      (loop [q p]
         (when-not (= "" q)
           (.putIfAbsent spelled (path/fold q) q)
           (recur (path/parent q))))
-      (add! (path/fold (path/parent p)) {:name (path/file-name p) :size (.byteSize data)})
+      (add! (path/fold (path/parent p)) (path/fold (path/file-name p)) (Entry. (path/file-name p) st) true)
       (loop [d (path/parent p)]
         (when-not (= "" d)
-          (add! (path/fold (path/parent d)) {:name (path/file-name d) :dir? true :size 0})
+          (add! (path/fold (path/parent d)) (path/fold (path/file-name d)) (Entry. (path/file-name d) prov/dir-stat) false)
           (recur (path/parent d)))))
-    (doseq [[dir ^java.util.Map m] children]
-      (.put nodes dir (Dir. (encode-listing (vals m)))))
+    (doseq [[dir ^java.util.Map m] children
+            :let [entries (vec (vals m))]]
+      (.put nodes dir (Dir. (prov/encode-listing entries) entries)))
     (Tree. nodes spelled)))
 
-(defn sample
-  "Up to `n` file and `n` directory vpaths (folded), for warm-up requests."
-  [^Tree t n]
-  (let [nodes (.entrySet ^HashMap (.-nodes t))
-        pick  (fn [cls] (->> nodes (filter #(instance? cls (.getValue ^java.util.Map$Entry %)))
-                             (map #(.getKey ^java.util.Map$Entry %)) (take n) vec))]
-    {:files (pick File) :dirs (pick Dir)}))
+;; --- content sources -----------------------------------------------------------
 
 (defn- map-file
   "The file's bytes, memory-mapped read-only in `arena`."
@@ -106,6 +134,6 @@
              [(.replace (str (.relativize root p)) \\ \/) (map-file arena p)])))))
 
 (defn from-dir
-  "A tree serving the directory `dir` from disk (see dir-files)."
+  "An index of the directory `dir` (see dir-files)."
   [^Arena arena dir]
   (build (dir-files arena dir)))

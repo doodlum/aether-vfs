@@ -1,11 +1,12 @@
 (ns aether.director.content-test
   "Content sources: Stored zips and launch staging."
   (:require [aether.director.stage :as stage]
+            [aether.director.provider :as prov]
             [aether.director.tree :as tree]
             [aether.director.zip :as zip]
             [clojure.java.io :as io]
             [clojure.test :refer [deftest is testing]])
-  (:import (aether.director.tree File)
+  (:import (aether.director.provider Stat)
            (java.lang.foreign Arena MemorySegment ValueLayout)
            (java.nio.file Files)
            (java.util.zip CRC32 ZipEntry ZipOutputStream)))
@@ -38,7 +39,7 @@
           (is (= "hello" (String. ^bytes (bytes-of (second (first files))))))
           (is (= (seq (byte-array (range 100))) (seq (bytes-of (second (second files)))))))
         (testing "and serve through a tree"
-          (is (= 100 (.-size ^File (tree/lookup (tree/build files) "data/x.bin")))))))
+          (is (= 100 (.-size ^Stat (prov/stat (tree/build files) "data/x.bin")))))))
     (write-zip! f [["a.txt" (.getBytes "aaaa") true] ["b.txt" (.getBytes "bbbbbbbbbb") false]])
     (with-open [arena (Arena/ofConfined)]
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"compressed entry .*b\.txt" (zip/open arena f))

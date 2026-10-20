@@ -3,7 +3,8 @@
 
     clojure -M:run --session <dir> --natives <dir>
                    [--zip <file>]... [--layer <dir>]...     ; root 0's content, later wins
-                   [--root <id>=<path>] [--root-layer <id>=<dir>]...  ; more roots
+                   [--write-layer <dir>]                   ; root 0's writes: a copy-on-write overlay
+                   [--root <id>=<path>] [--root-layer <id>=<dir>]... [--root-write <id>=<dir>]  ; more roots
                    [--stage <vpath> [--fallback <dir>]... [--also <vpath>]...]
                    [--env K=V]...
                    [<exe> [args...]]
@@ -11,7 +12,9 @@
   The program sees <session>/root as a folder holding the content. With
   --stage, the image is the content's own <vpath>, staged with its import
   closure; otherwise <exe> is a real file. Exits with the program's code."
-  (:require [aether.director.launch :as launch]
+  (:require [aether.director.compose :as compose]
+            [aether.director.disk :as disk]
+            [aether.director.launch :as launch]
             [aether.director.ring :as ring]
             [aether.director.stage :as stage]
             [aether.director.tree :as tree]
@@ -29,6 +32,8 @@
       "--zip"     (recur more (update opts :content conj [:zip b]))
       "--layer"   (recur more (update opts :content conj [:dir b]))
       "--root"    (let [[id at] (str/split b #"=" 2)] (recur more (assoc-in opts [:roots (parse-long id)] at)))
+      "--write-layer" (recur more (assoc-in opts [:write 0] b))
+      "--root-write" (let [[id d] (str/split b #"=" 2)] (recur more (assoc-in opts [:write (parse-long id)] d)))
       "--root-layer" (let [[id d] (str/split b #"=" 2)]
                        (recur more (update-in opts [:root-content (parse-long id)] (fnil conj []) [:dir d])))
       "--stage"   (recur more (assoc opts :stage b))
@@ -53,9 +58,12 @@
         ms     #(long (/ (- (System/nanoTime) t0) 1e6))
         log    (fn [& xs] (binding [*out* *err*] (apply println "[director]" (ms) "ms:" xs)))
         arena  (Arena/ofShared)
-        t      (tree/build (content arena (:content opts)))
-        more   (into {} (for [[id _] (:roots opts)]
-                          [id (tree/build (content arena (get-in opts [:root-content id] [])))]))
+        ;; each root: its layers indexed, under a copy-on-write overlay when it has a write layer
+        root   (fn [id layers]
+                 (let [lower (tree/build (content arena layers))]
+                   (if-let [w (get-in opts [:write id])] (compose/overlay (disk/disk w) lower) lower)))
+        t      (root 0 (:content opts))
+        more   (into {} (for [[id _] (:roots opts)] [id (root id (get-in opts [:root-content id] []))]))
         _      (log "content indexed")
         stage-dir (io/file session "stage")
         ;; STAGE_EXEC: a child EXE that only the VFS holds, staged on demand

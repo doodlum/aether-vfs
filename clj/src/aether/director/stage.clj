@@ -9,10 +9,11 @@
   System DLLs are never staged; anything found nowhere is the loader's
   business."
   (:require [aether.director.path :as path]
-            [aether.director.tree :as tree]
+            [aether.director.proto :as p]
+            [aether.director.provider :as prov]
             [clojure.java.io :as io]
             [clojure.string :as str])
-  (:import (aether.director.tree File)
+  (:import (aether.director.provider Stat)
            (java.lang.foreign MemorySegment ValueLayout)
            (java.nio.channels FileChannel)
            (java.nio.file OpenOption StandardOpenOption)))
@@ -93,6 +94,22 @@
                       (.listFiles (io/file d))))
         dirs))
 
+(defn- read-file
+  "The whole file at `vp` read through provider `t`, or nil if it isn't a file."
+  ^MemorySegment [t vp]
+  (let [h (prov/open t vp p/open-read)]
+    (when-not (number? h)
+      (try
+        (let [^Stat st (prov/handle-stat h)]
+          (when-not (.-dir? st)
+            (let [buf (MemorySegment/ofArray (byte-array (.-size st)))]
+              (loop [pos 0]
+                (if (>= pos (.-size st))
+                  buf
+                  (let [n (long (prov/read-into h buf pos pos (- (.-size st) pos)))]
+                    (if (pos? n) (recur (+ pos n)) buf)))))))
+        (finally (prov/close! h))))))
+
 (defn stage
   "Writes `exe` (a vpath the tree serves) and its import closure under
   `dir`, keeping the EXE's folder. Returns {:exe <staged path> :staged
@@ -102,7 +119,7 @@
   [t ^String exe {:keys [dir fallback also]}]
   (let [exe-dir (path/parent (path/normalize exe))
         target  (io/file dir exe-dir)
-        lookup  (fn [vp] (let [n (tree/lookup t (path/fold vp))] (when (instance? File n) (.-data ^File n))))]
+        lookup  (fn [vp] (read-file t vp))]
     (loop [pending (vec (cons exe also)) seen #{} staged [] files []]
       (if-let [[name & more] (seq pending)]
         (let [base (path/file-name (path/normalize name))

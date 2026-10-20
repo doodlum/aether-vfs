@@ -3,9 +3,10 @@
   case folding, path normalization and the content index."
   (:require [aether.director.path :as path]
             [aether.director.proto :as p]
+            [aether.director.provider :as prov]
             [aether.director.tree :as tree]
             [clojure.test :refer [deftest is testing]])
-  (:import (aether.director.tree Dir File)
+  (:import (aether.director.provider Stat)
            (java.lang.foreign Arena MemorySegment)
            (java.nio ByteBuffer ByteOrder)
            (java.nio.charset StandardCharsets)))
@@ -35,8 +36,8 @@
   (let [b (.getBytes s StandardCharsets/UTF_8)]
     (doto (.allocate (Arena/ofAuto) (alength b)) (.copyFrom (MemorySegment/ofArray b)))))
 
-(defn- listing [^Dir d]
-  (let [b (.order (ByteBuffer/wrap (.-listing d)) ByteOrder/LITTLE_ENDIAN)]
+(defn- listing [t vp]
+  (let [b (.order (ByteBuffer/wrap ^bytes (prov/listing-bytes t vp)) ByteOrder/LITTLE_ENDIAN)]
     (vec (for [_ (range (.getInt b))]
            (let [name (let [a (byte-array (.getInt b))] (.get b a) (String. a StandardCharsets/UTF_8))
                  dir? (= 1 (.get b))
@@ -47,9 +48,10 @@
 (deftest the-index
   (let [t (tree/build [["Data/Skyrim.esm" (seg "esm!")] ["Data/Meshes/a.nif" (seg "n")] ["top.txt" (seg "")]])]
     (testing "files are found by folded path"
-      (is (= 4 (.-size ^File (tree/lookup t "data/skyrim.esm"))))
-      (is (nil? (tree/lookup t "Data/Skyrim.esm")) "the ring always sends folded paths"))
+      (is (= 4 (.-size ^Stat (prov/stat t "data/skyrim.esm"))))
+      (is (nil? (prov/stat t "Data/Skyrim.esm")) "the ring always sends folded paths")
+      (is (= "Data/Skyrim.esm" (prov/spelling t "data/skyrim.esm"))))
     (testing "directories are implied, list their children in the archive's spelling"
-      (is (= [["Data" true 0] ["top.txt" false 0]] (listing (tree/lookup t ""))))
-      (is (= [["Skyrim.esm" false 4] ["Meshes" true 0]] (listing (tree/lookup t "data"))))
-      (is (= [["a.nif" false 1]] (listing (tree/lookup t "data/meshes")))))))
+      (is (= [["Data" true 0] ["top.txt" false 0]] (listing t "")))
+      (is (= [["Skyrim.esm" false 4] ["Meshes" true 0]] (listing t "data")))
+      (is (= [["a.nif" false 1]] (listing t "data/meshes"))))))

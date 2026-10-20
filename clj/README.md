@@ -1,15 +1,10 @@
 # Clojure director (experiment)
 
-A ring server for the aether-vfs shim, written in Clojure on JDK 26 with the
+A director for the aether-vfs shim, written in Clojure on JDK 26 with the
 Foreign Function & Memory API. It speaks the shim's wire contract byte for
-byte (ring version 2: `rust/crates/vfs-ipc`, `vfs-protocol`), so the in-game
-shim and payload stay Rust and only the host side changes.
-
-This is step 1 of a plan to move the director, then launch and staging, into
-Clojure: **does a JVM serve the ring as fast as the Rust director?** Steps
-after it: a director over a real content projection (disk, Stored zips),
-launch (staging, `CreateProcessW` with an explicit environment, the existing
-Rust injector), writes.
+byte (ring version 4: `rust/crates/vfs-ipc`, `vfs-protocol`; checked against
+the golden vectors), so the in-game shim stays Rust and only the host side
+changes. It launches Skyrim SE from a Stored zip (below).
 
 ## Layout
 
@@ -17,14 +12,74 @@ Rust injector), writes.
 |---|---|
 | `java/aether/director/Native.java` | VarHandle atomics on the mapping, kernel32 downcalls (sections, events). These are signature-polymorphic, which Clojure can only reach by reflection. |
 | `java/aether/director/Guard.java` | Calls a request handler without boxing its result: a Clojure `try` allocates a Long per request. |
-| `src/aether/director/proto.clj` | The wire contract: header and slot layout, geometry, opcodes, statuses. |
+| `src/aether/director/proto.clj` | The wire contract: header and slot layout, geometry, opcodes, flags, statuses. |
 | `src/aether/director/path.clj` | `fold` (exactly Rust's `char::to_lowercase`, per code point) and vpath normalization. |
-| `src/aether/director/tree.clj` | The content index: folded vpath to file or directory, every directory's READDIR reply encoded once. The layering a Rust provider stack does per request has already happened by the time a tree is built. |
-| `src/aether/director/ring.clj` | Section, header, events, worker threads, the opcode handlers. Requests are read in place and replies written over them; bulk reads go straight into the slot's arena bank. Also the warm-up (below). |
-| `src/aether/director/main.clj` | Serves the benchmark fixture: prints `SECTION <name> <map_bytes>`, serves until stdin closes. |
+| `src/aether/director/provider.clj` | The provider protocol (below). |
+| `src/aether/director/tree.clj` | Index provider: content that never changes (Stored zip entries, mapped files), indexed once; READDIR replies encoded once. |
+| `src/aether/director/disk.clj` | Disk provider: a real folder, readable and writable. |
+| `src/aether/director/compose.clj` | `layered` (read-only, later wins) and `overlay` (copy-on-write). |
+| `src/aether/director/zip.clj` | Stored ZIP/ZIP64 archives, mapped once; entries are slices. |
+| `src/aether/director/ring.clj` | Section, header, events, worker threads, every opcode. Requests are read in place and replies written over them; bulk reads go straight into the slot's arena bank. Also the warm-up. |
+| `src/aether/director/stage.clj` | Staging a launch image and its PE import closure. |
+| `src/aether/director/launch.clj`, `run.clj` | Sessions, `shim.cfg`, the child's environment, the injector; the command line. |
 
-Read-only so far: HEARTBEAT, GETATTR, READDIR, OPEN, READ (inline and bulk),
-CLOSE. Write opcodes answer `ST_READ_ONLY`.
+## The wire: what's served
+
+All of ring version 4 except the registry. HEARTBEAT, GETATTR, READDIR, OPEN
+(read and write, with CREATE/EXCL/TRUNC), READ (inline and bulk), WRITE,
+SETATTR (truncate/extend), RENAME, DELETE, MKDIR, CLOSE, STORED_NAMES,
+cross-root RENAME_X (files move by copy; a directory is ST_CROSS_ROOT), and
+STAGE_EXEC (a VFS-only child EXE, staged on demand). OPEN replies are
+immutable with mount_gen 1 for index content, so the shim may cache small
+reads; writable handles never are. The registry ops (15-22) answer
+NOT_SUPPORTED, and VFS_REGISTRY is never set.
+
+## Providers
+
+Each root is served by one provider, usually composed. A provider is two
+protocols (`aether.director.provider`):
+
+```clojure
+(defprotocol Provider
+  (stat [p vpath])            ; Stat or nil       (folded vpath)
+  (list-dir [p vpath])        ; [Entry …], nil, or a status
+  (spelling [p vpath])        ; how the provider spells the path, or nil
+  (open [p vpath flags])      ; a Handle or a status (path as the caller spelled it)
+  (mkdir! [p vpath]) (delete! [p vpath]) (rename! [p from to]))   ; statuses
+
+(defprotocol Handle
+  (handle-stat [h]) (immutable? [h])
+  (read-into [h dst dst-off pos len])     ; straight into a MemorySegment: the ring's arena
+  (write-from [h src src-off pos len]) (truncate! [h size]) (close! [h]))
+```
+
+Failures are status codes, never exceptions; a missing path is nil (a game
+probes missing files constantly). Reads go straight into the arena, so a
+provider backed by memory or a mapping costs one copy. A provider that keeps
+its READDIR replies encoded can also implement `Listing`.
+
+| Provider | |
+|---|---|
+| `tree/build`, `tree/from-dir` | Index of [path MemorySegment] pairs: zip slices (`zip/open`), mapped files. Read-only. |
+| `disk/disk` | A real folder. Creating a file makes missing parents; MKDIR is OK on an existing directory. |
+| `compose/layered` | Read-only stack; later layers win; listings are unioned. |
+| `compose/overlay` | A writable upper over a read-only lower: copy-up on write (via a `.cu.` temp and a rename), `.wh.<name>` whiteouts for deletes, listings merged with the lower's spelling kept. It indexes the upper, so reading lower content costs no disk stat, and a later session sees what the last one left. |
+
+**Adding one:** implement the two protocols (and `Listing` if listings are
+precomputed), then add it to `every-provider-conforms` in
+`test/aether/director/provider_test.clj`. That's the conformance suite, after
+vfs-provider's `conformance.rs`: stat, listing, case-insensitive lookups and
+spellings, positional reads, and for writable providers create/EXCL/TRUNC,
+positional writes, truncate/extend, MKDIR, rename, delete (non-empty
+directories), names created as spelled. Semantics follow the Rust providers,
+with three deliberate differences in the overlay: a directory holding only
+whiteout markers can be removed, a rename into a folder only the lower has
+creates it, and a base-only directory still can't be renamed (as upstream).
+
+`rust/`'s `vfs-fixture-writepath` passes end to end under the Clojure
+director with a write layer: copy-on-write of a read-only file, write/append
+round trips, rename and delete, same-handle write-then-read, CREATE_NEW
+exclusivity.
 
 ## Launching a game
 

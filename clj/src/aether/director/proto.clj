@@ -87,7 +87,12 @@
 (def ^:const read-resp-bulk-bit 0x80000000)
 (def ^:const bulk-threshold 65536)      ; reads this big go to the arena regardless of the flag
 
+(def ^:const open-read 1)
 (def ^:const open-write 2)
+(def ^:const open-create 4)
+(def ^:const open-excl 8)
+(def ^:const open-trunc 16)
+(def ^:const open-append 32)
 (def ^:const open-flag-immutable 1)     ; OPEN reply byte 17: content never changes (enables the shim's read cache)
 
 ;; --- status codes (vfs-provider/src/status.rs) ------------------------------
@@ -99,6 +104,10 @@
 (def ^:const io-error -4)
 (def ^:const is-dir -5)
 (def ^:const bad-fh -6)
+(def ^:const no-space -7)
 (def ^:const not-supported -8)
 (def ^:const read-only -9)
+(def ^:const exists -10)
+(def ^:const reply-too-large -11)
+(def ^:const cross-root -12)
 (def ^:const overflow Integer/MIN_VALUE)  ; a reply too big for the slot
