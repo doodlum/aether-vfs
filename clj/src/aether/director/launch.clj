@@ -47,29 +47,31 @@
   "Creates the session's directories under `dir`: root/ (the managed root,
   empty), overlay/ and state/, and writes shim.cfg and fuse.cfg for `server`
   (from ring/start). Returns the session map launch takes. `roots` declares
-  the roots beyond root 0 to the shim: {id path-the-program-uses}."
+  the roots beyond root 0 to the shim: {id path-the-program-uses}. When the
+  server serves a registry, the shim is told to install its registry hooks."
   [server dir & [{:keys [roots]}]]
   (let [[root state] (for [d ["root" "state"]] (doto (io/file dir d) (.mkdirs)))
         root-s  (canonical root)
         shim    (io/file state "shim.cfg")
         fuse    (io/file state "fuse.cfg")
-        {:keys [name cap map-bytes arena-offset arena-len server-event client-event]} server]
+        {:keys [name cap map-bytes arena-offset arena-len server-event client-event registry?]} server]
     (io/copy (shim-config root-s) shim)
     (spit fuse (str "section=" name "\nroot=" root-s "\npayload_cap=" cap "\nring_bytes=" map-bytes
                     "\narena_offset=" arena-offset "\narena_len=" arena-len
                     "\nserver_ev=" server-event "\nclient_ev=" client-event "\n"))
     {:root root-s :state (canonical state)
      :shim-config (canonical shim) :ready (str (canonical state) File/separator "ready.flag")
-     :env {"VFS_RING_SECTION"     name
-           "VFS_RING_BYTES"       (str map-bytes)
-           "VFS_RING_PAYLOAD_CAP" (str cap)
-           "VFS_ARENA_OFFSET"     (str arena-offset)
-           "VFS_ARENA_LEN"        (str arena-len)
-           "VFS_SERVER_EV"        server-event
-           "VFS_CLIENT_EV"        client-event
-           "VFS_FUSE_CFG"         (canonical fuse)
-           "VFS_VIRTUAL_DIR"      root-s
-           "VFS_VIRTUAL_ROOTS"    (str/join ";" (for [[id at] (sort roots)] (str id "=" at)))}}))
+     :env (cond-> {"VFS_RING_SECTION"     name
+                  "VFS_RING_BYTES"       (str map-bytes)
+                  "VFS_RING_PAYLOAD_CAP" (str cap)
+                  "VFS_ARENA_OFFSET"     (str arena-offset)
+                  "VFS_ARENA_LEN"        (str arena-len)
+                  "VFS_SERVER_EV"        server-event
+                  "VFS_CLIENT_EV"        client-event
+                  "VFS_FUSE_CFG"         (canonical fuse)
+                  "VFS_VIRTUAL_DIR"      root-s
+                  "VFS_VIRTUAL_ROOTS"    (str/join ";" (for [[id at] (sort roots)] (str id "=" at)))}
+             registry? (assoc "VFS_REGISTRY" "1"))}))
 
 (defn launch
   "Runs `exe` (a real file) with `args` under `session`, via the injector at
@@ -92,7 +94,8 @@
                  (.redirectError ProcessBuilder$Redirect/INHERIT))]
     (io/delete-file (:ready session) true)
     (doto (.environment pb)
-      ;; a file-backed ring would take priority over our section; no registry is served
+      ;; a file-backed ring would take priority over our section; VFS_REGISTRY
+      ;; comes back with the session's env only when a registry is served
       (.remove "VFS_RING_PATH")
       (.remove "VFS_REGISTRY")
       (.putAll ^java.util.Map (:env session))

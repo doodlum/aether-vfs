@@ -12,7 +12,8 @@
   the last `spin-us` spins; otherwise it waits on the server event for 1 ms."
   (:require [aether.director.path :as path]
             [aether.director.proto :as p]
-            [aether.director.provider :as prov])
+            [aether.director.provider :as prov]
+            [aether.director.registry :as registry])
   (:import (aether.director Guard Native Native$Section)
            (aether.director.provider Stat)
            (java.lang.foreign Arena MemorySegment ValueLayout)
@@ -45,6 +46,7 @@
                ^long srv-event ^long cli-event ^long spin-ns
                ^AtomicBoolean stop ^AtomicLong served
                stage-exec                           ; (fn [vpath] real-path-or-nil), or nil
+               registry                             ; an aether.director.registry, or nil (not served)
                ^ConcurrentHashMap trace])           ; "op outcome path" -> LongAdder, or nil (off)
 
 ;; A handler gets the slot's payload offset and request length, writes its
@@ -334,6 +336,28 @@
                   (reply-utf8 r off real)
                   (reply p/not-found 0)))))
 
+;; --- the registry --------------------------------------------------------------
+
+(defn- op-registry
+  "Registry ops 15-22, answered from the attached registry (NOT_SUPPORTED
+  without one). A request that doesn't decode is BAD_REQUEST; a REG_KEY reply
+  larger than an inline reply can carry (cap - 8) is REPLY_TOO_LARGE. A write
+  has published reg_gen before it returns, so its reply can't reach the
+  writer while another process may still use a cached answer."
+  ^long [^Ring r ^long off ^long len ^long op]
+  (if-let [reg (.-registry r)]
+    (let [b   (byte-array len)
+          _   (MemorySegment/copy ^MemorySegment (.-seg r) ValueLayout/JAVA_BYTE off b (int 0) (int len))
+          req (try (registry/decode-request op b) (catch Exception _ nil))]
+      (if-not req
+        (reply p/bad-request 0)
+        (let [[st ^bytes out] (registry/serve reg req)]
+          (cond
+            (not (zero? (long st)))                   (reply st 0)
+            (> (alength out) (- (.-cap r) 8))         (reply p/reply-too-large 0)
+            :else                                     (reply-bytes r off out)))))
+    (reply p/not-supported 0)))
+
 (defn- dispatch ^long [r ^long slot]
   (let [^Ring r r
         seg  (.-seg r)
@@ -358,7 +382,7 @@
         14 (op-stored-names r off len)
         23 (op-rename r off len true)
         24 (op-stage-exec r off len)
-        (15 16 17 18 19 20 21 22) (reply p/not-supported 0)       ; registry: not served
+        (15 16 17 18 19 20 21 22) (op-registry r off len op)
         (reply p/bad-request 0)))))
 
 (defn- serve-slot
@@ -471,7 +495,7 @@
           _      (init-header! seg g 1)
           r      (Ring. seg stride (:cap g) (:arena-offset g) (:bank-size g)
                         (roots-array {0 provider}) (ConcurrentHashMap.) (AtomicLong.)
-                        0 0 0 (AtomicBoolean.) (AtomicLong.) nil nil)
+                        0 0 0 (AtomicBoolean.) (AtomicLong.) nil nil nil)
           {:keys [files dirs]} (prov/sample provider 64)
           slot   (long-array 1)
           n      (long-array 1)
@@ -514,10 +538,12 @@
 
   First runs `warm-up` rounds of synthetic requests (see warm-up!; 0 skips
   it), so the handlers are compiled before the first real request.
-  `stage-exec` answers STAGE_EXEC: (fn [vpath] real-path-or-nil). `roots`
+  `stage-exec` answers STAGE_EXEC: (fn [vpath] real-path-or-nil). `registry`
+  (aether.director.registry/registry) serves the registry ops and publishes
+  reg_gen into the header; without one they're NOT_SUPPORTED. `roots`
   serves more roots: {root-id provider}, ids below 16. `trace` counts requests
   (see trace-top)."
-  [provider {:keys [name workers spin-us warm-up stage-exec trace roots]
+  [provider {:keys [name workers spin-us warm-up stage-exec trace roots registry]
              :or {workers 16 spin-us 400 warm-up 3000}}]
   (let [warmed  (when (pos? (long warm-up)) (warm-up! provider {:rounds warm-up}))
         g       (p/geometry)
@@ -529,13 +555,16 @@
         ring    (Ring. seg (:stride g) (:cap g) (:arena-offset g) (:bank-size g)
                        (roots-array (assoc roots 0 provider)) (ConcurrentHashMap.) (AtomicLong.)
                        srv cli (* 1000 (long spin-us))
-                       (AtomicBoolean.) (AtomicLong.) stage-exec
+                       (AtomicBoolean.) (AtomicLong.) stage-exec registry
                        (when trace (ConcurrentHashMap.)))
+        _       (when registry
+                  (registry/publish-to! registry #(Native/fetchMaxLong seg p/rh-reg-gen (long %))))
         threads (vec (for [i (range workers)]
                        (doto (Thread. ^Runnable #(worker ring) (str "ring-worker-" i))
                          (.setDaemon true)
                          (.start))))]
     (merge g {:name name :ring ring :section section :threads threads :warm-up warmed
+              :registry? (some? registry)
               :server-event (str name "_srv") :client-event (str name "_cli")})))
 
 (defn stop [{:keys [^Ring ring ^Native$Section section threads]}]

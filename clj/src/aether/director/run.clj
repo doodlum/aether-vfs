@@ -5,6 +5,7 @@
                    [--zip <file>]... [--layer <dir>]...     ; root 0's content, later wins
                    [--write-layer <dir>]                   ; root 0's writes: a copy-on-write overlay
                    [--root <id>=<path>] [--root-layer <id>=<dir>]... [--root-write <id>=<dir>]  ; more roots
+                   [--registry <dir>]                      ; virtualize the registry: overlay.reg in <dir>
                    [--stage <vpath> [--fallback <dir>]... [--also <vpath>]...]
                    [--env K=V]...
                    [<exe> [args...]]
@@ -15,6 +16,7 @@
   (:require [aether.director.compose :as compose]
             [aether.director.disk :as disk]
             [aether.director.launch :as launch]
+            [aether.director.registry :as registry]
             [aether.director.ring :as ring]
             [aether.director.stage :as stage]
             [aether.director.tree :as tree]
@@ -36,6 +38,7 @@
       "--root-write" (let [[id d] (str/split b #"=" 2)] (recur more (assoc-in opts [:write (parse-long id)] d)))
       "--root-layer" (let [[id d] (str/split b #"=" 2)]
                        (recur more (update-in opts [:root-content (parse-long id)] (fnil conj []) [:dir d])))
+      "--registry" (recur more (assoc opts :registry b))
       "--stage"   (recur more (assoc opts :stage b))
       "--fallback" (recur more (update opts :fallback conj b))
       "--also"    (recur more (update opts :also conj b))
@@ -68,9 +71,11 @@
         stage-dir (io/file session "stage")
         ;; STAGE_EXEC: a child EXE that only the VFS holds, staged on demand
         on-demand (fn [vpath] (:exe (stage/stage t vpath {:dir stage-dir :fallback fallback})))
+        reg    (when-let [d (:registry opts)] (registry/registry (doto (io/file d) (.mkdirs))))
         server (ring/start t {:name (str "Local\\vfs_ring_clj_" (.pid (ProcessHandle/current)))
                               :stage-exec on-demand
                               :trace (:trace opts)
+                              :registry reg
                               :roots more})
         _      (log "serving; warm-up" (:warm-up server))
         s      (launch/session server session {:roots (:roots opts)})
@@ -83,6 +88,7 @@
     (doseq [[k n] (ring/trace-top server 25)] (log "trace" n k))
     (when staged (stage/cleanup! staged stage-dir))
     (ring/stop server)
+    (when reg (registry/close! reg))
     (.close arena)
     (shutdown-agents)
     (System/exit code)))

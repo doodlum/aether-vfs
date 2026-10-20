@@ -20,19 +20,55 @@ changes. It launches Skyrim SE from a Stored zip (below).
 | `src/aether/director/compose.clj` | `layered` (read-only, later wins) and `overlay` (copy-on-write). |
 | `src/aether/director/zip.clj` | Stored ZIP/ZIP64 archives, mapped once; entries are slices. |
 | `src/aether/director/ring.clj` | Section, header, events, worker threads, every opcode. Requests are read in place and replies written over them; bulk reads go straight into the slot's arena bank. Also the warm-up. |
+| `src/aether/director/registry.clj` | The registry overlay, its wire encodings, and `overlay.reg`. |
 | `src/aether/director/stage.clj` | Staging a launch image and its PE import closure. |
 | `src/aether/director/launch.clj`, `run.clj` | Sessions, `shim.cfg`, the child's environment, the injector; the command line. |
 
 ## The wire: what's served
 
-All of ring version 4 except the registry. HEARTBEAT, GETATTR, READDIR, OPEN
-(read and write, with CREATE/EXCL/TRUNC), READ (inline and bulk), WRITE,
-SETATTR (truncate/extend), RENAME, DELETE, MKDIR, CLOSE, STORED_NAMES,
-cross-root RENAME_X (files move by copy; a directory is ST_CROSS_ROOT), and
-STAGE_EXEC (a VFS-only child EXE, staged on demand). OPEN replies are
-immutable with mount_gen 1 for index content, so the shim may cache small
-reads; writable handles never are. The registry ops (15-22) answer
-NOT_SUPPORTED, and VFS_REGISTRY is never set.
+All of ring version 4. HEARTBEAT, GETATTR, READDIR, OPEN (read and write,
+with CREATE/EXCL/TRUNC), READ (inline and bulk), WRITE, SETATTR
+(truncate/extend), RENAME, DELETE, MKDIR, CLOSE, STORED_NAMES, cross-root
+RENAME_X (files move by copy; a directory is ST_CROSS_ROOT), STAGE_EXEC (a
+VFS-only child EXE, staged on demand), and the registry ops 15-22 (below).
+OPEN replies are immutable with mount_gen 1 for index content, so the shim
+may cache small reads; writable handles never are.
+
+## The registry
+
+`aether.director.registry` is vfs-registry's overlay in Clojure: one
+copy-on-write layer over the real registry, which is never written. The shim
+merges real and overlay answers itself, so the director only keeps the
+overlay: keys created here, values set, value and key tombstones, renames
+(a tombstone at the old name, the subtree moved), volatile keys, last-write
+times, and the version counter behind REG_CHANGED. Lookups are
+case-insensitive (the same per-code-point folding as paths); the first
+spelling stays. Limits are upstream's: names of 255/16,383 characters, 1 MiB
+of data, 512 levels for writes, a bounded `deleted-at` that errs towards
+"changed".
+
+The overlay is a persistent value in an atom; writes apply under one lock,
+and every successful write raises the ring header's `reg_gen` (a fetch-max)
+before its reply goes out, so no process can keep using a cached answer from
+before it. It is saved as `overlay.reg` (upstream's AEREG format, checksummed;
+volatile keys left out) at most once a second while it changes and on exit;
+a damaged file is moved aside and the session starts empty.
+
+`--registry <dir>` turns it on: the ring serves ops 15-22 from it and the
+child gets `VFS_REGISTRY=1`, so the shim installs its registry hooks. Without
+it the ops answer NOT_SUPPORTED and the shim leaves the registry alone. The
+wire encodings are checked against the golden `reg-*` vectors, and upstream's
+overlay tests are ported (`test/aether/director/registry_test.clj`).
+
+End to end (2026-10-20, Windows 11): rust/'s `vfs-fixture-registry` under the
+Clojure director with `--registry`, steps 3-6 of upstream's
+`proton_registry` test without its overlay-off runs, so nothing touches the
+real registry. `run` (279 requests: every value type, short buffers, case,
+access, subkeys, deletes, renames, notifications) answered as Windows does,
+identically in HKCU and HKLM, HKLM included without admin. A second process's
+`probe` saw everything `run` wrote; a new session reloading `overlay.reg`
+probed identically; and `HKCU`/`HKLM\Software\AetherVfsRegistryTest` never
+existed in the real registry, before or after.
 
 ## Providers
 

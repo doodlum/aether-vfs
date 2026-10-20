@@ -43,6 +43,14 @@ public final class Native {
         return INT.compareAndSet(s, off, expected, value);
     }
 
+    private static final VarHandle LONG = ValueLayout.JAVA_LONG.varHandle();
+
+    /** Raises the (aligned) long at {@code off} to at least {@code v}, atomically. */
+    public static void fetchMaxLong(MemorySegment s, long off, long v) {
+        long cur = (long) LONG.getVolatile(s, off);
+        while (cur < v && !LONG.compareAndSet(s, off, cur, v)) cur = (long) LONG.getVolatile(s, off);
+    }
+
     // ------------------------------------------------------------------ kernel32
     // Looked up on first use (a holder class), so loading this class off
     // Windows doesn't fail.
