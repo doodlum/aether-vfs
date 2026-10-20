@@ -19,6 +19,7 @@
   (b/delete {:path "target/jar-classes"})
   (b/javac {:src-dirs ["java"] :class-dir "target/jar-classes" :javac-opts ["--release" "26"]
             :basis (b/create-basis {:project "deps.edn"})})
+  (b/copy-dir {:src-dirs ["resources"] :target-dir "target/jar-classes"})   ; the native library
   (let [basis (b/create-basis {:project "deps.edn"})]
     (b/compile-clj {:basis        basis
                     :ns-compile   '[aether.director.main aether.director.run]

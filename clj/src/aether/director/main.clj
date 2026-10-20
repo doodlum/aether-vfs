@@ -3,7 +3,7 @@
   prints `SECTION <name> <map_bytes>` and serves until stdin closes."
   (:require [aether.director.fixture :as fixture]
             [aether.director.ring :as ring]
-            [aether.director.tree :as tree])
+            [aether.director.provider.tree :as tree])
   (:gen-class))
 
 (defn -main [& args]

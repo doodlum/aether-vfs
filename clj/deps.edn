@@ -1,4 +1,4 @@
-{:paths ["src" "target/classes"]
+{:paths ["src" "resources" "target/classes"]
 
  :deps {org.clojure/clojure {:mvn/version "1.13.0-alpha9"}}
 
@@ -19,6 +19,7 @@
 
   ;;   clojure -M:test
   :test {:extra-paths ["test"]
-         :extra-deps  {lambdaisland/kaocha {:mvn/version "1.91.1392"}}
+         :extra-deps  {lambdaisland/kaocha {:mvn/version "1.91.1392"}
+                       org.clojure/test.check {:mvn/version "1.1.1"}}
          :jvm-opts    ["--enable-native-access=ALL-UNNAMED"]
          :main-opts   ["-m" "kaocha.runner"]}}}

@@ -2,8 +2,8 @@
   "Content sources: Stored zips and launch staging."
   (:require [aether.director.stage :as stage]
             [aether.director.provider :as prov]
-            [aether.director.tree :as tree]
-            [aether.director.zip :as zip]
+            [aether.director.provider.tree :as tree]
+            [aether.director.provider.zip :as zip]
             [clojure.java.io :as io]
             [clojure.test :refer [deftest is testing]])
   (:import (aether.director.provider Stat)

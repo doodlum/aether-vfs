@@ -1,4 +1,4 @@
-(ns aether.director.compose
+(ns aether.director.provider.compose
   "Providers built from providers.
 
     layered   read-only stack, later layers win
@@ -330,7 +330,7 @@
 
 (defn overlay
   "A writable provider: `upper` (a writable provider, usually
-  aether.director.disk) over `lower` (read-only). The upper's contents,
+  aether.director.provider.disk) over `lower` (read-only). The upper's contents,
   including whiteouts left by an earlier session, are indexed now."
   [upper lower]
   (doto (Overlay. upper lower (ConcurrentHashMap.) (ConcurrentHashMap.) (AtomicLong.) (ConcurrentHashMap.))

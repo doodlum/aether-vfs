@@ -1,0 +1,213 @@
+(ns aether.director.storage
+  "Storage: the block store with a catalog and a RAM tier, serving layers
+  (writable namespaces, aether.director.provider.layer), cache files (a
+  pull-through cache of slow sources, aether.director.provider.cached) and
+  live files (layer files frozen under content-derived keys). After
+  aether-vfs's aether-storage, with one structural difference: the catalog
+  is in the store's own LMDB environment, so every change is one durable
+  commit and there's nothing to reconcile at open.
+
+    (def s (storage/open dir))
+    (storage/layer s \"saves\")          ; a Provider; with compose/overlay over game content
+    (storage/freeze s \"saves\")         ; {vpath live-key}"
+  (:require [aether.director.path :as path]
+            [aether.director.provider.cached :as cached]
+            [aether.director.provider.layer :as layer]
+            [aether.director.storage.catalog :as cat]
+            [aether.director.storage.ram :as ram]
+            [aether.director.store :as store])
+  (:import (aether.director Codec)
+           (java.nio ByteBuffer ByteOrder)
+           (java.util HexFormat)
+           (java.util.concurrent ConcurrentHashMap)))
+
+(set! *warn-on-reflection* true)
+
+(def defaults
+  {:ram-bytes   (* 256 1024 1024)
+   :cache-bytes (* 32 1024 1024 1024)})
+
+(defn open
+  "Opens (creating) storage in directory `dir`. Options: the store's
+  (aether.director.store/defaults), plus :ram-bytes (the RAM tier) and
+  :cache-bytes (the cache files' budget, enforced by enforce-cache-budget!)."
+  [dir & [opts]]
+  (let [cfg (merge store/defaults defaults {:page-size 8192} opts)
+        st  (store/open dir (assoc cfg :extra-dbs cat/dbs))]
+    {:store st
+     :ram (ram/ram (:ram-bytes cfg) (:block-size st))
+     :cfg cfg
+     :layers (atom {})
+     :opens (ConcurrentHashMap.)}))                       ; cache file key (hex) -> open handles
+
+(defn close
+  "Commits open layer files and closes."
+  [{:keys [store layers]}]
+  (doseq [l (vals @layers)] (layer/commit-open! l))
+  (store/close store))
+
+;; --- layers -------------------------------------------------------------------------------
+
+(defn layer
+  "The provider of layer `name`, created if it doesn't exist."
+  [{:keys [store layers] :as s} ^String name]
+  (or (get @layers name)
+      (let [id (store/write! store (fn [txn] (cat/create-layer! store txn name)))]
+        (get (swap! layers (fn [m] (if (m name) m (assoc m name (layer/layer (select-keys s [:store :ram]) id name)))))
+             name))))
+
+(defn layers
+  "Every layer's name."
+  [{:keys [store]}]
+  (store/read* store (fn [txn] (cat/layer-names store txn))))
+
+(defn delete-layer!
+  "Deletes layer `name` and its files. Refused (:layer-in-use) while one is open."
+  [{:keys [store layers]} ^String name]
+  (when-let [l (get @layers name)]
+    (when (pos? (layer/open-files l))
+      (throw (ex-info (str "layer " name " has open files") {::error :layer-in-use}))))
+  (store/write! store
+                (fn [txn]
+                  (when-let [id (cat/layer-id store txn name)]
+                    (doseq [[p e] (cat/subtree store txn id "")]
+                      (when (:guid e) (store/delete-file! store txn (cat/layer-file-id (:guid e))))
+                      (cat/del-entry! store txn id p))
+                    (cat/drop-layer! store txn name)
+                    true)))
+  (swap! layers dissoc name)
+  nil)
+
+(defn put-files!
+  "Writes whole files into layer `name` ([[vpath bytes] …], spelled paths;
+  missing directories created), replacing any there, in one commit."
+  [s ^String name files]
+  (let [{:keys [store]} s
+        l     (layer s name)
+        id    (:id l)
+        now   (quot (System/currentTimeMillis) 1000)
+        plan  (mapv (fn [[vp ^bytes data]] [vp (path/fold vp) (cat/new-guid) data]) files)]
+    (store/put-files! store
+                      (mapv (fn [[_ _ guid data]] [(cat/layer-file-id guid) data]) plan)
+                      (fn [txn]
+                        (doseq [[vp folded guid ^bytes data] plan]
+                          (doseq [[f nm] (let [parts (clojure.string/split vp #"/")]
+                                           (for [i (range 1 (count parts))]
+                                             [(path/fold (clojure.string/join "/" (take i parts))) (nth parts (dec i))]))]
+                            (when-not (cat/get-entry store txn id f)
+                              (cat/put-entry! store txn id f {:dir? true :name nm :mtime now})))
+                          (when-let [old (cat/get-entry store txn id folded)]
+                            (when (:guid old) (store/delete-file! store txn (cat/layer-file-id (:guid old)))))
+                          (cat/put-entry! store txn id folded {:guid guid :len (alength data) :mtime now
+                                                               :name (path/file-name vp)}))))
+    nil))
+
+;; --- live files --------------------------------------------------------------------------------
+
+(def ^:private live-context "aether-storage 2026-10-13 live key v1")
+
+(defn key-string ^String [^bytes k] (str "live-" (.formatHex (HexFormat/of) k)))
+(defn parse-key ^bytes [^String s] (.parseHex (HexFormat/of) (subs s 5)))
+
+(defn- live-key
+  "BLAKE3 (derive-key) of the layer, the file's GUID, length and mtime, and
+  its content digest: the same file frozen twice gets the same key."
+  ^bytes [layer-id ^bytes guid len mtime ^bytes digest]
+  (let [bb (.order (ByteBuffer/allocate (+ 8 16 8 8 32)) ByteOrder/LITTLE_ENDIAN)]
+    (.putLong bb (long layer-id)) (.put bb guid) (.putLong bb (long len)) (.putLong bb (long mtime)) (.put bb digest)
+    (-> (Codec/derive live-context) (.update (.array bb)) (.finish 16))))
+
+(defn freeze
+  "Freezes layer `name`'s files (those under `prefix`, default all) into live
+  files: immutable copies, sharing their blocks, under keys derived from the
+  file and its content. Idempotent: an unchanged file keeps its key.
+  Returns {vpath key-string}."
+  [{:keys [store] :as s} ^String name & [{:keys [prefix] :or {prefix ""}}]]
+  (let [l  (layer s name)
+        id (:id l)
+        _  (layer/commit-open! l)]
+    (store/write! store
+                  (fn [txn]
+                    (let [files   (for [[p e] (cat/subtree store txn id (path/fold prefix)) :when (:guid e)] [p e])
+                          digests (store/content-digests-in store txn (map (fn [[_ e]] (cat/layer-file-id (:guid e))) files))]
+                      (into {}
+                            (for [[[p e] [len digest]] (map vector files digests) :when digest]
+                              (let [k (live-key id (:guid e) len (:mtime e) digest)]
+                                (when-not (cat/get-live store txn k)
+                                  (store/delete-file! store txn (cat/live-file-id k))     ; an orphan, if any
+                                  (cat/put-live! store txn k {:len len :mtime (:mtime e)})
+                                  (store/clone-in! store txn [[(cat/layer-file-id (:guid e)) (cat/live-file-id k)]]))
+                                [p (key-string k)]))))))))
+
+(defn live-info
+  "{:len :mtime} of live file `key` (a key string), or nil."
+  [{:keys [store]} ^String key]
+  (store/read* store (fn [txn] (cat/get-live store txn (parse-key key)))))
+
+(defn live-keys [{:keys [store]}]
+  (store/read* store (fn [txn] (mapv key-string (cat/live-keys store txn)))))
+
+(defn delete-live!
+  "Deletes live file `key`; false if there was none."
+  [{:keys [store]} ^String key]
+  (let [k (parse-key key)]
+    (store/write! store (fn [txn]
+                          (when (cat/get-live store txn k)
+                            (cat/del-live! store txn k)
+                            (store/delete-file! store txn (cat/live-file-id k))
+                            true)))))
+
+(defn read-live!
+  "Reads live file `key` from `offset` into MemorySegment `dst`: as
+  store/read!, through the RAM tier's store."
+  [{:keys [store]} ^String key offset dst]
+  (store/read! store (cat/live-file-id (parse-key key)) (long offset) dst))
+
+;; --- the cache -----------------------------------------------------------------------------------
+
+(defn cached
+  "`source` (a Provider whose files never change, slow to read) behind a
+  pull-through cache in this storage: see aether.director.provider.cached."
+  [s source ^String source-key & [opts]]
+  (cached/cached (select-keys s [:store :ram :opens]) source source-key opts))
+
+(defn cache-usage
+  "{:files n :bytes logical bytes} of the cache files."
+  [{:keys [store]}]
+  (let [fs (store/read* store (fn [txn] (cat/cache-files store txn)))]
+    {:files (count fs) :bytes (reduce + (map (comp :bytes second) fs))}))
+
+(defn- evict!
+  "Deletes cache files, least recently used first, until (done? freed) or
+  none are left; open ones are kept. Returns the bytes freed."
+  [{:keys [store ram ^ConcurrentHashMap opens]} done?]
+  (let [fs (sort-by (comp :access second) (store/read* store (fn [txn] (cat/cache-files store txn))))]
+    (loop [[[k {:keys [bytes]}] & more] fs freed 0]
+      (if (or (nil? k) (done? freed))
+        freed
+        (if (.containsKey opens (.formatHex (HexFormat/of) ^bytes k))
+          (recur more freed)
+          (do (store/write! store (fn [txn]
+                                    (cat/del-cache-file! store txn k)
+                                    (store/delete-file! store txn (cat/cache-file-id k))))
+              (ram/invalidate! ram (cat/cache-file-id k))
+              (recur more (+ freed (long bytes)))))))))
+
+(defn enforce-cache-budget!
+  "When the cache files hold more than :cache-bytes, deletes the least
+  recently used (not open) down to 90% of it, then compacts. Returns the
+  bytes freed."
+  [{:keys [store cfg] :as s}]
+  (let [budget (long (:cache-bytes cfg))
+        used   (long (:bytes (cache-usage s)))]
+    (if (<= used budget)
+      0
+      (let [target (- used (long (* 0.9 budget)))
+            freed  (evict! s #(>= (long %) target))]
+        (store/compact! store {:min-garbage-ratio 0.25})
+        freed))))
+
+(defn clear-cache!
+  "Deletes every cache file that isn't open. Returns the bytes freed."
+  [s]
+  (evict! s (constantly false)))

@@ -4,7 +4,7 @@
   (:require [aether.director.path :as path]
             [aether.director.proto :as p]
             [aether.director.provider :as prov]
-            [aether.director.tree :as tree]
+            [aether.director.provider.tree :as tree]
             [clojure.test :refer [deftest is testing]])
   (:import (aether.director.provider Stat)
            (java.lang.foreign Arena MemorySegment)

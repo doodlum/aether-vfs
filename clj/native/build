@@ -1,0 +1,101 @@
+#!/bin/sh
+# Builds the director's native library, aether_native, for every platform it
+# ships for: LMDB, zstd, BLAKE3 and xxHash from pinned sources, plus
+# aether_native.c, cross-compiled with Zig's C compiler from any host.
+#
+#   native/build        # -> resources/natives/<os>-<arch>/<lib>
+#
+# Needs zig (https://ziglang.org) and git. The output is committed, so a
+# normal build needs neither; rerun this only to change a version.
+set -eu
+
+here=$(cd "$(dirname "$0")" && pwd)
+out="$here/../resources/natives"
+zig=${ZIG:-zig}
+# Under Git Bash, zig's default relative cache paths break its own runtime
+# builds: give it absolute Windows ones.
+if command -v cygpath >/dev/null 2>&1; then
+  export ZIG_LOCAL_CACHE_DIR=${ZIG_LOCAL_CACHE_DIR:-$(cygpath -w "$here/.zig-cache")}
+  export ZIG_GLOBAL_CACHE_DIR=${ZIG_GLOBAL_CACHE_DIR:-$(cygpath -w "$here/.zig-cache/global")}
+fi
+
+# <dir> <repository> <tag> <commit>: a pinned checkout.
+pinned() {
+  if [ ! -d "$here/$1" ]; then
+    git clone -q --depth 1 --branch "$3" "https://github.com/$2.git" "$here/$1"
+  fi
+  have=$(git -C "$here/$1" rev-parse HEAD)
+  if [ "$have" != "$4" ]; then
+    echo "$1 is at $have, expected $3 ($4)" >&2
+    exit 1
+  fi
+  printf '%-8s %-8s %s\n' "$1" "$3" "$4" >> "$out/VERSIONS"
+}
+mkdir -p "$out"
+: > "$out/VERSIONS"
+pinned lmdb-src   LMDB/lmdb           LMDB_1.0.2 c279e0477c713076893e8c2b1a6337e421c15867
+pinned zstd-src   facebook/zstd       v1.5.7     f8745da6ff1ad1e7bab384bd1f9d742439278e99
+pinned blake3-src BLAKE3-team/BLAKE3  1.8.7      f3149ec5bb5449af877ba20377a11008ff499fa2
+pinned xxhash-src Cyan4973/xxHash     v0.8.4     c87183a77d67f7d37e3d2d1b7eaac5e7c695e4f0
+
+lmdb="$here/lmdb-src/libraries/liblmdb"
+zstd="$here/zstd-src/lib"
+b3="$here/blake3-src/c"
+xxh="$here/xxhash-src"
+
+# zig cc, retried: on Windows it sometimes fails the first build of its own
+# MinGW runtime ("failed to parse ... .obj.d"); what it built is cached, so a
+# retry finishes it.
+cc() {
+  for try in 1 2 3; do
+    if "$zig" cc "$@"; then return 0; fi
+    [ "$try" = 3 ] && exit 1
+    echo "retrying" >&2
+  done
+}
+
+# <zig target> <platform dir> <file name>
+build() {
+  target=$1 dir=$2 name=$3
+  obj="$here/.zig-cache/obj/$dir"
+  rm -rf "$obj" && mkdir -p "$obj" "$out/$dir"
+  pic=-fPIC; case $target in *windows*) pic= ;; esac
+  # <flags> -- <sources>: each to its own object (the libraries' flags differ)
+  compile() {
+    flags=""
+    while [ "$1" != "--" ]; do flags="$flags $1"; shift; done; shift
+    for s in "$@"; do
+      cc -target "$target" -O2 -DNDEBUG $pic $flags -c "$s" -o "$obj/$(basename "$(dirname "$s")")-$(basename "$s").o"
+    done
+  }
+  compile -pthread -- "$lmdb/mdb.c" "$lmdb/midl.c" "$lmdb/module.c"
+  # zstd's x86-64 Huffman decoder is ELF/Mach-O assembly; Windows builds go
+  # without it, as an MSVC build does
+  zasm="" zflags=""
+  case $target in
+    x86_64-linux*|x86_64-macos*) zasm="$zstd/decompress/huf_decompress_amd64.S" ;;
+    *windows*) zflags=-DZSTD_DISABLE_ASM ;;
+  esac
+  compile -DXXH_NAMESPACE=ZSTD_ $zflags -- \
+    "$zstd"/common/*.c "$zstd"/compress/*.c "$zstd"/decompress/*.c $zasm
+  case $target in
+    x86_64-windows*) b3simd="$b3/blake3_sse2_x86-64_windows_gnu.S $b3/blake3_sse41_x86-64_windows_gnu.S $b3/blake3_avx2_x86-64_windows_gnu.S $b3/blake3_avx512_x86-64_windows_gnu.S"; b3flags= ;;
+    x86_64-*)        b3simd="$b3/blake3_sse2_x86-64_unix.S $b3/blake3_sse41_x86-64_unix.S $b3/blake3_avx2_x86-64_unix.S $b3/blake3_avx512_x86-64_unix.S"; b3flags= ;;
+    aarch64-*)       b3simd="$b3/blake3_neon.c"; b3flags=-DBLAKE3_USE_NEON=1 ;;
+  esac
+  compile $b3flags -- "$b3/blake3.c" "$b3/blake3_dispatch.c" "$b3/blake3_portable.c" $b3simd
+  compile -- "$xxh/xxhash.c"
+  compile -I"$b3" -- "$here/aether_native.c"
+  libs=""; case $target in *linux*) libs="-lpthread -ldl" ;; esac
+  cc -target "$target" -s -shared -o "$out/$dir/$name" "$obj"/*.o $libs
+  rm -f "$out/$dir/"*.pdb "$out/$dir/"*.lib
+  echo "$dir/$name $(wc -c < "$out/$dir/$name")"
+}
+
+# Linux builds against glibc 2.28 (2018), so they load on any current distribution.
+build x86_64-windows-gnu      windows-x86_64  aether_native.dll
+build aarch64-windows-gnu     windows-aarch64 aether_native.dll
+build x86_64-linux-gnu.2.28   linux-x86_64    libaether_native.so
+build aarch64-linux-gnu.2.28  linux-aarch64   libaether_native.so
+build x86_64-macos            macos-x86_64    libaether_native.dylib
+build aarch64-macos           macos-aarch64   libaether_native.dylib

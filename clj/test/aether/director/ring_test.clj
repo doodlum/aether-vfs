@@ -5,7 +5,7 @@
             [aether.director.proto :as p]
             [aether.director.registry :as registry]
             [aether.director.ring :as ring]
-            [aether.director.tree :as tree]
+            [aether.director.provider.tree :as tree]
             [clojure.test :refer [deftest is testing]])
   (:import (java.lang.foreign Arena MemorySegment ValueLayout)
            (java.nio.file Files)))

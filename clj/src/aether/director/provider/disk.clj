@@ -1,4 +1,4 @@
-(ns aether.director.disk
+(ns aether.director.provider.disk
   "A disk provider: a real directory, readable and writable. Reads and writes
   are positional FileChannel calls straight into or out of the ring's memory
   (no lock shared between handles, no intermediate buffer). Windows file

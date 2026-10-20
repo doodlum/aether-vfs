@@ -5,6 +5,8 @@
                    [--zip <file>]... [--layer <dir>]...     ; root 0's content, later wins
                    [--write-layer <dir>]                   ; root 0's writes: a copy-on-write overlay
                    [--root <id>=<path>] [--root-layer <id>=<dir>]... [--root-write <id>=<dir>]  ; more roots
+                   [--store <dir>]                         ; block storage (aether.director.storage)
+                   [--store-write <id>=<layer>]...          ; a root's writes into a storage layer
                    [--registry <dir>]                      ; virtualize the registry: overlay.reg in <dir>
                    [--stage <vpath> [--fallback <dir>]... [--also <vpath>]...]
                    [--env K=V]...
@@ -13,14 +15,15 @@
   The program sees <session>/root as a folder holding the content. With
   --stage, the image is the content's own <vpath>, staged with its import
   closure; otherwise <exe> is a real file. Exits with the program's code."
-  (:require [aether.director.compose :as compose]
-            [aether.director.disk :as disk]
+  (:require [aether.director.provider.compose :as compose]
+            [aether.director.provider.disk :as disk]
             [aether.director.launch :as launch]
             [aether.director.registry :as registry]
             [aether.director.ring :as ring]
+            [aether.director.storage :as storage]
             [aether.director.stage :as stage]
-            [aether.director.tree :as tree]
-            [aether.director.zip :as zip]
+            [aether.director.provider.tree :as tree]
+            [aether.director.provider.zip :as zip]
             [clojure.java.io :as io]
             [clojure.string :as str])
   (:import (java.lang.foreign Arena))
@@ -39,6 +42,8 @@
       "--root-layer" (let [[id d] (str/split b #"=" 2)]
                        (recur more (update-in opts [:root-content (parse-long id)] (fnil conj []) [:dir d])))
       "--registry" (recur more (assoc opts :registry b))
+      "--store"   (recur more (assoc opts :store b))
+      "--store-write" (let [[id nm] (str/split b #"=" 2)] (recur more (assoc-in opts [:store-write (parse-long id)] nm)))
       "--stage"   (recur more (assoc opts :stage b))
       "--fallback" (recur more (update opts :fallback conj b))
       "--also"    (recur more (update opts :also conj b))
@@ -61,10 +66,15 @@
         ms     #(long (/ (- (System/nanoTime) t0) 1e6))
         log    (fn [& xs] (binding [*out* *err*] (apply println "[director]" (ms) "ms:" xs)))
         arena  (Arena/ofShared)
-        ;; each root: its layers indexed, under a copy-on-write overlay when it has a write layer
+        stor   (when-let [d (:store opts)] (storage/open d))
+        ;; each root: its layers indexed, under a copy-on-write overlay when it
+        ;; has a write layer (a folder, or a storage layer)
         root   (fn [id layers]
-                 (let [lower (tree/build (content arena layers))]
-                   (if-let [w (get-in opts [:write id])] (compose/overlay (disk/disk w) lower) lower)))
+                 (let [lower (tree/build (content arena layers))
+                       upper (if-let [nm (get-in opts [:store-write id])]
+                               (storage/layer (or stor (throw (ex-info "--store-write needs --store" {}))) nm)
+                               (some-> (get-in opts [:write id]) disk/disk))]
+                   (if upper (compose/overlay upper lower) lower)))
         t      (root 0 (:content opts))
         more   (into {} (for [[id _] (:roots opts)] [id (root id (get-in opts [:root-content id] []))]))
         _      (log "content indexed")
@@ -89,6 +99,7 @@
     (when staged (stage/cleanup! staged stage-dir))
     (ring/stop server)
     (when reg (registry/close! reg))
+    (when stor (storage/close stor))
     (.close arena)
     (shutdown-agents)
     (System/exit code)))

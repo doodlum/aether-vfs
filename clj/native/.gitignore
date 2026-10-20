@@ -1,0 +1,5 @@
+lmdb-src/
+zstd-src/
+blake3-src/
+xxhash-src/
+.zig-cache/

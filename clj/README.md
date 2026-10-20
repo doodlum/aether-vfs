@@ -11,14 +11,21 @@ changes. It launches Skyrim SE from a Stored zip (below).
 | | |
 |---|---|
 | `java/aether/director/Native.java` | VarHandle atomics on the mapping, kernel32 downcalls (sections, events). These are signature-polymorphic, which Clojure can only reach by reflection. |
+| `java/aether/director/NativeLib.java` | Finds this platform's `aether_native` in the jar, extracts it once to a per-user cache (named by its hash), loads it. |
+| `java/aether/director/Lmdb.java`, `Codec.java` | FFM bindings: LMDB 1.0; zstd, xxh3, BLAKE3. |
+| `native/` | `build` cross-compiles `aether_native` for six platforms; `aether_native.c`, BLAKE3 helpers. |
 | `java/aether/director/Guard.java` | Calls a request handler without boxing its result: a Clojure `try` allocates a Long per request. |
 | `src/aether/director/proto.clj` | The wire contract: header and slot layout, geometry, opcodes, flags, statuses. |
 | `src/aether/director/path.clj` | `fold` (exactly Rust's `char::to_lowercase`, per code point) and vpath normalization. |
 | `src/aether/director/provider.clj` | The provider protocol (below). |
-| `src/aether/director/tree.clj` | Index provider: content that never changes (Stored zip entries, mapped files), indexed once; READDIR replies encoded once. |
-| `src/aether/director/disk.clj` | Disk provider: a real folder, readable and writable. |
-| `src/aether/director/compose.clj` | `layered` (read-only, later wins) and `overlay` (copy-on-write). |
-| `src/aether/director/zip.clj` | Stored ZIP/ZIP64 archives, mapped once; entries are slices. |
+| `src/aether/director/provider/tree.clj` | Index provider: content that never changes (Stored zip entries, mapped files), indexed once; READDIR replies encoded once. |
+| `src/aether/director/provider/disk.clj` | Disk provider: a real folder, readable and writable. |
+| `src/aether/director/provider/compose.clj` | `layered` (read-only, later wins) and `overlay` (copy-on-write). |
+| `src/aether/director/provider/zip.clj` | Stored ZIP/ZIP64 archives, mapped once; entries are slices. |
+| `src/aether/director/provider/layer.clj` | A storage layer: a persistent, writable namespace in the block store. |
+| `src/aether/director/provider/cached.clj` | A pull-through cache over a slow, immutable source. |
+| `src/aether/director/store.clj`, `store/` | The block store: packs (`pack.clj`), the LMDB index (`lmdb.clj`). |
+| `src/aether/director/storage.clj`, `storage/` | Storage: the store plus the catalog (`catalog.clj`) and RAM tier (`ram.clj`); layers, live files, the cache. |
 | `src/aether/director/ring.clj` | Section, header, events, worker threads, every opcode. Requests are read in place and replies written over them; bulk reads go straight into the slot's arena bank. Also the warm-up. |
 | `src/aether/director/registry.clj` | The registry overlay, its wire encodings, and `overlay.reg`. |
 | `src/aether/director/stage.clj` | Staging a launch image and its PE import closure. |
@@ -99,6 +106,8 @@ its READDIR replies encoded can also implement `Listing`.
 | `tree/build`, `tree/from-dir` | Index of [path MemorySegment] pairs: zip slices (`zip/open`), mapped files. Read-only. |
 | `disk/disk` | A real folder. Creating a file makes missing parents; MKDIR is OK on an existing directory. |
 | `compose/layered` | Read-only stack; later layers win; listings are unioned. |
+| `storage/layer` | A layer in block storage (below): rows in the catalog, data in the store, a row and its blocks committed together. Writes collect in whole blocks per open file and commit when there are many, on truncate and on close. Same semantics as `disk/disk`. |
+| `storage/cached` | A slow, immutable source behind a pull-through cache: metadata is the source's, content comes from RAM, the store, or (a whole unit at a time) the source. |
 | `compose/overlay` | A writable upper over a read-only lower: copy-up on write (via a `.cu.` temp and a rename), `.wh.<name>` whiteouts for deletes, listings merged with the lower's spelling kept. It indexes the upper, so reading lower content costs no disk stat, and a later session sees what the last one left. |
 
 **Adding one:** implement the two protocols (and `Listing` if listings are
@@ -116,6 +125,82 @@ creates it, and a base-only directory still can't be renamed (as upstream).
 director with a write layer: copy-on-write of a read-only file, write/append
 round trips, rename and delete, same-handle write-then-read, CREATE_NEW
 exclusivity.
+
+## The native library
+
+`aether_native` is LMDB 1.0.2, zstd 1.5.7, BLAKE3 1.8.7 and xxHash 0.8.4
+(each pinned to a tag and commit in `native/build`) in one shared library,
+called through FFM: no JNI, no `sun.misc.Unsafe`, and zstd decompresses
+straight into a MemorySegment. `native/build` cross-compiles it with Zig's C
+compiler for Windows, Linux (glibc 2.28) and macOS, each x86_64 and aarch64,
+from any host; the results are committed under `resources/natives/`
+(0.6-0.9 MB each), so a build needs neither Zig nor the sources. The jar
+carries all six; `NativeLib` extracts this machine's once. Rerun
+`native/build` (with `zig` and `git`) only to change a version.
+
+## The block store
+
+`aether.director.store` is aether-vfs's aether-block-store (Rust, on the
+`live-freeze` branch) in Clojure: a deduplicating, compressing, sparse
+store of file contents. Files are fixed-size blocks (64 KiB by default),
+each identified by BLAKE3-128 and stored once, zstd-compressed, in
+append-only pack files whose format is the Rust store's byte for byte (40-
+byte record header, xxh3 checksum). Blocks are reference-counted per
+manifest slot; `clone-files!` copies a file without copying data.
+
+The index is LMDB, not redb: `files`, `blocks`, `dedup`, `packs`, `meta`
+databases in one environment. One writer thread group-commits: every write
+queued while a commit runs goes into the next one, each in a nested
+transaction. **Every write is durable when it returns**: each commit syncs
+the pack bytes its rows point at, then LMDB syncs. Measured on this machine:
+a synced commit is 0.2 ms (p50) / 0.6 ms (p99), 21,000 durable writes/s
+from 16 threads, reads 0.3-0.8 µs; so the Rust store's deferred durability
+(and its clean-shutdown tokens) has nothing to buy here. Recovery at open
+is short: the active pack is cut back to the end its last commit recorded,
+retired and never-committed packs are deleted.
+
+Reads take a snapshot and no lock. A record that fails its checks (header,
+lengths, hash, checksum, zstd) is healed: its rows are dropped and the
+block reads as missing, for the caller to fetch again. `compact!` rewrites
+sealed packs with enough garbage (live records copied unchanged, bad ones
+healed), and deletes a retired pack once no read can be using it.
+`verify` checks every manifest, count, dedup row, pack total and record.
+Not ported: the GPU compressor (optional upstream, a private crate) and
+write classes.
+
+Tests (`store_test.clj`): Rust's lifecycle, read, write, compaction and
+verify tests; crash tests that halt a child JVM at named points (after an
+append, during compaction) and check the store after; and a test.check
+model test of random puts, resizes, writes, deletes, clones and
+compactions against an in-memory model.
+
+## Storage
+
+`aether.director.storage` is aether-storage: the store plus a catalog and a
+RAM tier. The catalog (layers, entries, live files, cache files) is more
+databases in the store's LMDB environment, so a catalog row and the blocks
+it names commit together. That removes most of aether-storage: no durable
+points, no reconcile pass, no catalog/store ordering rules.
+
+- **Layers** (`storage/layer`): writable namespaces, a Provider each,
+  usually the upper of `compose/overlay`. They pass the conformance suite
+  alone and as an overlay's upper. A file deleted while open stays
+  readable through its handles; a renamed directory's open files commit to
+  their new place; growing a file writes zero blocks, so a layer file is
+  never sparse.
+- **Live files** (`storage/freeze`): a layer's files frozen under keys
+  derived from the layer, the file and its content digest. Idempotent; a
+  live file shares its blocks and outlives the layer file.
+- **The cache** (`storage/cached`): a slow, immutable source (a CDN depot,
+  an archive) read through: RAM tier, store, then the source a unit at a
+  time; concurrent misses share one fetch. `enforce-cache-budget!` evicts
+  the least recently used cache files (never open ones) and compacts.
+- **The RAM tier**: decompressed blocks in a sharded CLOCK cache.
+
+`--store <dir> --store-write <id>=<layer>` gives a root a storage layer as
+its write layer. `rust/`'s `vfs-fixture-writepath` passes with one
+(including the copy-up of a read-only file), and Skyrim SE runs with all
+three of its roots' writes in layers (below).
 
 ## Launching a game
 
@@ -138,6 +223,25 @@ clojure -M:run --session 'C:\tmp\skyrim-clj' --natives <rust/target/release> \
   --root '1=C:\Users\<you>\Documents\My Games\Skyrim Special Edition' --root-layer '1=<profile>\mygames' \
   --root '2=C:\Users\<you>\AppData\Local\Skyrim Special Edition' --root-layer '2=<profile>\localappdata'
 ```
+
+With `--store <dir> --store-write 0=skyrim --store-write 1=mygames
+--store-write 2=localappdata`, the three roots' writes go to storage layers
+instead (2026-10-20): the same 9,401 requests, `Plugins.txt` (and the
+`Saves`, `Creations`, `Mods`, `Data/ShaderCache` folders) created in the
+layers, and the store verifies clean afterwards.
+
+Closing the game's window (WM_CLOSE: the X, Alt+F4, `taskkill`) ends it with
+0xC0000005, with storage layers and with folders alike. It is Skyrim's own
+renderer: on close it resizes the swap chain, `GetBuffer` fails, and the
+unchecked texture is read at `SkyrimSE.exe+0xe4cce2` (in the function at
+`+0xe4cc50`, from WinMain). No shim code is on that stack; the calls are
+DXGI/D3D11, which the shim doesn't touch; and a minimize and restore before
+closing makes the same session exit 0. A debugger attached to the game sees
+nothing of it, because SteamStub hides the main thread from debuggers: its
+exceptions are never reported, and a breakpoint it hits ends the process
+with 0x80000003. `VFS_SHIM_EXCEPTION_LOG=<file>` makes the shim record every
+fatal-class exception (code, module+offset, unwound stack) from a vectored
+handler, which runs on hidden threads too; that is how this one was found.
 
 Add `--write-layer <dir>` (root 0) and `--root-write <id>=<dir>` to give a
 root a copy-on-write overlay: with them, the game creates its `Saves` folder

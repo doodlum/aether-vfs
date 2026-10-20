@@ -1,4 +1,4 @@
-(ns aether.director.zip
+(ns aether.director.provider.zip
   "Stored (uncompressed) zip archives as director content. The whole archive is
   memory-mapped once; each entry is a slice of that mapping, so a read
   anywhere in a 16 GB archive is one copy with no lock and no system call.
@@ -91,7 +91,7 @@
 
 (defn open
   "Maps the Stored zip at `path` in `arena` and returns [[path slice] …] for
-  aether.director.tree/build, with a common top folder stripped. Throws on a
+  aether.director.provider.tree/build, with a common top folder stripped. Throws on a
   compressed entry, naming it."
   [^Arena arena path]
   (with-open [ch (FileChannel/open (Path/of (str path) (make-array String 0))

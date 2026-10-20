@@ -1,11 +1,11 @@
-(ns aether.director.tree
+(ns aether.director.provider.tree
   "An index provider: content that never changes while served (Stored zip
   entries, memory-mapped files), indexed once by folded vpath. Serving is a
   lookup; a directory's READDIR reply is encoded once, here; a read is one
   copy from the content's MemorySegment into the arena.
 
   Read-only: every mutation answers ST_READ_ONLY. Put a writable layer over
-  it (aether.director.compose/overlay) for writes."
+  it (aether.director.provider.compose/overlay) for writes."
   (:require [aether.director.path :as path]
             [aether.director.proto :as p]
             [aether.director.provider :as prov])

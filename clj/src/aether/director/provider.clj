@@ -1,6 +1,6 @@
 (ns aether.director.provider
   "The provider protocol: where a root's files come from. The director serves
-  each root from one provider, usually composed (aether.director.compose):
+  each root from one provider, usually composed (aether.director.provider.compose):
   indexed archives and folders under a writable overlay, say.
 
   Paths are vpaths: root-relative, `/`-separated, normalized and case-folded

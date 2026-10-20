@@ -1,11 +1,12 @@
 (ns aether.director.provider-test
   "The provider conformance suite (after vfs-provider's conformance.rs), run
   against every provider; then the overlay's own behaviour."
-  (:require [aether.director.compose :as compose]
-            [aether.director.disk :as disk]
+  (:require [aether.director.provider.compose :as compose]
+            [aether.director.provider.disk :as disk]
             [aether.director.proto :as p]
             [aether.director.provider :as prov]
-            [aether.director.tree :as tree]
+            [aether.director.provider.tree :as tree]
+            [aether.director.storage :as storage]
             [clojure.java.io :as io]
             [clojure.test :refer [deftest is testing]])
   (:import (aether.director.provider Entry Stat)
@@ -22,6 +23,13 @@
 (def fixture {"a.txt" "hello" "sub/b.txt" "world!"})
 
 (defn- index-of [files] (tree/build (for [[k v] files] [k (seg v)])))
+
+(defn- layer-of
+  "A storage layer holding `files` (its storage stays open for the test run)."
+  [files]
+  (let [s (storage/open (temp-dir) {:block-size 4096 :threads 2})]
+    (storage/put-files! s "test" (for [[k v] files] [k (.getBytes ^String v "UTF-8")]))
+    (storage/layer s "test")))
 
 (defn- disk-of [files]
   (let [d (temp-dir)]
@@ -157,6 +165,8 @@
                                            (index-of {"a.txt" "hello"})])
                false)
   (conformance "disk" (disk-of fixture) true)
+  (conformance "layer" (layer-of fixture) true)
+  (conformance "overlay: layer over index" (compose/overlay (layer-of {}) (index-of fixture)) true)
   (conformance "overlay: disk over index" (compose/overlay (disk/disk (temp-dir)) (index-of fixture)) true)
   (conformance "overlay: disk over layered" (compose/overlay (disk/disk (temp-dir))
                                                              (compose/layered [(index-of {"a.txt" "hello"})
