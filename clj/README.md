@@ -103,6 +103,10 @@ clojure -M:run --session 'C:\tmp\skyrim-clj' --natives <rust/target/release> \
   --root '2=C:\Users\<you>\AppData\Local\Skyrim Special Edition' --root-layer '2=<profile>\localappdata'
 ```
 
+Add `--write-layer <dir>` (root 0) and `--root-write <id>=<dir>` to give a
+root a copy-on-write overlay: with them, the game creates its `Saves` folder
+and rewrites `plugins.txt` in those folders, and nothing real is touched.
+
 Result (2026-10-19): the game window in 4.1 s from the `clojure` command
 (Clojure CLI and JVM start included; the director itself is serving 0.32 s
 after its JVM starts), 9,383 requests, and a stable game. `--trace` counts
