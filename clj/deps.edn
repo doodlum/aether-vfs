@@ -13,6 +13,10 @@
   :serve {:main-opts ["-m" "aether.director.main"]
           :jvm-opts  ["--enable-native-access=ALL-UNNAMED" "-XX:+UseZGC"]}
 
+  ;; launch a program under the director (see aether.director.run)
+  :run {:main-opts ["-m" "aether.director.run"]
+        :jvm-opts  ["--enable-native-access=ALL-UNNAMED" "-XX:+UseZGC"]}
+
   ;;   clojure -M:test
   :test {:extra-paths ["test"]
          :extra-deps  {lambdaisland/kaocha {:mvn/version "1.91.1392"}}

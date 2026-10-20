@@ -7,7 +7,9 @@
   A directory's READDIR reply is encoded once, here, and copied per request."
   (:require [aether.director.path :as path])
   (:import (java.io ByteArrayOutputStream)
-           (java.lang.foreign MemorySegment)
+           (java.lang.foreign Arena MemorySegment)
+           (java.nio.channels FileChannel FileChannel$MapMode)
+           (java.nio.file Files LinkOption OpenOption Path StandardOpenOption)
            (java.nio ByteBuffer ByteOrder)
            (java.nio.charset StandardCharsets)
            (java.util HashMap)))
@@ -69,3 +71,29 @@
         pick  (fn [cls] (->> nodes (filter #(instance? cls (.getValue ^java.util.Map$Entry %)))
                              (map #(.getKey ^java.util.Map$Entry %)) (take n) vec))]
     {:files (pick File) :dirs (pick Dir)}))
+
+(defn- map-file
+  "The file's bytes, memory-mapped read-only in `arena`."
+  ^MemorySegment [^Arena arena ^Path p]
+  (with-open [ch (FileChannel/open p (into-array OpenOption [StandardOpenOption/READ]))]
+    (let [n (.size ch)]
+      (if (zero? n)
+        (MemorySegment/ofArray (byte-array 0))
+        (.map ch FileChannel$MapMode/READ_ONLY 0 n arena)))))
+
+(defn dir-files
+  "[[path data] …] for every file under `dir`, each memory-mapped in `arena`,
+  so a read is one copy from the mapping into the arena with no system call.
+  Mappings live as long as `arena` (Arena/ofShared, closed when serving ends).
+  Empty directories aren't served (only paths implied by files)."
+  [^Arena arena dir]
+  (let [root (.toAbsolutePath (.toPath (java.io.File. (str dir))))]
+    (with-open [paths (Files/walk root (make-array java.nio.file.FileVisitOption 0))]
+      (vec (for [^Path p (iterator-seq (.iterator paths))
+                 :when (Files/isRegularFile p (make-array LinkOption 0))]
+             [(.replace (str (.relativize root p)) \\ \/) (map-file arena p)])))))
+
+(defn from-dir
+  "A tree serving the directory `dir` from disk (see dir-files)."
+  [^Arena arena dir]
+  (build (dir-files arena dir)))
