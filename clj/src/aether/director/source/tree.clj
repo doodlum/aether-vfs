@@ -25,24 +25,23 @@
   [files order]
   (let [nodes (java.util.HashMap.)]
     (.put nodes "" {:name "" :dir? true :children []})
-    (doseq [{:keys [^String path size key] dir-entry? :dir?} files]
+    (doseq [{:keys [^String path size] file-key :key dir-entry? :dir?} files]
       (let [parts (remove empty? (str/split path #"[/\\]"))]
         (when (seq parts)
-          (loop [[part & more] parts parent "" ok true]
-            (when ok
-              (let [k (if (= "" parent) (path/fold part) (str parent "/" (path/fold part)))
-                    existing (.get nodes k)]
-                (if (or more dir-entry?)
-                  (cond
-                    (nil? existing)
-                    (do (.put nodes k {:name part :dir? true :children []})
-                        (.put nodes parent (update (.get nodes parent) :children conj k))
-                        (when more (recur more k true)))
-                    (:dir? existing) (when more (recur more k true))
-                    :else nil)                                   ; runs through a file: skipped
-                  (when (nil? existing)
-                    (.put nodes k {:name part :size (long size) :key key})
-                    (.put nodes parent (update (.get nodes parent) :children conj k))))))))))
+          (loop [[part & more] parts parent ""]
+            (let [k (if (= "" parent) (path/fold part) (str parent "/" (path/fold part)))
+                  existing (.get nodes k)]
+              (if (or more dir-entry?)
+                (cond
+                  (nil? existing)
+                  (do (.put nodes k {:name part :dir? true :children []})
+                      (.put nodes parent (update (.get nodes parent) :children conj k))
+                      (when more (recur more k)))
+                  (:dir? existing) (when more (recur more k))
+                  :else nil)                                     ; runs through a file: skipped
+                (when (nil? existing)
+                  (.put nodes k {:name part :size (long size) :key file-key})
+                  (.put nodes parent (update (.get nodes parent) :children conj k)))))))))
     (let [m (into {} nodes)]
       (if (= order :sorted)
         (into {} (map (fn [[k v]] [k (cond-> v (:dir? v) (update :children #(vec (sort %))))])) m)

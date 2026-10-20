@@ -18,7 +18,7 @@
            (java.lang.foreign MemorySegment ValueLayout)
            (java.nio ByteBuffer ByteOrder)
            (java.util ArrayList)
-           (java.util.concurrent CompletableFuture LinkedBlockingQueue TimeUnit)
+           (java.util.concurrent CompletableFuture ExecutionException LinkedBlockingQueue)
            (java.util.concurrent.locks ReentrantReadWriteLock)))
 
 (set! *warn-on-reflection* true)
@@ -69,9 +69,9 @@
       env)))
 
 (defn dbi
-  "The handle of database `name`."
-  ^long [env name]
-  (or (get (:dbis env) name) (throw (ex-info (str "no database " name) {:name name}))))
+  "The handle of database `db-name`."
+  ^long [env db-name]
+  (or (get (:dbis env) db-name) (throw (ex-info (str "no database " db-name) {:name db-name}))))
 
 (defn max-key-size ^long [env] (Lmdb/maxKeySize (:ptr env)))
 
@@ -84,10 +84,12 @@
   [{:keys [^long ptr ^ReentrantReadWriteLock resize ^ThreadLocal readers all-readers]} f]
   ;; per thread: [txn depth], the txn kept reset between reads
   (let [^longs r (or (.get readers)
-                     (let [t (Lmdb/txnBegin ptr 0 Lmdb/RDONLY)]
+                     (let [t (Lmdb/txnBegin ptr 0 Lmdb/RDONLY)
+                           a (long-array [t 0])]
                        (Lmdb/txnReset t)
                        (swap! all-readers conj t)
-                       (doto (long-array [t 0]) (->> (.set readers)))))
+                       (.set readers a)
+                       a))
         txn    (aget r 0)
         outer? (zero? (aget r 1))
         rl     (.readLock resize)]
@@ -110,24 +112,24 @@
   `(read* ~env (fn [~(with-meta txn {:tag 'long})] ~@body)))
 
 (defn get-seg
-  "The value under `key` (bytes or a segment) in database `dbi`, as a view
+  "The value under key `k` (bytes or a segment) in database `db`, as a view
   valid for the transaction, or nil."
-  ^MemorySegment [txn dbi key]
-  (if (bytes? key)
-    (Lmdb/get (long txn) (int dbi) ^bytes key)
-    (Lmdb/get (long txn) (int dbi) ^MemorySegment key)))
+  ^MemorySegment [txn db k]
+  (if (bytes? k)
+    (Lmdb/get (long txn) (int db) ^bytes k)
+    (Lmdb/get (long txn) (int db) ^MemorySegment k)))
 
 (defn get-bytes
-  "The value under `key`, copied out, or nil."
-  ^bytes [^long txn ^long dbi key]
-  (when-let [^MemorySegment s (get-seg txn dbi key)] (.toArray s ValueLayout/JAVA_BYTE)))
+  "The value under key `k`, copied out, or nil."
+  ^bytes [^long txn ^long db k]
+  (when-let [^MemorySegment s (get-seg txn db k)] (.toArray s ValueLayout/JAVA_BYTE)))
 
 (defn reduce-range
-  "Reduces (f acc key-seg val-seg) over the entries of `dbi` from `start`
-  (inclusive; nil for the first) while (more? key-seg) holds. f may return
-  (reduced x). The segments are views, valid only during the call."
-  [txn dbi start more? f init]
-  (with-open [^Lmdb$Cursor c (Lmdb/cursor (long txn) (int dbi))]
+  "Reduces (f acc key-seg val-seg) over the entries of database `db` from
+  `start` (inclusive; nil for the first) while (more? key-seg) holds. f may
+  return (reduced x). The segments are views, valid only during the call."
+  [txn db start more? f init]
+  (with-open [^Lmdb$Cursor c (Lmdb/cursor (long txn) (int db))]
     (loop [ok  (if start (.seek c ^bytes start) (.first c))
            acc init]
       (if (and ok (more? (.key c)))
@@ -145,25 +147,28 @@
 
 ;; --- writes --------------------------------------------------------------------
 
+(defn- as-seg
+  "Bytes as a heap segment; a segment as it is."
+  ^MemorySegment [x]
+  (if (bytes? x) (MemorySegment/ofArray ^bytes x) x))
+
 (defn put!
-  "Puts `val` (bytes or segment) under `key` in a write txn; with :no-overwrite,
-  returns false (and writes nothing) if the key exists."
-  ([txn dbi key val] (put! txn dbi key val nil))
-  ([txn dbi key val opt]
-   (let [k (if (bytes? key) (MemorySegment/ofArray ^bytes key) key)
-         v (if (bytes? val) (MemorySegment/ofArray ^bytes val) val)]
-     (Lmdb/put (long txn) (int dbi) ^MemorySegment k ^MemorySegment v
-               (int (if (= opt :no-overwrite) Lmdb/NOOVERWRITE 0))))))
+  "Puts value `v` (bytes or segment) under key `k` in a write txn; with
+  :no-overwrite, returns false (and writes nothing) if the key exists."
+  ([txn db k v] (put! txn db k v nil))
+  ([txn db k v opt]
+   (Lmdb/put (long txn) (int db) (as-seg k) (as-seg v)
+             (int (if (= opt :no-overwrite) Lmdb/NOOVERWRITE 0)))))
 
 (defn reserve!
-  "Room for an `n`-byte value under `key`, in the map, to fill now."
-  ^MemorySegment [txn dbi key n]
-  (Lmdb/reserve (long txn) (int dbi) ^MemorySegment (if (bytes? key) (MemorySegment/ofArray ^bytes key) key) (long n) 0))
+  "Room for an `n`-byte value under key `k`, in the map, to fill now."
+  ^MemorySegment [txn db k n]
+  (Lmdb/reserve (long txn) (int db) (as-seg k) (long n) 0))
 
 (defn del!
-  "Deletes `key`; false if it wasn't there."
-  [^long txn ^long dbi key]
-  (if (bytes? key) (Lmdb/del txn (int dbi) ^bytes key) (Lmdb/del txn (int dbi) ^MemorySegment key)))
+  "Deletes key `k`; false if it wasn't there."
+  [^long txn ^long db k]
+  (if (bytes? k) (Lmdb/del txn (int db) ^bytes k) (Lmdb/del txn (int db) ^MemorySegment k)))
 
 (defn on-commit
   "Registers (f txn) to run on the writer thread in each commit that holds
@@ -249,9 +254,11 @@
   f may run more than once (after the map grows), so it should only write."
   [env f]
   (try (.get (submit env f))
-       (catch java.util.concurrent.ExecutionException e (throw (.getCause e)))))
+       (catch ExecutionException e (throw (.getCause e)))))
 
 (defmacro with-write
+  "Evaluates body with `txn` bound to a write transaction of `env` (see write!);
+  returns its result once committed."
   [[txn env] & body]
   `(write! ~env (fn [~(with-meta txn {:tag 'long})] ~@body)))
 
@@ -262,7 +269,7 @@
 
 (defn close
   "Stops the writer (after what's queued), and closes the environment."
-  [{:keys [^long ptr ^LinkedBlockingQueue queue ^Thread writer all-readers] :as env}]
+  [{:keys [^long ptr ^LinkedBlockingQueue queue ^Thread writer all-readers]}]
   (.put queue ::stop)
   (.join writer 60000)
   (doseq [t @all-readers] (Lmdb/txnAbort (long t)))
@@ -286,7 +293,17 @@
         :bytes (.put bb ^bytes v)))
     (.array bb)))
 
-(defmacro le-u32 [seg off] `(Integer/toUnsignedLong (.get ~(with-meta seg {:tag `MemorySegment}) ValueLayout/JAVA_INT_UNALIGNED (long ~off))))
-(defmacro le-u64 [seg off] `(.get ~(with-meta seg {:tag `MemorySegment}) ValueLayout/JAVA_LONG_UNALIGNED (long ~off)))
-(defmacro be-u32 [seg off] `(Integer/toUnsignedLong (.get ~(with-meta seg {:tag `MemorySegment}) (.withOrder ValueLayout/JAVA_INT_UNALIGNED ByteOrder/BIG_ENDIAN) (long ~off))))
-(defmacro be-u64 [seg off] `(.get ~(with-meta seg {:tag `MemorySegment}) (.withOrder ValueLayout/JAVA_LONG_UNALIGNED ByteOrder/BIG_ENDIAN) (long ~off)))
+(defn- seg-form
+  "For the macros below: `form`, hinted as a MemorySegment."
+  [form]
+  (with-meta form {:tag `MemorySegment}))
+
+(defmacro le-u32 [seg off]
+  `(Integer/toUnsignedLong (.get ~(seg-form seg) ValueLayout/JAVA_INT_UNALIGNED (long ~off))))
+(defmacro le-u64 [seg off]
+  `(.get ~(seg-form seg) ValueLayout/JAVA_LONG_UNALIGNED (long ~off)))
+(defmacro be-u32 [seg off]
+  `(Integer/toUnsignedLong
+    (.get ~(seg-form seg) (.withOrder ValueLayout/JAVA_INT_UNALIGNED ByteOrder/BIG_ENDIAN) (long ~off))))
+(defmacro be-u64 [seg off]
+  `(.get ~(seg-form seg) (.withOrder ValueLayout/JAVA_LONG_UNALIGNED ByteOrder/BIG_ENDIAN) (long ~off)))

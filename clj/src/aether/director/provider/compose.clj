@@ -8,14 +8,14 @@
             [aether.director.proto :as p]
             [aether.director.provider :as prov])
   (:import (aether.director.provider Entry Stat)
-           (java.lang.foreign Arena)
            (java.util LinkedHashMap TreeMap)
            (java.util.concurrent ConcurrentHashMap)
-           (java.util.concurrent.atomic AtomicLong)))
+           (java.util.concurrent.atomic AtomicLong)
+           (java.util.function Function)))
 
 (set! *warn-on-reflection* true)
 
-(def ^:private write-flags (bit-or p/open-write p/open-create p/open-trunc p/open-append))
+(def ^:private ^:const write-flags (bit-or p/open-write p/open-create p/open-trunc p/open-append))
 
 (defn- top-with
   "The last of `layers` that has `vp`, with its stat: [layer stat] or nil."
@@ -88,10 +88,10 @@
 (def ^:private wh ".wh.")
 (def ^:private cu ".cu.")
 
-(defn- child ^String [^String dir ^String name] (if (= "" dir) name (str dir "/" name)))
+(defn- child ^String [^String dir ^String nm] (if (= "" dir) nm (str dir "/" nm)))
 
-(defn- marker? [^String name]
-  (let [n (path/fold name)] (or (.startsWith n wh) (.startsWith n cu))))
+(defn- marker? [^String nm]
+  (let [n (path/fold nm)] (or (.startsWith n wh) (.startsWith n cu))))
 
 (deftype Overlay [upper lower
                   ^ConcurrentHashMap present        ; folded vpaths the upper holds (files and dirs)
@@ -137,10 +137,10 @@
   (let [es (prov/list-dir (.-upper o) dir)]
     (when (sequential? es)
       (doseq [^Entry e es
-              :let [name (.-name e) fname (path/fold name)]]
+              :let [nm (.-name e) fname (path/fold nm)]]
         (cond
           (.startsWith fname wh) (.put ^ConcurrentHashMap (.-whiteouts o) (child dir (subs fname (count wh))) Boolean/TRUE)
-          (.startsWith fname cu) (prov/delete! (.-upper o) (child dir name))
+          (.startsWith fname cu) (prov/delete! (.-upper o) (child dir nm))
           :else (let [fp (child dir fname)]
                   (mark-present! o fp)
                   (when (.-dir? ^Stat (.-stat e)) (index! o fp))))))))
@@ -172,7 +172,7 @@
   The copy keeps the lower's spelling. Returns a status."
   ^long [^Overlay o ^String fp]
   (locking (.computeIfAbsent ^ConcurrentHashMap (.-locks o) fp
-                             (reify java.util.function.Function (apply [_ _] (Object.))))
+                             (reify Function (apply [_ _] (Object.))))
     (if (present? o fp)
       p/ok
       (let [spelled (or (prov/spelling (.-lower o) fp) fp)
@@ -183,21 +183,10 @@
           (let [dst (prov/open (.-upper o) tmp (bit-or p/open-write p/open-create p/open-trunc))]
             (if (number? dst)
               (do (prov/close! src) dst)
-              (let [size (.-size ^Stat (prov/handle-stat src))
-                    st   (with-open [arena (Arena/ofConfined)]
-                           (let [buf (.allocate arena (long (max 1 (min size (* 1024 1024)))))
-                                 chunk (.byteSize buf)]
-                             (loop [pos 0]
-                               (if (>= pos size)
-                                 p/ok
-                                 (let [n (long (prov/read-into src buf 0 pos (min chunk (- size pos))))]
-                                   (if (<= n 0)
-                                     p/io-error
-                                     (let [w (long (prov/write-from dst buf 0 pos n))]
-                                       (if (neg? w) w (recur (+ pos n))))))))))]
+              (let [st (prov/copy! src dst (.-size ^Stat (prov/handle-stat src)))]
                 (prov/close! src)
                 (prov/close! dst)
-                (let [st (if (zero? (long st)) (long (prov/rename! (.-upper o) tmp spelled)) (long st))]
+                (let [st (if (zero? st) (long (prov/rename! (.-upper o) tmp spelled)) st)]
                   (if (zero? st)
                     (mark-present! o fp)
                     (prov/delete! (.-upper o) tmp))
@@ -240,8 +229,7 @@
           :else           (prov/stat (.-lower o) fp)))
 
   (list-dir [o fp]
-    (if (and (not= "" fp) (hidden? o fp))
-      nil
+    (when-not (and (not= "" fp) (hidden? o fp))
       (let [b  (prov/list-dir (.-lower o) fp)
             u  (when (or (= "" fp) (present? o fp)) (prov/list-dir (.-upper o) fp))
             ^ConcurrentHashMap w (.-whiteouts o)]

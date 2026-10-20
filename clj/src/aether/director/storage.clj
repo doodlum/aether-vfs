@@ -49,12 +49,15 @@
 ;; --- layers -------------------------------------------------------------------------------
 
 (defn layer
-  "The provider of layer `name`, created if it doesn't exist."
-  [{:keys [store layers] :as s} ^String name]
-  (or (get @layers name)
-      (let [id (store/write! store (fn [txn] (cat/create-layer! store txn name)))]
-        (get (swap! layers (fn [m] (if (m name) m (assoc m name (layer/layer (select-keys s [:store :ram]) id name)))))
-             name))))
+  "The provider of layer `layer-name`, created if it doesn't exist."
+  [{:keys [store layers] :as s} ^String layer-name]
+  (or (get @layers layer-name)
+      (let [id (store/write! store (fn [txn] (cat/create-layer! store txn layer-name)))]
+        (-> (swap! layers (fn [m]
+                            (if (m layer-name)
+                              m
+                              (assoc m layer-name (layer/layer (select-keys s [:store :ram]) id layer-name)))))
+            (get layer-name)))))
 
 (defn layers
   "Every layer's name."
@@ -62,38 +65,34 @@
   (store/read* store (fn [txn] (cat/layer-names store txn))))
 
 (defn delete-layer!
-  "Deletes layer `name` and its files. Refused (:layer-in-use) while one is open."
-  [{:keys [store layers]} ^String name]
-  (when-let [l (get @layers name)]
+  "Deletes layer `layer-name` and its files. Refused (:layer-in-use) while one is open."
+  [{:keys [store layers]} ^String layer-name]
+  (when-let [l (get @layers layer-name)]
     (when (pos? (layer/open-files l))
-      (throw (ex-info (str "layer " name " has open files") {::error :layer-in-use}))))
+      (throw (ex-info (str "layer " layer-name " has open files") {::error :layer-in-use}))))
   (store/write! store
                 (fn [txn]
-                  (when-let [id (cat/layer-id store txn name)]
+                  (when-let [id (cat/layer-id store txn layer-name)]
                     (doseq [[p e] (cat/subtree store txn id "")]
                       (when (:guid e) (store/delete-file! store txn (cat/layer-file-id (:guid e))))
                       (cat/del-entry! store txn id p))
-                    (cat/drop-layer! store txn name)
+                    (cat/drop-layer! store txn layer-name)
                     true)))
-  (swap! layers dissoc name)
+  (swap! layers dissoc layer-name)
   nil)
 
 (defn put-files!
-  "Writes whole files into layer `name` ([[vpath bytes] …], spelled paths;
-  missing directories created), replacing any there, in one commit."
-  [s ^String name files]
-  (let [{:keys [store]} s
-        l     (layer s name)
-        id    (:id l)
-        now   (quot (System/currentTimeMillis) 1000)
-        plan  (mapv (fn [[vp ^bytes data]] [vp (path/fold vp) (cat/new-guid) data]) files)]
+  "Writes whole files into layer `layer-name` ([[vpath bytes] …], spelled
+  paths; missing directories created), replacing any there, in one commit."
+  [{:keys [store] :as s} ^String layer-name files]
+  (let [id   (:id (layer s layer-name))
+        now  (quot (System/currentTimeMillis) 1000)
+        plan (mapv (fn [[vp ^bytes data]] [vp (path/fold vp) (cat/new-guid) data]) files)]
     (store/put-files! store
                       (mapv (fn [[_ _ guid data]] [(cat/layer-file-id guid) data]) plan)
                       (fn [txn]
                         (doseq [[vp folded guid ^bytes data] plan]
-                          (doseq [[f nm] (let [parts (clojure.string/split vp #"/")]
-                                           (for [i (range 1 (count parts))]
-                                             [(path/fold (clojure.string/join "/" (take i parts))) (nth parts (dec i))]))]
+                          (doseq [[f nm] (layer/ancestors-of vp)]
                             (when-not (cat/get-entry store txn id f)
                               (cat/put-entry! store txn id f {:dir? true :name nm :mtime now})))
                           (when-let [old (cat/get-entry store txn id folded)]
@@ -118,12 +117,12 @@
     (-> (Codec/derive live-context) (.update (.array bb)) (.finish 16))))
 
 (defn freeze
-  "Freezes layer `name`'s files (those under `prefix`, default all) into live
-  files: immutable copies, sharing their blocks, under keys derived from the
-  file and its content. Idempotent: an unchanged file keeps its key.
+  "Freezes layer `layer-name`'s files (those under `prefix`, default all) into
+  live files: immutable copies, sharing their blocks, under keys derived from
+  the file and its content. Idempotent: an unchanged file keeps its key.
   Returns {vpath key-string}."
-  [{:keys [store] :as s} ^String name & [{:keys [prefix] :or {prefix ""}}]]
-  (let [l  (layer s name)
+  [{:keys [store] :as s} ^String layer-name & [{:keys [prefix] :or {prefix ""}}]]
+  (let [l  (layer s layer-name)
         id (:id l)
         _  (layer/commit-open! l)]
     (store/write! store
@@ -140,17 +139,17 @@
                                 [p (key-string k)]))))))))
 
 (defn live-info
-  "{:len :mtime} of live file `key` (a key string), or nil."
-  [{:keys [store]} ^String key]
-  (store/read* store (fn [txn] (cat/get-live store txn (parse-key key)))))
+  "{:len :mtime} of live file `ks` (a key string), or nil."
+  [{:keys [store]} ^String ks]
+  (store/read* store (fn [txn] (cat/get-live store txn (parse-key ks)))))
 
 (defn live-keys [{:keys [store]}]
   (store/read* store (fn [txn] (mapv key-string (cat/live-keys store txn)))))
 
 (defn delete-live!
-  "Deletes live file `key`; false if there was none."
-  [{:keys [store]} ^String key]
-  (let [k (parse-key key)]
+  "Deletes live file `ks` (a key string); false if there was none."
+  [{:keys [store]} ^String ks]
+  (let [k (parse-key ks)]
     (store/write! store (fn [txn]
                           (when (cat/get-live store txn k)
                             (cat/del-live! store txn k)
@@ -158,10 +157,10 @@
                             true)))))
 
 (defn read-live!
-  "Reads live file `key` from `offset` into MemorySegment `dst`: as
-  store/read!, through the RAM tier's store."
-  [{:keys [store]} ^String key offset dst]
-  (store/read! store (cat/live-file-id (parse-key key)) (long offset) dst))
+  "Reads live file `ks` (a key string) from `offset` into MemorySegment
+  `dst`: as store/read!, through the RAM tier's store."
+  [{:keys [store]} ^String ks offset dst]
+  (store/read! store (cat/live-file-id (parse-key ks)) (long offset) dst))
 
 ;; --- the cache -----------------------------------------------------------------------------------
 
@@ -182,7 +181,7 @@
   none are left; open ones are kept. Returns the bytes freed."
   [{:keys [store ram ^ConcurrentHashMap opens]} done?]
   (let [fs (sort-by (comp :access second) (store/read* store (fn [txn] (cat/cache-files store txn))))]
-    (loop [[[k {:keys [bytes]}] & more] fs freed 0]
+    (loop [[[k {n :bytes}] & more] fs freed 0]
       (if (or (nil? k) (done? freed))
         freed
         (if (.containsKey opens (.formatHex (HexFormat/of) ^bytes k))
@@ -191,7 +190,7 @@
                                     (cat/del-cache-file! store txn k)
                                     (store/delete-file! store txn (cat/cache-file-id k))))
               (ram/invalidate! ram (cat/cache-file-id k))
-              (recur more (+ freed (long bytes)))))))))
+              (recur more (+ freed (long n)))))))))
 
 (defn enforce-cache-budget!
   "When the cache files hold more than :cache-bytes, deletes the least

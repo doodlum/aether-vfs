@@ -16,9 +16,12 @@
             [aether.director.registry :as registry])
   (:import (aether.director Guard Native Native$Section)
            (aether.director.provider Stat)
+           (java.io ByteArrayOutputStream)
            (java.lang.foreign Arena MemorySegment ValueLayout)
+           (java.nio ByteBuffer ByteOrder)
            (java.nio.charset StandardCharsets)
            (java.util.concurrent ConcurrentHashMap)
+           (java.util.function Function)
            (java.util.concurrent.atomic AtomicBoolean AtomicLong LongAdder)))
 
 (set! *warn-on-reflection* true)
@@ -26,11 +29,21 @@
 
 ;; --- little-endian access to the mapping (x64 is little-endian) ------------
 
-(defmacro ^:private u32 [seg off] `(Integer/toUnsignedLong (.get ~(with-meta seg {:tag `MemorySegment}) ValueLayout/JAVA_INT_UNALIGNED (long ~off))))
-(defmacro ^:private u64 [seg off] `(.get ~(with-meta seg {:tag `MemorySegment}) ValueLayout/JAVA_LONG_UNALIGNED (long ~off)))
-(defmacro ^:private put-i32 [seg off v] `(.set ~(with-meta seg {:tag `MemorySegment}) ValueLayout/JAVA_INT_UNALIGNED (long ~off) (unchecked-int ~v)))
-(defmacro ^:private put-i64 [seg off v] `(.set ~(with-meta seg {:tag `MemorySegment}) ValueLayout/JAVA_LONG_UNALIGNED (long ~off) (long ~v)))
-(defmacro ^:private put-u8 [seg off v] `(.set ~(with-meta seg {:tag `MemorySegment}) ValueLayout/JAVA_BYTE (long ~off) (unchecked-byte ~v)))
+(defn- seg-form
+  "For the macros below: `form`, hinted as a MemorySegment."
+  [form]
+  (with-meta form {:tag `MemorySegment}))
+
+(defmacro ^:private u32 [seg off]
+  `(Integer/toUnsignedLong (.get ~(seg-form seg) ValueLayout/JAVA_INT_UNALIGNED (long ~off))))
+(defmacro ^:private u64 [seg off]
+  `(.get ~(seg-form seg) ValueLayout/JAVA_LONG_UNALIGNED (long ~off)))
+(defmacro ^:private put-i32 [seg off v]
+  `(.set ~(seg-form seg) ValueLayout/JAVA_INT_UNALIGNED (long ~off) (unchecked-int ~v)))
+(defmacro ^:private put-i64 [seg off v]
+  `(.set ~(seg-form seg) ValueLayout/JAVA_LONG_UNALIGNED (long ~off) (long ~v)))
+(defmacro ^:private put-u8 [seg off v]
+  `(.set ~(seg-form seg) ValueLayout/JAVA_BYTE (long ~off) (unchecked-byte ~v)))
 
 ;; --- the server's state ------------------------------------------------------
 
@@ -69,7 +82,7 @@
   [^Ring r op outcome vp]
   (when-let [^ConcurrentHashMap t (.-trace r)]
     (.increment ^LongAdder (.computeIfAbsent t (str op " " outcome " " vp)
-                                             (reify java.util.function.Function
+                                             (reify Function
                                                (apply [_ _] (LongAdder.)))))))
 
 (defn- utf8-at
@@ -97,7 +110,7 @@
 (defmacro ^:private status-reply
   "A provider op's status as a reply with no payload."
   [st]
-  `(let [s# (long ~st)] (reply s# 0)))
+  `(reply ~st 0))
 
 ;; --- reads --------------------------------------------------------------------
 
@@ -244,7 +257,7 @@
       (reply p/bad-fh 0))))
 
 (defn- op-delete ^long [^Ring r ^long off ^long len]
-  (let [seg (.-seg r)
+  (let [seg  (.-seg r)
         prov (when (>= len 4) (provider-of r (u32 seg off)))
         vp   (when prov (vpath (utf8-at seg (+ off 4) (- len 4)) false))]
     (trace! r "delete" (if vp "asked" "bad") vp)
@@ -253,7 +266,7 @@
 (defn- op-mkdir
   "root u32, mode u32 | path (the mode is ignored)."
   ^long [^Ring r ^long off ^long len]
-  (let [seg (.-seg r)
+  (let [seg  (.-seg r)
         prov (when (>= len 8) (provider-of r (u32 seg off)))
         vp   (when prov (vpath (utf8-at seg (+ off 8) (- len 8)) false))]
     (trace! r "mkdir" (if vp "asked" "bad") vp)
@@ -270,21 +283,10 @@
       (let [dst (prov/open to-prov to (bit-or p/open-write p/open-create p/open-trunc))]
         (if (number? dst)
           (do (prov/close! src) dst)
-          (with-open [arena (Arena/ofConfined)]
-            (let [size (.-size ^Stat (prov/handle-stat src))
-                  buf  (.allocate arena (long (min size (* 1024 1024))))
-                  chunk (.byteSize buf)
-                  st   (loop [pos 0]
-                         (if (>= pos size)
-                           p/ok
-                           (let [n (long (prov/read-into src buf 0 pos (min chunk (- size pos))))]
-                             (if (<= n 0)
-                               p/io-error
-                               (let [w (long (prov/write-from dst buf 0 pos n))]
-                                 (if (neg? w) w (recur (+ pos n))))))))]
-              (prov/close! src)
-              (prov/close! dst)
-              (if (zero? (long st)) (prov/delete! from-prov from) st))))))))
+          (let [st (prov/copy! src dst (.-size ^Stat (prov/handle-stat src)))]
+            (prov/close! src)
+            (prov/close! dst)
+            (if (zero? st) (long (prov/delete! from-prov from)) st)))))))
 
 (defn- op-rename
   "RENAME: root u32, from_len u32, from, to. RENAME_X (`cross?`): from_root
@@ -315,9 +317,9 @@
   "root u32, skip u32 | path -> the provider's spelling of the path's
   components from `skip` on, joined by `/` (for GetFinalPathNameByHandle)."
   ^long [^Ring r ^long off ^long len]
-  (let [seg  (.-seg r)
-        prov (when (>= len 8) (provider-of r (u32 seg off)))
-        vp   (when prov (vpath (utf8-at seg (+ off 8) (- len 8)) true))
+  (let [seg     (.-seg r)
+        prov    (when (>= len 8) (provider-of r (u32 seg off)))
+        vp      (when prov (vpath (utf8-at seg (+ off 8) (- len 8)) true))
         spelled (when vp (prov/spelling prov vp))]
     (if (nil? spelled)
       (reply p/not-found 0)
@@ -358,9 +360,8 @@
             :else                                     (reply-bytes r off out)))))
     (reply p/not-supported 0)))
 
-(defn- dispatch ^long [r ^long slot]
-  (let [^Ring r r
-        seg  (.-seg r)
+(defn- dispatch ^long [^Ring r ^long slot]
+  (let [seg  (.-seg r)
         base (+ p/ring-header-size (* slot (.-stride r)))
         off  (+ base p/slot-header-size)
         op   (u32 seg (+ base p/sh-opcode))
@@ -420,17 +421,17 @@
 
 (defn- worker [^Ring r]
   (let [stop (.-stop r) spin-ns (.-spin-ns r)]
-    (loop [last-served (long 0) start (long 0)]
+    (loop [last-served 0 start 0]
       (when-not (.get ^AtomicBoolean stop)
-        (let [n    (serve-pass r start)
-              next (rem (inc start) p/slot-count)]
+        (let [n     (serve-pass r start)
+              start (rem (inc start) p/slot-count)]
           (if (pos? n)
             (do (.addAndGet ^AtomicLong (.-served r) n)
-                (recur (System/nanoTime) next))
+                (recur (System/nanoTime) start))
             (do (if (< (- (System/nanoTime) last-served) spin-ns)
                   (dotimes [_ 64] (Thread/onSpinWait))
                   (Native/waitFor (.-srv-event r) 1))
-                (recur last-served next))))))))
+                (recur last-served start))))))))
 
 ;; --- lifecycle -----------------------------------------------------------------
 
@@ -472,12 +473,12 @@
     (Native/setRelease seg (+ base p/sh-state) p/st-submitted)))
 
 (defn- le-bytes ^bytes [& fields]
-  (let [out (java.io.ByteArrayOutputStream.)]
+  (let [out (ByteArrayOutputStream.)]
     (doseq [[kind v] (partition 2 fields)]
       (case kind
-        :u32  (let [b (.order (java.nio.ByteBuffer/allocate 4) java.nio.ByteOrder/LITTLE_ENDIAN)]
+        :u32  (let [b (.order (ByteBuffer/allocate 4) ByteOrder/LITTLE_ENDIAN)]
                 (.write out (.array (.putInt b (unchecked-int v)))))
-        :u64  (let [b (.order (java.nio.ByteBuffer/allocate 8) java.nio.ByteOrder/LITTLE_ENDIAN)]
+        :u64  (let [b (.order (ByteBuffer/allocate 8) ByteOrder/LITTLE_ENDIAN)]
                 (.write out (.array (.putLong b (long v)))))
         :utf8 (.write out (.getBytes ^String v StandardCharsets/UTF_8))))
     (.toByteArray out)))
@@ -497,13 +498,11 @@
                         (roots-array {0 provider}) (ConcurrentHashMap.) (AtomicLong.)
                         0 0 0 (AtomicBoolean.) (AtomicLong.) nil nil nil)
           {:keys [files dirs]} (prov/sample provider 64)
-          slot   (long-array 1)
-          n      (long-array 1)
+          sent   (long-array 1)                ; requests so far: the next one's slot
           call   (fn [op flags ^bytes payload]
-                   (let [s (rem (aget slot 0) p/slot-count)
+                   (let [s    (rem (aget sent 0) p/slot-count)
                          base (+ p/ring-header-size (* s stride))]
-                     (aset slot 0 (inc (aget slot 0)))
-                     (aset n 0 (inc (aget n 0)))
+                     (aset sent 0 (inc (aget sent 0)))
                      (request! seg stride s op flags payload)
                      (when-not (= 1 (serve-pass r 0))
                        (throw (ex-info "warm-up: request not served" {:op op})))
@@ -528,7 +527,7 @@
               (ok! (call p/op-read 0 (le-bytes :u64 fh :u64 0 :u32 4096 :u32 0)) "read")
               (ok! (call p/op-read p/flag-read-bulk (le-bytes :u64 fh :u64 0 :u32 4096 :u32 0)) "bulk read")
               (ok! (call p/op-close 0 (le-bytes :u64 fh)) "close")))))
-      {:requests (aget n 0) :ms (/ (- (System/nanoTime) t0) 1e6)})))
+      {:requests (aget sent 0) :ms (/ (- (System/nanoTime) t0) 1e6)})))
 
 (defn start
   "Creates the section `name` (e.g. \"Local\\\\vfs_ring_…\") and its events,

@@ -18,7 +18,7 @@
             [aether.director.source.net :as net]
             [clojure.string :as str])
   (:import (aether.director Codec)
-           (java.lang.foreign MemorySegment ValueLayout)
+           (java.lang.foreign MemorySegment)
            (java.nio ByteBuffer ByteOrder)
            (java.nio.channels FileChannel)
            (java.nio.charset Charset StandardCharsets)
@@ -120,16 +120,16 @@
 
 (defn- build-table [entries checksums? table-len]
   (let [n (count entries)
-        co (long-array n) cs (long-array n) do (long-array n) ds (long-array n)
+        co (long-array n) cs (long-array n) dof (long-array n) ds (long-array n)
         ck (when checksums? (int-array n))]
     (loop [i 0 c 0 d 0]
       (if (< i n)
         (let [[csz dsz sum] (nth entries i)]
           (when (> (long dsz) max-frame) (throw (unsupported sz (str "frame " i " decompresses to " dsz " bytes"))))
-          (aset co i c) (aset cs i (long csz)) (aset do i d) (aset ds i (long dsz))
+          (aset co i c) (aset cs i (long csz)) (aset dof i d) (aset ds i (long dsz))
           (when ck (aset ck i (unchecked-int sum)))
           (recur (inc i) (+ c (long csz)) (+ d (long dsz))))
-        (->SeekTable co cs do ds ck table-len c d)))))
+        (->SeekTable co cs dof ds ck table-len c d)))))
 
 (defn parse-seek-table
   "The seek table at the end of `tail` (which ends where the stream does)."
@@ -241,13 +241,13 @@
   (let [n (alength tail)
         _ (when (or (< n 22) (and (pos? tail-start) (< n max-tail))) (throw (invalid zf "tail too short")))
         b (le tail)
-        find (fn [exact?]
+        find-eocd (fn [exact?]
                (loop [i (- n 22)]
                  (when (>= i 0)
                    (if (and (= 0x06054b50 (u32 b i))
                             (let [end (+ i 22 (u16 b (+ i 20)))] (if exact? (= end n) (<= end n))))
                      i (recur (dec i))))))
-        i (or (find true) (find false) (throw (invalid zf "no end of central directory record")))
+        i (or (find-eocd true) (find-eocd false) (throw (invalid zf "no end of central directory record")))
         disk (u16 b (+ i 4)) cd-disk (u16 b (+ i 6))
         entries (u16 b (+ i 10)) size (u32 b (+ i 12)) offset (u32 b (+ i 16))]
     (when (and (or (pos? disk) (pos? cd-disk)) (not= 0xFFFF disk) (not= 0xFFFF cd-disk))
@@ -280,8 +280,8 @@
 (defn- decode-name ^String [^bytes raw ^long flags]
   (if (pos? (bit-and flags 0x0800))
     (String. raw StandardCharsets/UTF_8)
-    (let [dec (.newDecoder StandardCharsets/UTF_8)]
-      (try (str (.decode dec (ByteBuffer/wrap raw)))
+    (let [decoder (.newDecoder StandardCharsets/UTF_8)]
+      (try (str (.decode decoder (ByteBuffer/wrap raw)))
            (catch java.nio.charset.CharacterCodingException _ (String. raw ^Charset cp437))))))
 
 (defn- nexus-table
@@ -295,12 +295,13 @@
     t))
 
 (defn parse-central-directory
-  "The entries of central directory bytes `cd` (`count` entries)."
-  [^bytes cd ^long count]
-  (when (> count (quot (alength cd) 46)) (throw (invalid zf (str count " entries can't fit in " (alength cd) " bytes"))))
+  "The entries of central directory bytes `cd` (`n-entries` entries)."
+  [^bytes cd ^long n-entries]
+  (when (> n-entries (quot (alength cd) 46))
+    (throw (invalid zf (str n-entries " entries can't fit in " (alength cd) " bytes"))))
   (let [b (le cd) n (alength cd)]
     (loop [i 0 at 0 out (transient [])]
-      (if (= i count)
+      (if (= i n-entries)
         (persistent! out)
         (do
           (when (or (> (+ at 46) n) (not= 0x02014b50 (u32 b at))) (throw (invalid zf (str "bad central header " i))))
@@ -308,9 +309,9 @@
                 csize (u32 b (+ at 20)) usize (u32 b (+ at 24))
                 nlen (u16 b (+ at 28)) xlen (u16 b (+ at 30)) clen (u16 b (+ at 32))
                 disk (u16 b (+ at 34)) lh (u32 b (+ at 42))
-                nstart (+ at 46) xstart (+ nstart nlen) next (+ xstart xlen clen)
-                _ (when (> next n) (throw (invalid zf (str "central header " i " runs past the end"))))
-                name (decode-name (Arrays/copyOfRange cd (int nstart) (int xstart)) flags)
+                nstart (+ at 46) xstart (+ nstart nlen) after (+ xstart xlen clen)
+                _ (when (> after n) (throw (invalid zf (str "central header " i " runs past the end"))))
+                entry-name (decode-name (Arrays/copyOfRange cd (int nstart) (int xstart)) flags)
                 ;; the extra fields: ZIP64 sizes, a Nexus seek table
                 [usize csize lh table]
                 (loop [x xstart usize usize csize csize lh lh table nil]
@@ -320,18 +321,18 @@
                       (case (int id)
                         1 (let [need (fn [v] (= v 0xFFFFFFFF))
                                 fields (cond-> [] (need usize) (conj :u) (need csize) (conj :c) (need lh) (conj :l))
-                                vals (into {} (map-indexed (fn [k f]
-                                                             (when (> (* 8 (inc k)) len) (throw (invalid zf (str "short ZIP64 field in entry " i))))
-                                                             [f (u64 b (+ d (* 8 k)))])
-                                                           fields))]
-                            (recur (+ d len) (long (get vals :u usize)) (long (get vals :c csize)) (long (get vals :l lh)) table))
+                                found (into {} (map-indexed (fn [k f]
+                                                              (when (> (* 8 (inc k)) len) (throw (invalid zf (str "short ZIP64 field in entry " i))))
+                                                              [f (u64 b (+ d (* 8 k)))])
+                                                            fields))]
+                            (recur (+ d len) (long (get found :u usize)) (long (get found :c csize)) (long (get found :l lh)) table))
                         0x4E58 (recur (+ d len) usize csize lh (Arrays/copyOfRange cd (int d) (int (+ d len))))
                         (recur (+ d len) usize csize lh table)))
                     [usize csize lh table]))]
             (when (or (= usize 0xFFFFFFFF) (= csize 0xFFFFFFFF) (= lh 0xFFFFFFFF) (= disk 0xFFFF))
               (throw (invalid zf (str "entry " i " needs a ZIP64 extra field"))))
-            (recur (inc i) next
-                   (conj! out (->ZipEntry name method flags crc csize usize lh
+            (recur (inc i) after
+                   (conj! out (->ZipEntry entry-name method flags crc csize usize lh
                                           (when table (nexus-table table csize usize)) nlen)))))))))
 
 (defrecord ZipIndex [entries by-name])
@@ -380,8 +381,8 @@
       [start (+ start (.-csize e))])))
 
 (defn entry-data-range [r ^ZipEntry e]
-  (let [[s e* :as rg] (local-data-range (read-bytes r (.-lh-offset e) local-header-len) e)]
-    (when (> (long e*) (long (source-len r))) (throw (invalid zf (str (.-name e) " runs past the end"))))
+  (let [[_ end :as rg] (local-data-range (read-bytes r (.-lh-offset e) local-header-len) e)]
+    (when (> (long end) (long (source-len r))) (throw (invalid zf (str (.-name e) " runs past the end"))))
     rg))
 
 (defn read-entry

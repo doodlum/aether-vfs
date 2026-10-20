@@ -16,9 +16,11 @@
   (:require [aether.director.path :as path]
             [aether.director.proto :as p])
   (:import (java.io ByteArrayOutputStream)
-           (java.lang.foreign MemorySegment)
+           (java.lang.foreign Arena MemorySegment)
            (java.nio ByteBuffer ByteOrder)
            (java.nio.charset StandardCharsets)))
+
+(set! *warn-on-reflection* true)
 
 ;; What `stat` returns. Indexed providers keep one per path, so a stat allocates
 ;; nothing. `mtime` is unix seconds (0 when unknown: the shim synthesizes times).
@@ -59,6 +61,23 @@
     a negative status.")
   (truncate! [h size] "Sets the file's length. Returns a status.")
   (close! [h] "Releases the handle."))
+
+(defn copy!
+  "Copies the first `size` bytes of open handle `src` into `dst` at the same
+  offsets, through a native buffer of at most 1 MiB. Returns a status; closes
+  neither handle."
+  ^long [src dst ^long size]
+  (with-open [arena (Arena/ofConfined)]
+    (let [buf   (.allocate arena (max 1 (min size (* 1024 1024))))
+          chunk (.byteSize buf)]
+      (loop [pos 0]
+        (if (>= pos size)
+          p/ok
+          (let [n (long (read-into src buf 0 pos (min chunk (- size pos))))]
+            (if (<= n 0)
+              p/io-error
+              (let [w (long (write-from dst buf 0 pos n))]
+                (if (neg? w) w (recur (+ pos n)))))))))))
 
 ;; --- READDIR replies ---------------------------------------------------------
 

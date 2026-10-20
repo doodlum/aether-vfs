@@ -9,6 +9,8 @@
            (java.nio.charset StandardCharsets)
            (java.nio.file OpenOption Path StandardOpenOption)))
 
+(set! *warn-on-reflection* true)
+
 (defn- u16 ^long [^MemorySegment s ^long off] (Short/toUnsignedLong (.get s ValueLayout/JAVA_SHORT_UNALIGNED off)))
 (defn- u32 ^long [^MemorySegment s ^long off] (Integer/toUnsignedLong (.get s ValueLayout/JAVA_INT_UNALIGNED off)))
 (defn- u64 ^long [^MemorySegment s ^long off] (.get s ValueLayout/JAVA_LONG_UNALIGNED off))
@@ -43,8 +45,8 @@
       e
       (let [id (u16 z p) len (u16 z (+ p 2))]
         (if (= id 1)
-          (let [vals (atom (+ p 4))
-                take! (fn [] (let [v (u64 z @vals)] (swap! vals + 8) v))
+          (let [at    (volatile! (+ p 4))
+                take! (fn [] (let [v (u64 z @at)] (vswap! at + 8) v))
                 size  (if (= size 0xFFFFFFFF) (take!) size)
                 csize (if (= csize 0xFFFFFFFF) (take!) csize)
                 local (if (= local 0xFFFFFFFF) (take!) local)]
@@ -55,25 +57,25 @@
   "The archive's file entries: [{:name :method :size :local} …], in central
   directory order. Directories (names ending in /) are left out."
   [^MemorySegment z]
-  (let [{:keys [count offset]} (end-of-central-directory z)]
+  (let [{n :count offset :offset} (end-of-central-directory z)]
     (loop [i 0 p (long offset) out (transient [])]
-      (if (= i count)
+      (if (= i n)
         (persistent! out)
         (do
           (when-not (= 0x02014b50 (u32 z p)) (throw (ex-info "bad central directory entry" {:offset p})))
           (let [name-len  (u16 z (+ p 28))
                 extra-len (u16 z (+ p 30))
                 cmt-len   (u16 z (+ p 32))
-                name      (let [b (byte-array name-len)]
+                nm        (let [b (byte-array name-len)]
                             (MemorySegment/copy z ValueLayout/JAVA_BYTE (+ p 46) b (int 0) (int name-len))
                             ;; general-purpose bit 11: UTF-8 names; otherwise CP437, which
                             ;; for the ASCII names games use is the same
                             (String. b StandardCharsets/UTF_8))
                 e         (zip64-extra z (+ p 46 name-len) extra-len
-                                       {:name name :method (u16 z (+ p 10))
+                                       {:name nm :method (u16 z (+ p 10))
                                         :csize (u32 z (+ p 20)) :size (u32 z (+ p 24)) :local (u32 z (+ p 42))})]
             (recur (inc i) (+ p 46 name-len extra-len cmt-len)
-                   (if (.endsWith ^String name "/") out (conj! out e)))))))))
+                   (if (.endsWith ^String nm "/") out (conj! out e)))))))))
 
 (defn- data-offset
   "Where an entry's bytes start: past its local header, whose name and extra
@@ -87,7 +89,7 @@
   \"Skyrim Special Edition/…\"), so the game's own files appear at the root."
   [names]
   (let [tops (into #{} (map #(let [i (.indexOf ^String % "/")] (when (pos? i) (subs % 0 (inc i))))) names)]
-    (when (and (= 1 (count tops)) (first tops)) (first tops))))
+    (when (= 1 (count tops)) (first tops))))
 
 (defn open
   "Maps the Stored zip at `path` in `arena` and returns [[path slice] …] for
@@ -99,9 +101,9 @@
     (let [z      (.map ch FileChannel$MapMode/READ_ONLY 0 (.size ch) arena)
           es     (entries z)
           prefix (common-top-folder (map :name es))]
-      (vec (for [{:keys [name method size local]} es]
+      (vec (for [{nm :name :keys [method size local]} es]
              (do (when-not (zero? (long method))
-                   (throw (ex-info (str "compressed entry (method " method "): " name
-                                        "; serve only Stored archives") {:entry name :method method})))
-                 [(if prefix (subs name (count prefix)) name)
+                   (throw (ex-info (str "compressed entry (method " method "): " nm
+                                        "; serve only Stored archives") {:entry nm :method method})))
+                 [(if prefix (subs nm (count prefix)) nm)
                   (.asSlice z (data-offset z local) (long size))]))))))

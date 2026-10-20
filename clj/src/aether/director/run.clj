@@ -15,40 +15,45 @@
   The program sees <session>/root as a folder holding the content. With
   --stage, the image is the content's own <vpath>, staged with its import
   closure; otherwise <exe> is a real file. Exits with the program's code."
-  (:require [aether.director.provider.compose :as compose]
+  (:require [aether.director.launch :as launch]
+            [aether.director.provider.compose :as compose]
             [aether.director.provider.disk :as disk]
-            [aether.director.launch :as launch]
-            [aether.director.registry :as registry]
-            [aether.director.ring :as ring]
-            [aether.director.storage :as storage]
-            [aether.director.stage :as stage]
             [aether.director.provider.tree :as tree]
             [aether.director.provider.zip :as zip]
+            [aether.director.registry :as registry]
+            [aether.director.ring :as ring]
+            [aether.director.stage :as stage]
+            [aether.director.storage :as storage]
             [clojure.java.io :as io]
             [clojure.string :as str])
   (:import (java.lang.foreign Arena))
   (:gen-class))
 
+(defn- split-kv
+  "\"k=v\" as [k v]."
+  [s]
+  (str/split s #"=" 2))
+
 (defn- parse [args]
   (loop [[a b & more :as args] args opts {:env {} :content [] :fallback [] :also []}]
     (case a
-      "--session" (recur more (assoc opts :session b))
-      "--natives" (recur more (assoc opts :natives b))
-      "--zip"     (recur more (update opts :content conj [:zip b]))
-      "--layer"   (recur more (update opts :content conj [:dir b]))
-      "--root"    (let [[id at] (str/split b #"=" 2)] (recur more (assoc-in opts [:roots (parse-long id)] at)))
+      "--session"     (recur more (assoc opts :session b))
+      "--natives"     (recur more (assoc opts :natives b))
+      "--zip"         (recur more (update opts :content conj [:zip b]))
+      "--layer"       (recur more (update opts :content conj [:dir b]))
+      "--root"        (let [[id at] (split-kv b)] (recur more (assoc-in opts [:roots (parse-long id)] at)))
       "--write-layer" (recur more (assoc-in opts [:write 0] b))
-      "--root-write" (let [[id d] (str/split b #"=" 2)] (recur more (assoc-in opts [:write (parse-long id)] d)))
-      "--root-layer" (let [[id d] (str/split b #"=" 2)]
-                       (recur more (update-in opts [:root-content (parse-long id)] (fnil conj []) [:dir d])))
-      "--registry" (recur more (assoc opts :registry b))
-      "--store"   (recur more (assoc opts :store b))
-      "--store-write" (let [[id nm] (str/split b #"=" 2)] (recur more (assoc-in opts [:store-write (parse-long id)] nm)))
-      "--stage"   (recur more (assoc opts :stage b))
-      "--fallback" (recur more (update opts :fallback conj b))
-      "--also"    (recur more (update opts :also conj b))
-      "--trace"   (recur (cons b more) (assoc opts :trace true))
-      "--env"     (let [[k v] (str/split b #"=" 2)] (recur more (assoc-in opts [:env k] v)))
+      "--root-write"  (let [[id d] (split-kv b)] (recur more (assoc-in opts [:write (parse-long id)] d)))
+      "--root-layer"  (let [[id d] (split-kv b)]
+                        (recur more (update-in opts [:root-content (parse-long id)] (fnil conj []) [:dir d])))
+      "--registry"    (recur more (assoc opts :registry b))
+      "--store"       (recur more (assoc opts :store b))
+      "--store-write" (let [[id nm] (split-kv b)] (recur more (assoc-in opts [:store-write (parse-long id)] nm)))
+      "--stage"       (recur more (assoc opts :stage b))
+      "--fallback"    (recur more (update opts :fallback conj b))
+      "--also"        (recur more (update opts :also conj b))
+      "--trace"       (recur (cons b more) (assoc opts :trace true))
+      "--env"         (let [[k v] (split-kv b)] (recur more (assoc-in opts [:env k] v)))
       (assoc opts :exe a :args (vec (rest args))))))
 
 (defn- content
@@ -97,7 +102,7 @@
         (when reg (registry/close! reg))))))
 
 (defn -main [& args]
-  (let [{:keys [session natives stage fallback also] :as opts} (parse args)
+  (let [opts   (parse args)
         t0     (System/nanoTime)
         ms     #(long (/ (- (System/nanoTime) t0) 1e6))
         log    (fn [& xs] (binding [*out* *err*] (apply println "[director]" (ms) "ms:" xs)))

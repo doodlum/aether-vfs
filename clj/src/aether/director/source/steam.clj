@@ -30,7 +30,7 @@
            (java.net.http HttpResponse)
            (java.nio.charset StandardCharsets)
            (java.util Base64 LinkedHashMap)
-           (java.util.concurrent CompletableFuture ConcurrentHashMap Semaphore)
+           (java.util.concurrent ConcurrentHashMap Semaphore)
            (java.util.concurrent.atomic AtomicLong)))
 
 (set! *warn-on-reflection* true)
@@ -48,26 +48,14 @@
 
 ;; --- the login file -----------------------------------------------------------------------------
 
-(defn- write-private! [^java.io.File f ^bytes data]
-  (let [dir (.getParentFile (.getAbsoluteFile f))
-        _ (.mkdirs dir)
-        tmp (io/file dir (str (.getName f) "." (.pid (ProcessHandle/current)) "." (System/nanoTime) ".partial"))]
-    (try
-      (with-open [o (java.io.FileOutputStream. tmp)] (.write o data) (.sync (.getFD o)))
-      (.setReadable tmp false false) (.setReadable tmp true true)
-      (.setWritable tmp false false) (.setWritable tmp true true)
-      (java.nio.file.Files/move (.toPath tmp) (.toPath f)
-                                (into-array java.nio.file.CopyOption [java.nio.file.StandardCopyOption/REPLACE_EXISTING
-                                                                     java.nio.file.StandardCopyOption/ATOMIC_MOVE]))
-      (catch Exception e (.delete tmp) (throw e)))))
+(defn- write-private! [f ^bytes data] (net/write-file! f data {:private? true}))
 
 (defn save-login!
   "Saves a login ({:account :refresh-token :guard-data}) to `file`, owner-only."
   [file {:keys [account refresh-token guard-data]}]
-  (write-private! (io/file file) (.getBytes ^String (json/write-json-str (cond-> {"account_name" account "refresh_token" refresh-token}
-                                                                           guard-data (assoc "guard_data" guard-data))
-                                                                         :indent-str "  ")
-                                            StandardCharsets/UTF_8)))
+  (let [d (cond-> {"account_name" account "refresh_token" refresh-token}
+            guard-data (assoc "guard_data" guard-data))]
+    (write-private! file (.getBytes ^String (json/write-json-str d :indent-str "  ") StandardCharsets/UTF_8))))
 
 (defn token-expires-at
   "The refresh token's expiry (epoch s) from its JWT, or nil if opaque."
@@ -102,7 +90,7 @@
   [servers & [cfg]]
   (let [cfg (merge cdn-defaults cfg)
         p {:cfg cfg :servers (vec servers) :hosts (atom (into {} (for [s servers] [s {}]))) :current (atom (first servers))}]
-    (when (seq servers) (doseq [s servers] (probe! p s (:probe-timeout-ms cfg))))
+    (doseq [s servers] (probe! p s (:probe-timeout-ms cfg)))
     p))
 
 (defn- latency ^long [h] (long (or (:latency h) (quot Long/MAX_VALUE 2))))
@@ -163,10 +151,8 @@
                                      (success! pool srv (- (System/nanoTime) t0))
                                      {:ok v})
                         (#{401 403} st) (do (net/close-body resp)
-                                            (if (and token-fn (not (contains? refreshed host)))
-                                              (if-let [t (token-fn host)]
-                                                (do (.put tokens host t) {:retry-host host})
-                                                (do (failure! pool srv nil) {:error (str host ": HTTP " st)}))
+                                            (if-let [t (and token-fn (not (contains? refreshed host)) (token-fn host))]
+                                              (do (.put tokens host t) {:retry-host host})
                                               (do (failure! pool srv nil) {:error (str host ": HTTP " st)})))
                         :else (let [ra (some-> (net/header resp "Retry-After") str/trim parse-long (* 1000))]
                                 (net/close-body resp)
@@ -202,31 +188,19 @@
 
 (defn- chunk!
   "A decoded chunk: from the LRU, a fetch in flight, or the CDN."
-  ^bytes [{:keys [h pool depot key token-fn tokens ^Semaphore sem ^LinkedHashMap lru ^AtomicLong lru-bytes ^ConcurrentHashMap inflight]} c]
+  ^bytes [{:keys [h pool depot key token-fn tokens ^Semaphore sem ^LinkedHashMap lru lru-bytes inflight]} c]
   (let [k (codec/hex (:id c))
         budget (long (:chunk-cache-bytes (:cfg pool)))]
     (or (locking lru (.get lru k))
-        (let [mine (CompletableFuture.)
-              ^CompletableFuture f (or (.putIfAbsent inflight k mine) mine)]
-          (when (identical? f mine)
-            (try
-              (.acquire sem)
-              (let [plain (try (fetch! h pool (str "/depot/" depot "/chunk/" k) (+ (* 2 (long (:len c))) 65536)
-                                       #(codec/decode-chunk key c %) (str "steam " depot " " k) token-fn tokens)
-                               (finally (.release sem)))]
-                (when (<= (alength ^bytes plain) budget)
-                  (locking lru
-                    (.put lru k plain)
-                    (.addAndGet lru-bytes (alength ^bytes plain))
-                    (let [it (.iterator (.entrySet lru))]
-                      (while (and (> (.get lru-bytes) budget) (.hasNext it))
-                        (let [^java.util.Map$Entry v (.next it)]
-                          (.addAndGet lru-bytes (- (alength ^bytes (.getValue v))))
-                          (.remove it))))))
-                (.complete mine plain))
-              (catch Throwable t (.completeExceptionally mine t))
-              (finally (.remove inflight k))))
-          (try (.get f) (catch java.util.concurrent.ExecutionException e (throw (.getCause e))))))))
+        (net/single-flight inflight k false
+          (fn []
+            (.acquire sem)
+            (let [^bytes plain (try (fetch! h pool (str "/depot/" depot "/chunk/" k) (+ (* 2 (long (:len c))) 65536)
+                                            #(codec/decode-chunk key c %) (str "steam " depot " " k) token-fn tokens)
+                                    (finally (.release sem)))]
+              (when (<= (alength plain) budget)
+                (net/lru-put! lru lru-bytes k plain budget))
+              plain))))))
 
 (defn read-file!
   "Reads up to `len` bytes of `file` (from the manifest) at `pos` into
@@ -269,14 +243,14 @@
 
 (defn depot-key
   "Depot `depot`'s key: cached on disk, else from the session."
-  ^bytes [{:keys [dir session ^ConcurrentHashMap keys]} app depot]
-  (or (.get keys depot)
+  ^bytes [{:keys [dir session] ^ConcurrentHashMap depot-keys :keys} app depot]
+  (or (.get depot-keys depot)
       (let [f (io/file dir "depot-keys" (str depot ".key"))
             k (or (when (and (.exists f) (= 32 (.length f))) (java.nio.file.Files/readAllBytes (.toPath f)))
                   (let [k (cm/depot-key @session app depot)]
                     (try (write-private! f k) (catch Exception _))
                     k))]
-        (.put keys depot k)
+        (.put depot-keys depot k)
         k)))
 
 (defn cdn-servers
@@ -294,7 +268,7 @@
                                   (cm/cdn-servers @anonymous app))]
                         (when (empty? s) (throw (net/error :cdn "Steam listed no content servers")))
                         s)
-                      (catch Exception e (if cached nil (throw e))))]
+                      (catch Exception e (when-not cached (throw e))))]
         (if live
           (do (.mkdirs ^java.io.File dir)
               (spit f (json/write-json-str {"fetched_at" (quot (now) 1000) "servers" live}))
@@ -302,7 +276,7 @@
           (vec (:servers cached)))))))
 
 (defn- pool-for [{:keys [^ConcurrentHashMap pools cdn-cfg] :as c} app]
-  (.computeIfAbsent pools app (reify java.util.function.Function (apply [_ _] (pool (cdn-servers c app) cdn-cfg)))))
+  (.computeIfAbsent pools app (fn [_] (pool (cdn-servers c app) cdn-cfg))))
 
 (defn depot-reader
   "A reader for `depot` of `app`."
@@ -312,23 +286,20 @@
 
 (defn manifest
   "Manifest `gid` of `depot`: the cached body, else fetched (with a request code)."
-  [{:keys [dir session ^ConcurrentHashMap keys] :as c} app depot gid]
+  [{:keys [dir session] ^ConcurrentHashMap depot-keys :keys :as c} app depot gid]
   (let [f (io/file dir "manifests" (str depot "_" (Long/toUnsignedString (long gid)) ".bin"))
-        key (depot-key c app depot)]
+        k (depot-key c app depot)]
     (or (when (.exists f)
-          (try (codec/parse-manifest (java.nio.file.Files/readAllBytes (.toPath f)) depot gid key)
+          (try (codec/parse-manifest (java.nio.file.Files/readAllBytes (.toPath f)) depot gid k)
                (catch clojure.lang.ExceptionInfo e
                  (when (str/includes? (str (ex-message e)) "file names:")
                    ;; a bad cached key: forget it, and say so
-                   (.remove keys depot)
+                   (.remove depot-keys depot)
                    (.delete (io/file dir "depot-keys" (str depot ".key")))
                    (throw (net/error :integrity (str "depot " depot "'s cached key can't decrypt its manifest; it was dropped")))))))
         (let [code (cm/manifest-request-code @session app depot gid)
               [m body] (fetch-manifest (depot-reader c app depot) gid code)]
-          (.mkdirs (.getParentFile f))
-          (let [tmp (io/file (str f "." (System/nanoTime) ".partial"))]
-            (java.nio.file.Files/write (.toPath tmp) ^bytes body ^"[Ljava.nio.file.OpenOption;" (make-array java.nio.file.OpenOption 0))
-            (java.nio.file.Files/move (.toPath tmp) (.toPath f) (into-array java.nio.file.CopyOption [java.nio.file.StandardCopyOption/REPLACE_EXISTING])))
+          (net/write-file! f body)
           m))))
 
 ;; --- the provider ------------------------------------------------------------------------------------

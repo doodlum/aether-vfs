@@ -17,30 +17,32 @@
             [aether.director.storage.ram :as ram]
             [aether.director.store :as store])
   (:import (aether.director.provider Stat)
+           (java.io IOException)
            (java.lang.foreign MemorySegment ValueLayout)
-           (java.util Arrays)
-           (java.util.concurrent CompletableFuture ConcurrentHashMap)
-           (java.util.concurrent.atomic AtomicBoolean AtomicLong)))
+           (java.util Arrays HexFormat)
+           (java.util.concurrent CompletableFuture ConcurrentHashMap ExecutionException)
+           (java.util.concurrent.atomic AtomicBoolean)
+           (java.util.function BiFunction)))
 
 (set! *warn-on-reflection* true)
 
 (defn- minute ^long [] (quot (System/currentTimeMillis) 60000))
-(defn- hex [^bytes b] (apply str (map #(format "%02x" %) b)))
+(defn- hex ^String [^bytes b] (.formatHex (HexFormat/of) b))
 
 (defn- touch!
-  "Records an access of cache file `key` (at most one commit a minute per file)."
-  [{:keys [storage ^ConcurrentHashMap touched]} ^bytes key size]
-  (let [now (minute) k (hex key)]
+  "Records an access of cache file `ck` (at most one commit a minute per file)."
+  [{:keys [storage ^ConcurrentHashMap touched]} ^bytes ck size]
+  (let [now (minute) k (hex ck)]
     (when (not= now (long (or (.put touched k now) -1)))
       (let [st (:store storage)]
         (store/write! st (fn [txn]
-                           (when (store/file-len st txn (cat/cache-file-id key))
-                             (cat/put-cache-file! st txn key {:access now :bytes size}))))))))
+                           (when (store/file-len st txn (cat/cache-file-id ck))
+                             (cat/put-cache-file! st txn ck {:access now :bytes size}))))))))
 
 (defn- fetch-unit!
   "Fetches blocks [b0, b1) of the file from the source handle and stores
   them (creating the cache file at its first fetch). Returns the blocks."
-  [{:keys [storage]} src ^bytes key ^bytes fid size b0 b1]
+  [{:keys [storage]} src ^bytes ck ^bytes fid size b0 b1]
   (let [size (long size) b0 (long b0) b1 (long b1)
         st    (:store storage)
         bs    (long (:block-size st))
@@ -50,14 +52,14 @@
         got   (long (prov/read-into src (MemorySegment/ofArray buf) 0 start n))]
     (when (not= got n) (throw (ex-info "the source returned a short read" {:status p/io-error})))
     (when-not (:len (store/stat st fid))
-      (store/set-len! st fid size {:also (fn [txn] (cat/put-cache-file! st txn key {:access (minute) :bytes size}))}))
+      (store/set-len! st fid size {:also (fn [txn] (cat/put-cache-file! st txn ck {:access (minute) :bytes size}))}))
     (store/write-blocks! st fid b0 buf)
     (vec (for [b (range b0 b1)]
            (let [off (* (- b b0) bs)] (Arrays/copyOfRange buf (int off) (int (min n (+ off bs)))))))))
 
 (defn- block!
   "Block `b`: from the RAM tier, the store, or (fetching its unit) the source."
-  ^bytes [{:keys [storage ^ConcurrentHashMap inflight unit-blocks] :as cache} src ^bytes key ^bytes fid size b]
+  ^bytes [{:keys [storage ^ConcurrentHashMap inflight unit-blocks] :as cache} src ^bytes ck ^bytes fid size b]
   (let [size (long size) b (long b)
         st (:store storage)
         r  (:ram storage)
@@ -76,15 +78,15 @@
               mine (CompletableFuture.)
               ^CompletableFuture f (or (.putIfAbsent inflight k mine) mine)]
           (when (identical? f mine)
-            (try (let [blocks (fetch-unit! cache src key fid size b0 b1)]
+            (try (let [blocks (fetch-unit! cache src ck fid size b0 b1)]
                    (doseq [[i blk] (map-indexed vector blocks)] (ram/put-block! r fid (+ b0 i) blk))
                    (.complete mine blocks))
                  (catch Throwable t (.completeExceptionally mine t))
                  (finally (.remove inflight k))))
-          (nth (try (.get f) (catch java.util.concurrent.ExecutionException e (throw (.getCause e))))
+          (nth (try (.get f) (catch ExecutionException e (throw (.getCause e))))
                (- b b0))))))
 
-(deftype CachedHandle [cache src ^bytes key ^bytes fid ^long size ^long mtime ^AtomicBoolean closed]
+(deftype CachedHandle [cache src ^bytes ck ^bytes fid ^long size ^long mtime ^AtomicBoolean closed]
   prov/Handle
   (handle-stat [_] (Stat. false size mtime))
   (immutable? [_] true)
@@ -100,19 +102,20 @@
             (let [b    (quot at bs)
                   boff (- at (* b bs))
                   n    (min (- bs boff) (- end at))
-                  ^bytes blk (block! cache src key fid size b)]
+                  ^bytes blk (block! cache src ck fid size b)]
               (MemorySegment/copy blk (int boff) dst ValueLayout/JAVA_BYTE (+ (long dst-off) (- at pos)) (int n))
               (recur (+ at n)))))
         (catch clojure.lang.ExceptionInfo e (long (or (:status (ex-data e)) p/io-error)))
-        (catch java.io.IOException _ p/io-error))))
+        (catch IOException _ p/io-error))))
   (write-from [_ _ _ _ _] p/read-only)
   (truncate! [_ _] p/read-only)
   (close! [_]
     (when (.compareAndSet closed false true)
       (prov/close! src)
       (let [^ConcurrentHashMap opens (:opens (:storage cache))]
-        (.computeIfPresent opens (hex key) (reify java.util.function.BiFunction
-                                            (apply [_ _ n] (let [n (dec (long n))] (when (pos? n) n)))))))))
+        (.computeIfPresent opens (hex ck)
+                           (reify BiFunction
+                             (apply [_ _ n] (let [n (dec (long n))] (when (pos? n) n)))))))))
 
 (defrecord Cached [storage source ^String source-key ^long root ^long unit-blocks
                    ^ConcurrentHashMap inflight ^ConcurrentHashMap touched]
@@ -129,11 +132,11 @@
           (let [^Stat s (prov/handle-stat h)]
             (if (.-dir? s)
               h
-              (let [key (cat/cache-key source-key root (path/fold vp) (.-size s) (.-mtime s))
-                    fid (cat/cache-file-id key)]
-                (.merge ^ConcurrentHashMap (:opens storage) (hex key) 1 +)
-                (when (:len (store/stat (:store storage) fid)) (touch! this key (.-size s)))
-                (CachedHandle. this h key fid (.-size s) (.-mtime s) (AtomicBoolean.)))))))))
+              (let [ck  (cat/cache-key source-key root (path/fold vp) (.-size s) (.-mtime s))
+                    fid (cat/cache-file-id ck)]
+                (.merge ^ConcurrentHashMap (:opens storage) (hex ck) 1 +)
+                (when (:len (store/stat (:store storage) fid)) (touch! this ck (.-size s)))
+                (CachedHandle. this h ck fid (.-size s) (.-mtime s) (AtomicBoolean.)))))))))
   (mkdir! [_ _] p/read-only)
   (delete! [_ _] p/read-only)
   (rename! [_ _ _] p/read-only))

@@ -12,11 +12,10 @@
 
   Secrets: the tokens (credential file, owner-only), and the CDN token,
   which GOG puts in the URL *path*: errors show a scrubbed URL."
-  (:require [aether.director.source.net :as net]
-            [aether.director.source.tree :as tree]
-            [aether.director.path :as path]
-            [aether.director.proto :as p]
+  (:require [aether.director.proto :as p]
             [aether.director.provider :as prov]
+            [aether.director.source.net :as net]
+            [aether.director.source.tree :as tree]
             [charred.api :as json]
             [clojure.java.io :as io]
             [clojure.string :as str])
@@ -26,7 +25,7 @@
            (java.nio.charset StandardCharsets)
            (java.security MessageDigest)
            (java.util HexFormat LinkedHashMap)
-           (java.util.concurrent CompletableFuture ConcurrentHashMap)
+           (java.util.concurrent ConcurrentHashMap)
            (java.util.concurrent.atomic AtomicLong)
            (java.util.concurrent.locks ReentrantLock)
            (java.util.zip Inflater)))
@@ -60,6 +59,7 @@
 (defn- now-s ^long [] (quot (System/currentTimeMillis) 1000))
 (defn- enc ^String [s] (URLEncoder/encode (str s) StandardCharsets/UTF_8))
 (defn- endpoint ^String [base path] (str (str/replace base #"/+$" "") path))
+(defn- read-json-bytes [^bytes b] (json/read-json (String. b StandardCharsets/UTF_8)))
 
 ;; --- documents ---------------------------------------------------------------------------
 
@@ -109,23 +109,12 @@
       (do (when (re-find #"[\s?&/=#]" s) (throw (net/error :login "that isn't a login code or the URL GOG sent you to")))
           s))))
 
-(defn- save-credentials! [^java.io.File f creds]
-  (let [dir (.getParentFile (.getAbsoluteFile f))
-        _ (.mkdirs dir)
-        tmp (io/file dir (str (.getName f) "." (.pid (ProcessHandle/current)) "." (System/nanoTime) ".partial"))]
-    (try
-      (with-open [o (java.io.FileOutputStream. tmp)]
-        (.write o (.getBytes ^String (json/write-json-str {"user_id" (:user-id creds) "access_token" (:access-token creds)
-                                                           "refresh_token" (:refresh-token creds) "expires_at" (:expires-at creds)}
-                                                          :indent-str "  ")
-                             StandardCharsets/UTF_8))
-        (.sync (.getFD o)))
-      (.setReadable tmp false false) (.setReadable tmp true true)
-      (.setWritable tmp false false) (.setWritable tmp true true)
-      (java.nio.file.Files/move (.toPath tmp) (.toPath f)
-                                (into-array java.nio.file.CopyOption [java.nio.file.StandardCopyOption/REPLACE_EXISTING
-                                                                     java.nio.file.StandardCopyOption/ATOMIC_MOVE]))
-      (catch Exception e (.delete tmp) (throw e)))))
+(defn- save-credentials! [f {:keys [user-id access-token refresh-token expires-at]}]
+  (net/write-file! f (.getBytes ^String (json/write-json-str {"user_id" user-id "access_token" access-token
+                                                              "refresh_token" refresh-token "expires_at" expires-at}
+                                                             :indent-str "  ")
+                                StandardCharsets/UTF_8)
+                   {:private? true}))
 
 (defn load-credentials
   "The saved login, or nil."
@@ -142,7 +131,7 @@
                  "&grant_type=" grant "&redirect_uri=" (enc redirect-uri)
                  (apply str (for [[k v] (partition 2 kvs)] (str "&" k "=" (enc v)))))]
     (try
-      (let [d (json/read-json (String. (net/get-bytes h url max-token-body {:api? true}) StandardCharsets/UTF_8))]
+      (let [d (read-json-bytes (net/get-bytes h url max-token-body {:api? true}))]
         {:user-id (str (get d "user_id")) :access-token (get d "access_token") :refresh-token (get d "refresh_token")
          :expires-at (+ (now-s) (long (u64 (get d "expires_in"))))})
       (catch clojure.lang.ExceptionInfo e
@@ -182,29 +171,28 @@
 
 (defn- api-get
   "An authenticated GET (bearer token, refreshed when near expiry or refused once)."
-  ^bytes [{:keys [h creds ^ReentrantLock lock] :as c} url max]
-  (.lock lock)
-  (try (when (<= (long (or (:expires-at @creds) 0)) (+ (now-s) expiry-margin-s)) (refresh! c (:access-token @creds)))
-       (finally (.unlock lock)))
-  (let [call #(net/get-bytes h url max {:api? true :headers {"Authorization" (str "Bearer " (:access-token @creds))}})]
+  ^bytes [{:keys [h creds lock] :as c} url max-body]
+  (net/with-lock lock
+    (when (<= (long (or (:expires-at @creds) 0)) (+ (now-s) expiry-margin-s))
+      (refresh! c (:access-token @creds))))
+  (let [call #(net/get-bytes h url max-body {:api? true :headers {"Authorization" (str "Bearer " (:access-token @creds))}})
+        refused? #(= 401 (:status (ex-data %)))]
     (try (call)
          (catch clojure.lang.ExceptionInfo e
-           (if (= 401 (:status (ex-data e)))
-             (do (.lock lock)
-                 (try (refresh! c (:access-token @creds)) (finally (.unlock lock)))
-                 (try (call)
-                      (catch clojure.lang.ExceptionInfo e2
-                        (if (= 401 (:status (ex-data e2)))
-                          (throw (net/error :login-expired "GOG refused the saved login; log in to GOG again"))
-                          (throw e2)))))
-             (throw e))))))
+           (when-not (refused? e) (throw e))
+           (net/with-lock lock (refresh! c (:access-token @creds)))
+           (try (call)
+                (catch clojure.lang.ExceptionInfo e2
+                  (throw (if (refused? e2)
+                           (net/error :login-expired "GOG refused the saved login; log in to GOG again")
+                           e2))))))))
 
 (defn builds
   "Builds of `product` for `os` (:windows :osx :linux), newest first."
   [{:keys [cfg] :as c} product os]
   (let [url (str (endpoint (:content-base cfg) (str "/products/" product "/os/" (name os) "/builds")) "?generation=2")]
     (try
-      (vec (for [b (get (json/read-json (String. (api-get c url max-json-body) StandardCharsets/UTF_8)) "items")]
+      (vec (for [b (get (read-json-bytes (api-get c url max-json-body)) "items")]
              {:build-id (str (get b "build_id")) :product-id (u64 (get b "product_id")) :os (get b "os")
               :version-name (get b "version_name") :generation (or (u64 (get b "generation")) 0)
               :link (get b "link") :date-published (get b "date_published")}))
@@ -248,13 +236,10 @@
               m (or (when (.exists f)
                       (try (parse-manifest (decode-document (java.nio.file.Files/readAllBytes (.toPath f))))
                            (catch Exception _ nil)))
-                    (let [body (net/get-bytes h (endpoint (:cdn-meta-base cfg) (str "/content-system/v2/meta/" (subs id 0 2) "/" (subs id 2 4) "/" id)) max-meta-body)
+                    (let [path (str "/content-system/v2/meta/" (subs id 0 2) "/" (subs id 2 4) "/" id)
+                          body (net/get-bytes h (endpoint (:cdn-meta-base cfg) path) max-meta-body)
                           m (parse-manifest (decode-document body))]
-                      (.mkdirs (.getParentFile f))
-                      (let [tmp (io/file (str f "." (System/nanoTime) ".partial"))]
-                        (java.nio.file.Files/write (.toPath tmp) ^bytes body ^"[Ljava.nio.file.OpenOption;" (make-array java.nio.file.OpenOption 0))
-                        (java.nio.file.Files/move (.toPath tmp) (.toPath f)
-                                                  (into-array java.nio.file.CopyOption [java.nio.file.StandardCopyOption/REPLACE_EXISTING])))
+                      (net/write-file! f body)
                       m))]
           (.put manifests id m)
           m))))
@@ -266,25 +251,24 @@
   [{:keys [cfg ^ConcurrentHashMap links ^ConcurrentHashMap link-locks] :as c} product]
   (let [ok #(when-let [l (.get links product)] (when (> (long (:valid-until l)) (now-s)) l))]
     (or (ok)
-        (let [^ReentrantLock l (.computeIfAbsent link-locks product (reify java.util.function.Function (apply [_ _] (ReentrantLock.))))]
-          (.lock l)
-          (try
-            (or (ok)
-                (let [url (str (endpoint (:content-base cfg) (str "/products/" product "/secure_link")) "?generation=2&_version=2&path=/")
-                      d (try (json/read-json (String. (api-get c url max-json-body) StandardCharsets/UTF_8))
-                             (catch clojure.lang.ExceptionInfo e
-                               (if (= 403 (:status (ex-data e)))
-                                 (throw (net/error :not-owned (str "this GOG account doesn't own product " product)))
-                                 (throw e))))
-                      u (first (sort-by #(long (or (u64 (get % "priority")) 0)) (get d "urls")))
-                      _ (when-not u (throw (net/error :protocol "GOG gave no CDN URLs")))
-                      params (into {} (for [[k v] (get u "parameters")] [k (if (string? v) v (json/write-json-str v))]))
-                      link {:format (get u "url_format") :params (dissoc params "path") :path (get params "path")
-                            :valid-until (if-let [e (u64 (get params "expires_at"))] (- (long e) link-margin-s) (+ (now-s) link-default-ttl-s))}]
-                  (when-not (:path link) (throw (net/error :protocol "GOG's CDN link has no path")))
-                  (.put links product link)
-                  link))
-            (finally (.unlock l)))))))
+        (net/with-lock (.computeIfAbsent link-locks product (fn [_] (ReentrantLock.)))
+          (or (ok)
+              (let [url (str (endpoint (:content-base cfg) (str "/products/" product "/secure_link")) "?generation=2&_version=2&path=/")
+                    d (try (read-json-bytes (api-get c url max-json-body))
+                           (catch clojure.lang.ExceptionInfo e
+                             (throw (if (= 403 (:status (ex-data e)))
+                                      (net/error :not-owned (str "this GOG account doesn't own product " product))
+                                      e))))
+                    u (first (sort-by #(long (or (u64 (get % "priority")) 0)) (get d "urls")))
+                    _ (when-not u (throw (net/error :protocol "GOG gave no CDN URLs")))
+                    params (into {} (for [[k v] (get u "parameters")] [k (if (string? v) v (json/write-json-str v))]))
+                    link {:format (get u "url_format") :params (dissoc params "path") :path (get params "path")
+                          :valid-until (if-let [e (u64 (get params "expires_at"))]
+                                         (- (long e) link-margin-s)
+                                         (+ (now-s) link-default-ttl-s))}]
+                (when-not (:path link) (throw (net/error :protocol "GOG's CDN link has no path")))
+                (.put links product link)
+                link))))))
 
 (defn- fill [{:keys [format params path]} cmd5 show?]
   (reduce (fn [^String s [k v]] (.replace s (str "{" k "}") (if (or show? (= k "base_url")) (str v) "REDACTED")))
@@ -319,7 +303,7 @@
                     (fn []
                       (let [url (fill link (:cmd5 ch) true)]
                         (try
-                          (with-open [_ (net/acquire! (:limiter h) (.getHost (java.net.URI. url)))]
+                          (with-open [_ (net/acquire! (:limiter h) (net/host url))]
                             (let [resp (net/check (net/send! h url {}) url)]
                               (verify-chunk (net/read-body h resp url {:max (+ (long (:csize ch)) chunk-body-slack)}) ch)))
                           (catch clojure.lang.ExceptionInfo e
@@ -336,27 +320,14 @@
   ^bytes [{:keys [cfg ^LinkedHashMap chunks ^AtomicLong chunk-bytes ^ConcurrentHashMap inflight] :as c} product ch]
   (let [k (:cmd5 ch)]
     (or (locking chunks (.get chunks k))
-        (let [mine (CompletableFuture.)
-              ^CompletableFuture f (or (.putIfAbsent inflight k mine) mine)]
-          (when (identical? f mine)
-            (Thread/startVirtualThread
-             ^Runnable (fn []
-                         (try
-                           (let [b (download-chunk c product ch)]
-                             (when (and (pos? (long (:chunk-cache-chunks cfg))) (<= (alength b) (long (:chunk-cache-bytes cfg))))
-                               (locking chunks
-                                 (.put chunks k b)
-                                 (.addAndGet chunk-bytes (alength b))
-                                 (let [it (.iterator (.entrySet chunks))]
-                                   (while (and (.hasNext it) (or (> (.size chunks) (long (:chunk-cache-chunks cfg)))
-                                                                 (> (.get chunk-bytes) (long (:chunk-cache-bytes cfg)))))
-                                     (let [^java.util.Map$Entry v (.next it)]
-                                       (.addAndGet chunk-bytes (- (alength ^bytes (.getValue v))))
-                                       (.remove it))))))
-                             (.complete mine b))
-                           (catch Throwable t (.completeExceptionally mine t))
-                           (finally (.remove inflight k))))))
-          (try (.get f) (catch java.util.concurrent.ExecutionException e (throw (.getCause e))))))))
+        ;; detached: a cancelled reader doesn't fail the others waiting on it
+        (net/single-flight inflight k true
+          (fn []
+            (let [b (download-chunk c product ch)
+                  max-chunks (long (:chunk-cache-chunks cfg)) max-bytes (long (:chunk-cache-bytes cfg))]
+              (when (and (pos? max-chunks) (<= (alength b) max-bytes))
+                (net/lru-put! chunks chunk-bytes k b max-bytes max-chunks))
+              b))))))
 
 (defn read-file!
   "Reads up to `len` bytes of depot file `file` (from the manifest) at `pos`

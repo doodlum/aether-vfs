@@ -4,6 +4,8 @@
   (:import (java.lang.foreign Arena MemorySegment ValueLayout)
            (java.nio.charset StandardCharsets)))
 
+(set! *warn-on-reflection* true)
+
 (def ^:const data-len (* 64 1024 1024))
 
 (defn- bytes-of ^MemorySegment [^bytes b]

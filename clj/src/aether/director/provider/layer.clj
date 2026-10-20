@@ -29,17 +29,24 @@
             [clojure.string :as str])
   (:import (aether.director.provider Entry Stat)
            (java.lang.foreign MemorySegment ValueLayout)
-           (java.util Arrays TreeMap)
+           (java.util Arrays HexFormat TreeMap)
            (java.util.concurrent ConcurrentHashMap)
            (java.util.concurrent.atomic AtomicBoolean AtomicLong)
-           (java.util.concurrent.locks ReentrantLock ReentrantReadWriteLock)))
+           (java.util.concurrent.locks Lock ReentrantLock ReentrantReadWriteLock)))
 
 (set! *warn-on-reflection* true)
 
 (def ^:const max-dirty-blocks 64)
 
 (defn- now [] (quot (System/currentTimeMillis) 1000))
-(defn- hex [^bytes b] (apply str (map #(format "%02x" %) b)))
+(defn- hex ^String [^bytes b] (.formatHex (HexFormat/of) b))
+
+(defmacro ^:private with-lock
+  "Runs body holding `lock` (a java.util.concurrent.locks.Lock)."
+  [lock & body]
+  `(let [^Lock l# ~lock]
+     (.lock l#)
+     (try ~@body (finally (.unlock l#)))))
 
 ;; --- open files ------------------------------------------------------------------------
 
@@ -111,11 +118,11 @@
         (when-not (.containsKey dirty b) (.put dirty b (byte-array bs))))
       (let [n     (blocks-in new-len bs)
             idx   (vec (filter #(< (long %) n) (keys dirty)))
-            runs  (partition-by identity (map-indexed (fn [i b] (- (long b) (long i))) idx))
-            runs  (loop [idx idx runs runs out []]
-                    (if-let [r (first runs)]
-                      (recur (drop (count r) idx) (rest runs) (conj out (vec (take (count r) idx))))
-                      out))
+            ;; consecutive blocks: a run keeps block - position constant
+            runs  (->> idx
+                       (map-indexed (fn [i b] [(- (long b) (long i)) b]))
+                       (partition-by first)
+                       (mapv #(mapv second %)))
             block (fn [b] (let [^bytes buf (.get dirty b) blen (block-len new-len bs b)]
                             (if (= blen bs) buf (Arrays/copyOf buf (int blen)))))
             files (vec (map-indexed
@@ -152,10 +159,8 @@
   (immutable? [_] false)
   (read-into [_ dst dst-off pos len]
     (let [storage (:storage layer)
-          bs      (long (:block-size (:store storage)))
-          rl      (.readLock (lock-of cell))]
-      (.lock rl)
-      (try
+          bs      (long (:block-size (:store storage)))]
+      (with-lock (.readLock (lock-of cell))
         (let [size (.get (live-of cell))
               pos  (long pos)
               end  (min size (+ pos (long len)))
@@ -177,56 +182,49 @@
                           (recur (+ at n)))
                     (>= (* b bs) (.get (committed-of cell)))        ; grown, not committed: zeros
                     (do (.fill (.asSlice dst (+ (long dst-off) (- at pos)) (long n)) (byte 0)) (recur (+ at n)))
-                    :else p/io-error))))))
-        (finally (.unlock rl)))))
+                    :else p/io-error)))))))))
   (write-from [_ src src-off pos len]
     (if-not writable?
       p/bad-fh
       (let [storage (:storage layer)
             bs      (long (:block-size (:store storage)))
-            wl      (.writeLock (lock-of cell))
             ^MemorySegment src src]
-        (.lock wl)
-        (try
-          (let [pos (if append? (.get (live-of cell)) (long pos))
-                end (+ pos (long len))]
-            (loop [at pos]
-              (when (< at end)
-                (let [b    (quot at bs)
-                      boff (- at (* b bs))
-                      n    (min (- bs boff) (- end at))
-                      buf  (load-block! storage cell b)]
-                  (MemorySegment/copy src ValueLayout/JAVA_BYTE (+ (long src-off) (- at pos)) buf (int boff) (int n))
-                  (recur (+ at n)))))
-            (when (> end (.get (live-of cell))) (.set (live-of cell) end))
-            (when (> (.size (dirty-of cell)) max-dirty-blocks) (commit! storage (:id layer) cell))
-            (long len))
-          (catch clojure.lang.ExceptionInfo e (long (or (:status (ex-data e)) p/io-error)))
-          (finally (.unlock wl))))))
+        (with-lock (.writeLock (lock-of cell))
+          (try
+            (let [pos (if append? (.get (live-of cell)) (long pos))
+                  end (+ pos (long len))]
+              (loop [at pos]
+                (when (< at end)
+                  (let [b    (quot at bs)
+                        boff (- at (* b bs))
+                        n    (min (- bs boff) (- end at))
+                        buf  (load-block! storage cell b)]
+                    (MemorySegment/copy src ValueLayout/JAVA_BYTE (+ (long src-off) (- at pos)) buf (int boff) (int n))
+                    (recur (+ at n)))))
+              (when (> end (.get (live-of cell))) (.set (live-of cell) end))
+              (when (> (.size (dirty-of cell)) max-dirty-blocks) (commit! storage (:id layer) cell))
+              (long len))
+            (catch clojure.lang.ExceptionInfo e (long (or (:status (ex-data e)) p/io-error))))))))
   (truncate! [_ size]
     (if-not writable?
       p/bad-fh
       (let [storage (:storage layer)
             bs      (long (:block-size (:store storage)))
-            wl      (.writeLock (lock-of cell))
             size    (long size)]
-        (.lock wl)
-        (try
-          (let [n (blocks-in size bs)]
-            (doseq [b (vec (.keySet (.tailMap (dirty-of cell) n true)))] (.remove (dirty-of cell) b))
-            (when-let [^bytes buf (and (pos? (rem size bs)) (.get (dirty-of cell) (quot size bs)))]
-              (Arrays/fill buf (int (rem size bs)) (int bs) (byte 0)))
-            (.set (live-of cell) size)
-            (commit! storage (:id layer) cell)
-            p/ok)
-          (catch clojure.lang.ExceptionInfo e (long (or (:status (ex-data e)) p/io-error)))
-          (finally (.unlock wl))))))
+        (with-lock (.writeLock (lock-of cell))
+          (try
+            (let [n (blocks-in size bs)]
+              (doseq [b (vec (.keySet (.tailMap (dirty-of cell) n true)))] (.remove (dirty-of cell) b))
+              (when-let [^bytes buf (and (pos? (rem size bs)) (.get (dirty-of cell) (quot size bs)))]
+                (Arrays/fill buf (int (rem size bs)) (int bs) (byte 0)))
+              (.set (live-of cell) size)
+              (commit! storage (:id layer) cell)
+              p/ok)
+            (catch clojure.lang.ExceptionInfo e (long (or (:status (ex-data e)) p/io-error))))))))
   (close! [_]
     (when (.compareAndSet closed false true)
-      (let [wl (.writeLock (lock-of cell))]
-        (.lock wl)
-        (try (commit! (:storage layer) (:id layer) cell)
-             (finally (.unlock wl))))
+      (with-lock (.writeLock (lock-of cell))
+        (commit! (:storage layer) (:id layer) cell))
       (release! layer cell))))
 
 (deftype DirHandle []
@@ -258,29 +256,26 @@
     (.incrementAndGet (opens-of c))
     c))
 
+(defmacro ^:private with-ns
+  "Runs body holding `layer`'s namespace lock."
+  [layer & body]
+  `(with-lock (:ns ~layer) ~@body))
+
 (defn- release!
   "One open of `c` fewer; the last one of a deleted file drops its data."
   [layer ^Cell c]
-  (let [^ReentrantLock ns (:ns layer)]
-    (.lock ns)
-    (try
-      (when (zero? (.decrementAndGet (opens-of c)))
-        (.remove ^ConcurrentHashMap (:cells layer) (hex (guid-of c)))
-        (when (.get (removed-of c))
-          (store/delete! (:store (:storage layer)) (fid-of c))))
-      (finally (.unlock ns)))))
-
-(defmacro ^:private with-ns [layer & body]
-  `(let [^ReentrantLock ns# (:ns ~layer)]
-     (.lock ns#)
-     (try ~@body (finally (.unlock ns#)))))
+  (with-ns layer
+    (when (zero? (.decrementAndGet (opens-of c)))
+      (.remove ^ConcurrentHashMap (:cells layer) (hex (guid-of c)))
+      (when (.get (removed-of c))
+        (store/delete! (:store (:storage layer)) (fid-of c))))))
 
 (defn- stat-of ^Stat [layer e]
   (if (:dir? e)
     prov/dir-stat
     (Stat. false (if-let [c (live-cell layer (:guid e))] (.get (live-of c)) (long (:len e))) (long (:mtime e)))))
 
-(defn- ancestors-of
+(defn ancestors-of
   "The folded and spelled paths of each ancestor of spelled vpath `vp`, root first (not \"\")."
   [^String vp]
   (let [parts (str/split vp #"/")]
@@ -293,7 +288,7 @@
   [st txn layer ^String vp]
   (reduce (fn [_ [folded nm]]
             (if-let [e (cat/get-entry st txn layer folded)]
-              (if (:dir? e) nil (reduced p/not-a-directory))
+              (when-not (:dir? e) (reduced p/not-a-directory))
               (do (cat/put-entry! st txn layer folded {:dir? true :name nm :mtime (now)}) nil)))
           nil (ancestors-of vp)))
 
@@ -431,8 +426,7 @@
   "Commits every open file's written blocks (before a freeze or a close)."
   [^Layer l]
   (doseq [^Cell c (.values ^ConcurrentHashMap (:cells l))]
-    (let [wl (.writeLock (lock-of c))]
-      (.lock wl)
-      (try (commit! (:storage l) (:id l) c) (finally (.unlock wl))))))
+    (with-lock (.writeLock (lock-of c))
+      (commit! (:storage l) (:id l) c))))
 
 (defn open-files ^long [^Layer l] (.size ^ConcurrentHashMap (:cells l)))

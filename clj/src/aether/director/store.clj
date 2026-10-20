@@ -33,11 +33,12 @@
            (java.io File)
            (java.lang.foreign MemorySegment ValueLayout)
            (java.nio ByteBuffer ByteOrder)
-           (java.nio.channels FileChannel FileLock)
+           (java.nio.channels FileChannel FileLock OverlappingFileLockException)
            (java.nio.charset StandardCharsets)
            (java.nio.file StandardOpenOption)
-           (java.util Arrays)
-           (java.util.concurrent Callable ExecutorService Executors Future)
+           (java.util Arrays HashMap)
+           (java.util.concurrent Callable ExecutionException ExecutorService Executors Future
+                                 ThreadFactory)
            (java.util.concurrent.atomic AtomicLong)
            (java.util.concurrent.locks ReentrantReadWriteLock)))
 
@@ -67,8 +68,8 @@
 (defn crash-point
   "For crash tests: halts the JVM at point `name` when the system property
   aether.store.crash names it."
-  [name]
-  (when (= name (System/getProperty "aether.store.crash"))
+  [point]
+  (when (= point (System/getProperty "aether.store.crash"))
     (.halt (Runtime/getRuntime) 99)))
 
 (defn- fail [kind msg & [data]] (throw (ex-info msg (assoc data ::error kind))))
@@ -97,14 +98,15 @@
 (defn- meta-key ^bytes [^String k] (.getBytes k StandardCharsets/UTF_8))
 
 (defn- le ^ByteBuffer [n] (.order (ByteBuffer/allocate n) ByteOrder/LITTLE_ENDIAN))
+(defn- le-u64-bytes ^bytes [v] (.array (.putLong (le 8) (long v))))
 
-(defn- dbi ^long [store name] (l/dbi (:env store) name))
+(defn- dbi ^long [store db-name] (l/dbi (:env store) db-name))
 
 (defn- get-meta [store txn k]
   (when-let [s (l/get-seg txn (dbi store "meta") (meta-key k))] (l/le-u64 s 0)))
 
 (defn- put-meta! [store txn k v]
-  (l/put! txn (dbi store "meta") (meta-key k) (.array (.putLong (le 8) v))))
+  (l/put! txn (dbi store "meta") (meta-key k) (le-u64-bytes v)))
 
 ;; A blocks row, decoded.
 (defrecord Row [^long pack ^long offset ^long stored ^long raw ^long refs ^bytes hash])
@@ -128,9 +130,16 @@
 (defn- record-len ^long [^Row r] (+ pack/header-len (.-stored r)))
 
 ;; packs rows: {:live :end :state}
+(defn- decode-pack [^MemorySegment s]
+  {:live (l/le-u64 s 0) :end (l/le-u64 s 8) :state (bit-and 0xff (.get s ValueLayout/JAVA_BYTE 16))})
+
 (defn- get-pack [store txn id]
-  (when-let [s (l/get-seg txn (dbi store "packs") (u32-key id))]
-    {:live (l/le-u64 s 0) :end (l/le-u64 s 8) :state (bit-and 0xff (.get s ValueLayout/JAVA_BYTE 16))}))
+  (some-> (l/get-seg txn (dbi store "packs") (u32-key id)) decode-pack))
+
+(defn- get-pack-or-new
+  "The packs row of `id`, or a fresh active one."
+  [store txn id]
+  (or (get-pack store txn id) {:live 0 :end 0 :state active}))
 
 (defn- put-pack! [store txn id {:keys [live end state]}]
   (let [bb (le 17)]
@@ -138,16 +147,14 @@
     (l/put! txn (dbi store "packs") (u32-key id) (.array bb))))
 
 (defn- add-live! [store txn pack-id delta]
-  (let [p (or (get-pack store txn pack-id) {:live 0 :end 0 :state active})]
+  (let [p (get-pack-or-new store txn pack-id)]
     (put-pack! store txn pack-id (update p :live #(max 0 (+ (long %) delta))))))
 
 (defn- all-packs
   "{pack-id {:live :end :state}} in a read or write txn."
   [store txn]
   (l/reduce-range txn (dbi store "packs") nil (constantly true)
-                  (fn [m ^MemorySegment k ^MemorySegment v]
-                    (assoc m (l/be-u32 k 0)
-                           {:live (l/le-u64 v 0) :end (l/le-u64 v 8) :state (bit-and 0xff (.get v ValueLayout/JAVA_BYTE 16))}))
+                  (fn [m ^MemorySegment k v] (assoc m (l/be-u32 k 0) (decode-pack v)))
                   {}))
 
 ;; --- manifests ----------------------------------------------------------------------------
@@ -192,7 +199,7 @@
               lo  (- i (* seg seg-slots))
               n   (min (- (alength a) lo) (- to i))]
           (when (pos? n) (System/arraycopy a lo out (- i from) n))
-          (recur (+ i (max 1 n) (if (pos? n) 0 0))))))
+          (recur (+ i (max 1 n))))))
     out))
 
 (defn- write-slots!
@@ -290,11 +297,9 @@
   [store txn]
   (let [{:keys [appender ^AtomicLong next-block ^AtomicLong next-pack]} store
         {:keys [id end] newly-sealed :sealed} (pack/sync! appender)]
-    (let [p (or (get-pack store txn id) {:live 0 :end 0 :state active})]
-      (put-pack! store txn id (assoc p :end end :state active)))
+    (put-pack! store txn id (assoc (get-pack-or-new store txn id) :end end :state active))
     (doseq [[sid size] newly-sealed]
-      (let [p (or (get-pack store txn sid) {:live 0 :end 0 :state active})]
-        (put-pack! store txn sid (assoc p :end size :state sealed))))
+      (put-pack! store txn sid (assoc (get-pack-or-new store txn sid) :end size :state sealed)))
     (put-meta! store txn "next_block_id" (.get next-block))
     (put-meta! store txn "next_pack_id" (.get next-pack))
     (when (seq newly-sealed) #(pack/recorded! appender newly-sealed))))
@@ -312,7 +317,7 @@
         _       (.mkdirs (io/file dir "packs"))
         lock-ch (FileChannel/open (.toPath (io/file dir "LOCK"))
                                   (into-array StandardOpenOption [StandardOpenOption/CREATE StandardOpenOption/WRITE]))
-        lock    (try (.tryLock lock-ch) (catch java.nio.channels.OverlappingFileLockException _ nil))
+        lock    (try (.tryLock lock-ch) (catch OverlappingFileLockException _ nil))
         _       (when-not lock (.close lock-ch) (fail :locked (str dir " is open in another process")))
         env     (l/open (io/file dir "index") (into ["files" "blocks" "dedup" "packs" "meta"] (:extra-dbs cfg))
                         {:map-size (:map-size cfg) :durability (:durability cfg) :page-size (:page-size cfg)})
@@ -355,15 +360,14 @@
                                                  (concat (keys rows) on-disk)))))
                         (if resume
                           [resume (:end (live-rows resume))]
-                          (let [id (dec (.incrementAndGet ^AtomicLong (:next-pack store)))]
-                            [id 0]))))))
+                          [(dec (.incrementAndGet ^AtomicLong (:next-pack store))) 0])))))
         [rid rend] resume
         store   (assoc store
                        :appender (pack/appender dir rid rend)
                        :reader (pack/reader dir)
                        :pool (Executors/newFixedThreadPool
                               (int (:threads cfg))
-                              (reify java.util.concurrent.ThreadFactory
+                              (reify ThreadFactory
                                 (newThread [_ r] (doto (Thread. r "store-compress") (.setDaemon true))))))]
     (when (>= (long (:max-file-id-len cfg)) (- (l/max-key-size env) 6))
       (fail :config (str "file ids up to " (:max-file-id-len cfg) " bytes don't fit LMDB's keys")))
@@ -422,17 +426,16 @@
   for an existing destination."
   [store txn pairs]
   (doseq [[_ d] pairs] (check-id store d))
-  (do
-    (let [bs (.-block-size ^Store store)]
-      (doseq [[^bytes src ^bytes dst] pairs]
-        (let [len (or (file-len store txn src) (fail :not-found "no such file" {:id src}))]
-          (when (file-len store txn dst) (fail :already-exists "file exists" {:id dst}))
-          (let [n (blocks-in len bs)]
-            (doseq [seg (range (segs-for n))]
-              (let [a (read-seg store txn src seg)]
-                (write-seg! store txn dst seg len a)
-                (doseq [b a] (when (pos? (long b)) (incref! store txn b)))))))))
-    nil))
+  (let [bs (.-block-size ^Store store)]
+    (doseq [[^bytes src ^bytes dst] pairs]
+      (let [len (or (file-len store txn src) (fail :not-found "no such file" {:id src}))]
+        (when (file-len store txn dst) (fail :already-exists "file exists" {:id dst}))
+        (let [n (blocks-in len bs)]
+          (doseq [seg (range (segs-for n))]
+            (let [a (read-seg store txn src seg)]
+              (write-seg! store txn dst seg len a)
+              (doseq [b a] (when (pos? (long b)) (incref! store txn b)))))))))
+  nil)
 
 (defn clone-files!
   "Copies each [src dst] file's manifest to a new file (no data is copied).
@@ -461,13 +464,13 @@
   (if (next xs)
     (let [^ExecutorService pool (:pool store)
           fs (mapv (fn [x] (.submit pool ^Callable (fn [] (f x)))) xs)]
-      (mapv (fn [^Future fu] (try (.get fu) (catch java.util.concurrent.ExecutionException e (throw (.getCause e))))) fs))
+      (mapv (fn [^Future fu] (try (.get fu) (catch ExecutionException e (throw (.getCause e))))) fs))
     (mapv f xs)))
 
 (defn- hash-at ^bytes [^bytes hashes i] (Arrays/copyOfRange hashes (int (* 16 i)) (int (* 16 (inc i)))))
 
 (defn- known-blocks
-  "{hash-hex block-id} for those of `hashes` the store already holds."
+  "{hash-code [hash block-id]} for those of `hashes` the store already holds."
   [store hashes]
   (l/with-read [txn (:env store)]
     (into {} (keep (fn [^bytes h]
@@ -495,7 +498,7 @@
   "In a write txn: the block id for each of `hashes`, from the index or from
   `fresh` (just appended; given a row now). Throws ::retry with the indices
   whose block vanished since it was looked up."
-  [store txn hashes fresh ^java.util.HashMap placed]
+  [store txn hashes fresh ^HashMap placed]
   (let [ids     (long-array (count hashes))
         missing (volatile! [])]
     (doseq [[i ^bytes h] (map-indexed vector hashes)]
@@ -507,7 +510,7 @@
             (if-let [{:keys [pack offset stored raw]} (get fresh k)]
               (let [bid (.getAndIncrement ^AtomicLong (:next-block store))]
                 (put-row! store txn bid (->Row pack offset stored raw 0 h))
-                (l/put! txn (dbi store "dedup") h (.array (.putLong (le 8) bid)))
+                (l/put! txn (dbi store "dedup") h (le-u64-bytes bid))
                 (add-live! store txn pack (+ pack/header-len (long stored)))
                 (.put placed k bid)
                 (aset ids i bid))
@@ -541,7 +544,7 @@
             result (try
                      (l/write! (:env store)
                                (fn [txn]
-                                 (let [placed (java.util.HashMap.)]
+                                 (let [placed (HashMap.)]
                                    (doseq [[{:keys [^bytes id len ^long from]} hs] (map vector files hashes)]
                                      (when len (resize! store txn id len))
                                      (let [flen (or (file-len store txn id) (fail :not-found "no such file" {:id id}))]
@@ -637,11 +640,10 @@
                                 s      (max offset bstart)
                                 e      (min end (+ bstart blen))
                                 bid    (aget ids (- b b0))
-                                r      (when (pos? bid) (get-row store txn bid))
+                                ^Row r (when (pos? bid) (get-row store txn bid))
                                 whole? (and (= s bstart) (= e (+ bstart blen)))
                                 ok?    (when r
-                                         (let [^Row r r
-                                               out (if whole?
+                                         (let [out (if whole?
                                                      (.asSlice dst (long (- s offset)) (long blen))
                                                      (pack/scratch (:raw-buf store) blen))
                                                why (read-block! store r out)]
@@ -677,22 +679,21 @@
   compaction doesn't change it."
   [store txn ids]
   (let [bs (.-block-size ^Store store)]
-    (do
-      (mapv (fn [^bytes id]
-              (when-let [len (file-len store txn id)]
-                (let [d   (Codec/derive "aether-block-store content digest v1")
-                      len (long len)
-                      n   (blocks-in len bs)
-                      ids (read-slots store txn id 0 n)]
-                  (.update d (.array (.putLong (le 8) len)))
-                  (doseq [b (range n)]
-                    (let [bid (aget ids b)
-                          r   (when (pos? bid) (get-row store txn bid))]
-                      (if r
-                        (.update d (byte-array (cons 1 (seq ^bytes (:hash r)))))
-                        (.update d (byte-array [0])))))
-                  [len (.finish d 32)])))
-            ids))))
+    (mapv (fn [^bytes id]
+            (when-let [len (file-len store txn id)]
+              (let [d   (Codec/derive "aether-block-store content digest v1")
+                    len (long len)
+                    n   (blocks-in len bs)
+                    ids (read-slots store txn id 0 n)]
+                (.update d (le-u64-bytes len))
+                (doseq [b (range n)]
+                  (let [bid (aget ids b)
+                        r   (when (pos? bid) (get-row store txn bid))]
+                    (if r
+                      (.update d (byte-array (cons 1 (seq ^bytes (:hash r)))))
+                      (.update d (byte-array [0])))))
+                [len (.finish d 32)])))
+          ids)))
 
 (defn content-digests
   "content-digests-in, in a read snapshot."
@@ -765,13 +766,10 @@
               ;; check each before copying: a bad one is healed, not carried along
               good (filterv (fn [[bid off len]]
                               (let [rec (.asSlice (pack/scratch (:rec-buf store) len) 0 (long len))]
-                                (if (pack/read-at! (:reader store) pid off rec)
-                                  (if-let [h (pack/header rec 0)]
-                                    (if (= (:checksum h) (Codec/xxh3 (.asSlice rec pack/header-len)))
-                                      true
-                                      (do (heal! store bid pid off) false))
-                                    (do (heal! store bid pid off) false))
-                                  (do (heal! store bid pid off) false))))
+                                (or (and (pack/read-at! (:reader store) pid off rec)
+                                         (when-let [h (pack/header rec 0)]
+                                           (= (:checksum h) (Codec/xxh3 (.asSlice rec pack/header-len)))))
+                                    (do (heal! store bid pid off) false))))
                             recs)
               batch (long (get-in store [:cfg :write-txn-bytes]))
               n     (reduce (fn [^long acc part] (+ acc (long (move-records! store pid part))))
@@ -805,7 +803,7 @@
         problem! #(vswap! problems conj %)]
     (l/with-read [txn (:env store)]
       (let [ids    (file-ids store)
-            refs   (java.util.HashMap.)
+            refs   (HashMap.)
             _      (doseq [^bytes id ids]
                      (let [len (long (file-len store txn id))
                            n   (blocks-in len bs)]
@@ -815,7 +813,7 @@
                              (problem! (str "file " (String. id) " segment " seg " holds " (alength a) " slots, not " (slots-in-seg n seg))))
                            (doseq [b a] (when (pos? (long b)) (.merge refs b 1 +)))))))
             packs  (all-packs store txn)
-            counted (java.util.HashMap.)
+            counted (HashMap.)
             nblock (l/reduce-range
                     txn (dbi store "blocks") nil (constantly true)
                     (fn [^long n k v]

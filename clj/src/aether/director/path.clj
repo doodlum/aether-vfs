@@ -2,6 +2,8 @@
   "Virtual paths as the ring carries them: root-relative, `/`-separated, and
   case-folded by the shim with Rust's `char::to_lowercase` (vfs_core::fold).")
 
+(set! *warn-on-reflection* true)
+
 (defn fold
   "Case-fold exactly like vfs_core::fold: each code point's simple lowercase.
   Not String/toLowerCase, which is context-sensitive (final sigma) and

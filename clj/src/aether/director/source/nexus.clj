@@ -16,21 +16,20 @@
   expire or when the file host refuses one; they never appear in errors,
   events or printed values. The API key is sent only to the API, by the
   client that never follows redirects."
-  (:require [aether.director.source.archive :as ar]
+  (:require [aether.director.proto :as p]
+            [aether.director.provider :as prov]
+            [aether.director.source.archive :as ar]
             [aether.director.source.net :as net]
             [aether.director.source.tree :as tree]
-            [aether.director.proto :as p]
-            [aether.director.provider :as prov]
             [charred.api :as json]
             [clojure.java.io :as io]
             [clojure.string :as str])
-  (:import (aether.director.source.archive SeekTable ZipEntry ZipIndex)
-           (aether.director.provider Stat)
+  (:import (aether.director.provider Stat)
+           (aether.director.source.archive SeekTable ZipEntry ZipIndex)
            (java.lang.foreign MemorySegment ValueLayout)
            (java.net.http HttpResponse)
-           (java.nio ByteBuffer ByteOrder)
-           (java.time Instant OffsetDateTime)
-           (java.time.format DateTimeFormatter)
+           (java.nio.charset StandardCharsets)
+           (java.time OffsetDateTime)
            (java.util Arrays LinkedHashMap)
            (java.util.concurrent ConcurrentHashMap)
            (java.util.concurrent.atomic AtomicBoolean AtomicLong AtomicReferenceArray)
@@ -124,12 +123,12 @@
 (defn client
   "A Nexus client for API key `key` over net base `h`. Options: :base-url,
   :link-file (signed links kept across runs: a secret, never logged)."
-  [h ^String key & [{:keys [base-url link-file]}]]
+  [h ^String api-key & [{:keys [base-url link-file]}]]
   (let [links (ConcurrentHashMap.)]
     (when link-file
       (io/make-parents link-file)
       (when (.exists (io/file link-file)) (.putAll links (load-links (io/file link-file)))))
-    {:h h :key (Secret. key) :base (or base-url api) :links links :locks (ConcurrentHashMap.)
+    {:h h :key (Secret. api-key) :base (or base-url api) :links links :locks (ConcurrentHashMap.)
      :quota (atom {}) :links-requested (AtomicLong.) :link-file (some-> link-file io/file)
      :dirty (AtomicBoolean.) :last-save (AtomicLong.) :saving (Object.)}))
 
@@ -143,16 +142,11 @@
             body (json/write-json-str
                   {"v" 1 "links" (vec (for [[u {:keys [url expires]}] (sort-by key links)
                                             :when (> (long expires) (+ now expiry-margin-ms))]
-                                        {"uid" u "url" (.-v ^Secret url) "expires_at" (quot (long expires) 1000)}))})
-            tmp (io/file (str link-file "." (.pid (ProcessHandle/current)) "." now ".partial"))]
+                                        {"uid" u "url" (.-v ^Secret url) "expires_at" (quot (long expires) 1000)}))})]
         (try
-          (spit tmp body)
-          (.setReadable tmp false false) (.setReadable tmp true true)
-          (java.nio.file.Files/move (.toPath tmp) (.toPath link-file)
-                                    (into-array java.nio.file.CopyOption [java.nio.file.StandardCopyOption/REPLACE_EXISTING
-                                                                         java.nio.file.StandardCopyOption/ATOMIC_MOVE]))
+          (net/write-file! link-file (.getBytes ^String body StandardCharsets/UTF_8) {:private? true})
           (.set last-save now)
-          (catch Exception _ (.set dirty true) (.delete tmp)))))))
+          (catch Exception _ (.set dirty true)))))))
 
 (defn- maybe-save! [{:keys [^AtomicBoolean dirty ^AtomicLong last-save link-file] :as c}]
   (when (and link-file (.get dirty) (> (- (System/currentTimeMillis) (.get last-save)) link-save-interval-ms))
@@ -161,8 +155,8 @@
 (defn- problem-detail [^HttpResponse resp]
   (let [b (try (.readNBytes ^java.io.InputStream (.body resp) 4096) (catch Exception _ (byte-array 0)))]
     (net/close-body resp)
-    (let [d (try (get (json/read-json (String. ^bytes b "UTF-8")) "detail") (catch Exception _ nil))]
-      (some-> d str (#(subs % 0 (min 300 (count %))))))))
+    (when-let [d (try (get (json/read-json (String. ^bytes b StandardCharsets/UTF_8)) "detail") (catch Exception _ nil))]
+      (let [s (str d)] (subs s 0 (min 300 (count s)))))))
 
 (defn- api-check [^HttpResponse resp url]
   (let [st (.statusCode resp)]
@@ -174,28 +168,29 @@
           401 (throw (net/error :unauthorized "Nexus Mods rejected the API key (HTTP 401). Log in to Nexus Mods again with a valid personal API key."))
           403 (throw (net/error :forbidden (str "Nexus Mods refused the request (HTTP 403: " detail "). Downloading repacked archives needs a Premium membership.") {:detail detail}))
           404 (throw (net/error :not-found (str "not found (HTTP 404): " (or detail (net/redact url))) {:what (or detail (net/redact url))}))
-          429 (throw (net/error :rate-limited (str "rate limited by " (.getHost (java.net.URI. url)) " (HTTP 429)" (when ra (str ", retry after " ra "s")))
+          429 (throw (net/error :rate-limited (str "rate limited by " (net/host url) " (HTTP 429)" (when ra (str ", retry after " ra "s")))
                                 {:retry-after-ms (some-> ra (* 1000))}))
           (throw (net/error :status (str "HTTP " st " from " (net/redact url) ": " detail) {:url (net/redact url) :status st :body detail})))))))
 
 (defn- api!
   "An API call's parsed JSON body, retried; a 429 that outlasts the retries
   waits for a spent hourly allowance to reset (a spent daily one fails)."
-  [{:keys [h key base] :as c} method path]
+  [{:keys [h base] ^Secret api-key :key :as c} method path]
   (let [url (str base path)]
     (loop []
       (let [r (try
                 {:ok (net/with-job [job h (str "nexus " (name method) " " (net/redact url)) nil]
                        (net/with-retry h job
                          (fn []
-                           (with-open [_ (net/acquire! (:limiter h) (.getHost (java.net.URI. url)))]
+                           (with-open [_ (net/acquire! (:limiter h) (net/host url))]
                              (let [resp (net/send! h url {:method method :api? true
-                                                          :headers {"apikey" (.-v ^Secret key) "Accept" "application/json"}})]
+                                                          :headers {"apikey" (.-v api-key) "Accept" "application/json"}})]
                                (record-quota! c resp)
                                (api-check resp url)
                                (let [b (net/read-body h resp url {:max (* 16 1024 1024)})]
-                                 (try (json/read-json (String. ^bytes b "UTF-8"))
-                                      (catch Exception _ (throw (net/error :protocol (str "unexpected response from " (net/redact url) ": not JSON")))))))))))}
+                                 (try (json/read-json (String. b StandardCharsets/UTF_8))
+                                      (catch Exception _
+                                        (throw (net/error :protocol (str "unexpected response from " (net/redact url) ": not JSON")))))))))))}
                 (catch clojure.lang.ExceptionInfo e
                   (if (= :rate-limited (net/kind e))
                     (let [now (System/currentTimeMillis)
@@ -228,26 +223,22 @@
         fresh (fn [] (when-let [{:keys [url expires]} (.get links uid)]
                        (when (> (long expires) (+ (System/currentTimeMillis) expiry-margin-ms)) url)))]
     (or (fresh)
-        (let [^ReentrantLock l (.computeIfAbsent locks uid (reify java.util.function.Function (apply [_ _] (ReentrantLock.))))]
-          (.lock l)
-          (try
-            (or (fresh)
-                (let [_ (.incrementAndGet links-requested)
-                      d (api! c :post (str "/v3/mod-file-versions/" uid "/download-repacked"))
-                      url (Secret. (str (get d "download_url")))
-                      expires (.toEpochMilli (.toInstant (OffsetDateTime/parse (str (get d "expires_at")))))]
-                  (.put links uid {:url url :expires expires})
-                  (.set dirty true)
-                  (maybe-save! c)
-                  url))
-            (finally (.unlock l)))))))
+        (net/with-lock (.computeIfAbsent locks uid (fn [_] (ReentrantLock.)))
+          (or (fresh)
+              (let [_ (.incrementAndGet links-requested)
+                    d (api! c :post (str "/v3/mod-file-versions/" uid "/download-repacked"))
+                    url (Secret. (str (get d "download_url")))
+                    expires (.toEpochMilli (.toInstant (OffsetDateTime/parse (str (get d "expires_at")))))]
+                (.put links uid {:url url :expires expires})
+                (.set dirty true)
+                (maybe-save! c)
+                url))))))
 
 (defn forget-refused!
   "Drops `uid`'s link if it is still `refused` (a reader whose refusal arrives
   late mustn't drop a link someone just renewed)."
   [{:keys [^ConcurrentHashMap links]} uid ^Secret refused]
-  (.computeIfPresent links (long uid) (reify java.util.function.BiFunction
-                                        (apply [_ _ v] (when-not (identical? refused (:url v)) v)))))
+  (.computeIfPresent links (long uid) (fn [_ v] (when-not (identical? refused (:url v)) v))))
 
 (defn has-url? [{:keys [^ConcurrentHashMap links]} uid]
   (when-let [{:keys [expires]} (.get links (long uid))] (> (long expires) (+ (System/currentTimeMillis) expiry-margin-ms))))
@@ -381,16 +372,7 @@
   (locking (frames-of a) (.get (frames-of a) k)))
 
 (defn- cache-frame! [^Archive a k ^bytes frame]
-  (let [^LinkedHashMap m (frames-of a)]
-    (locking m
-      (when-not (.containsKey m k)
-        (.put m k frame)
-        (.addAndGet (frame-bytes a) (alength frame))
-        (let [it (.iterator (.entrySet m))]
-          (while (and (> (.get (frame-bytes a)) frame-cache-bytes) (.hasNext it))
-            (let [^java.util.Map$Entry victim (.next it)]
-              (.addAndGet (frame-bytes a) (- (alength ^bytes (.getValue victim))))
-              (.remove it))))))))
+  (net/lru-put! (frames-of a) (frame-bytes a) k frame frame-cache-bytes))
 
 (defn- runs
   "Frames (indices) grouped into contiguous runs of at most max-request compressed bytes."

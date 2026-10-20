@@ -2,9 +2,11 @@
   "Serves the benchmark fixture over a ring, for vfs-ring-bench:
   prints `SECTION <name> <map_bytes>` and serves until stdin closes."
   (:require [aether.director.fixture :as fixture]
-            [aether.director.ring :as ring]
-            [aether.director.provider.tree :as tree])
+            [aether.director.provider.tree :as tree]
+            [aether.director.ring :as ring])
   (:gen-class))
+
+(set! *warn-on-reflection* true)
 
 (defn -main [& args]
   (let [opts   (into {} (for [[k v] (partition 2 args)] [(keyword (subs k 2)) (parse-long v)]))

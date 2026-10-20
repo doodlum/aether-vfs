@@ -9,12 +9,12 @@
   parents; MKDIR makes parents and is OK on an existing directory; deleting a
   non-empty directory, or renaming onto one, is an I/O error; rename replaces
   a file."
-  (:require [aether.director.path :as path]
-            [aether.director.proto :as p]
+  (:require [aether.director.proto :as p]
             [aether.director.provider :as prov])
   (:import (aether.director.provider Entry Stat)
-           (java.io IOException)
+           (java.io File IOException)
            (java.lang.foreign MemorySegment)
+           (java.nio ByteBuffer)
            (java.nio.channels FileChannel)
            (java.nio.file AccessDeniedException CopyOption DirectoryNotEmptyException
                           FileAlreadyExistsException Files LinkOption NoSuchFileException
@@ -39,7 +39,8 @@
   [& body]
   `(try ~@body (catch IOException e# (status-of e#))))
 
-(def ^:private no-links (make-array LinkOption 0))
+(def ^:private ^"[Ljava.nio.file.LinkOption;" no-links (make-array LinkOption 0))
+(def ^:private ^"[Ljava.nio.file.attribute.FileAttribute;" no-attrs (make-array FileAttribute 0))
 
 (defn- stat-of ^Stat [^BasicFileAttributes a]
   (if (.isDirectory a)
@@ -47,7 +48,7 @@
     (Stat. false (.size a) (quot (.toMillis (.lastModifiedTime a)) 1000))))
 
 (defn- attrs ^BasicFileAttributes [^Path f]
-  (try (Files/readAttributes f BasicFileAttributes ^"[Ljava.nio.file.LinkOption;" no-links)
+  (try (Files/readAttributes f BasicFileAttributes no-links)
        (catch IOException _ nil)))
 
 (deftype DiskHandle [^FileChannel ch]
@@ -74,7 +75,7 @@
     (guarded
      (let [size (long size) cur (.size ch)]
        (cond (< size cur) (.truncate ch size)
-             (> size cur) (.write ch (java.nio.ByteBuffer/allocate 1) (dec size)))
+             (> size cur) (.write ch (ByteBuffer/allocate 1) (dec size)))
        p/ok)))
   (close! [_] (.close ch)))
 
@@ -90,15 +91,16 @@
 (defn- options
   "FileChannel options for the ring's OPEN flags."
   ^"[Ljava.nio.file.OpenOption;" [^long flags]
-  (let [write? (not (zero? (bit-and flags (bit-or p/open-write p/open-append p/open-trunc))))]
+  (let [write?  (not (zero? (bit-and flags (bit-or p/open-write p/open-append p/open-trunc))))
+        trunc?  (not (zero? (bit-and flags p/open-trunc)))
+        create? (not (zero? (bit-and flags p/open-create)))
+        excl?   (not (zero? (bit-and flags p/open-excl)))]
     (into-array OpenOption
                 (cond-> [StandardOpenOption/READ]
-                  write?                                        (conj StandardOpenOption/WRITE)
-                  (not (zero? (bit-and flags p/open-trunc)))    (conj StandardOpenOption/TRUNCATE_EXISTING)
-                  (and (not (zero? (bit-and flags p/open-create)))
-                       (not (zero? (bit-and flags p/open-excl)))) (conj StandardOpenOption/CREATE_NEW)
-                  (and (not (zero? (bit-and flags p/open-create)))
-                       (zero? (bit-and flags p/open-excl)))     (conj StandardOpenOption/CREATE)))))
+                  write?                    (conj StandardOpenOption/WRITE)
+                  trunc?                    (conj StandardOpenOption/TRUNCATE_EXISTING)
+                  (and create? excl?)       (conj StandardOpenOption/CREATE_NEW)
+                  (and create? (not excl?)) (conj StandardOpenOption/CREATE)))))
 
 (deftype Disk [^Path root]
   prov/Provider
@@ -113,22 +115,24 @@
         (catch NotDirectoryException _ p/not-a-directory)
         (catch IOException e (status-of e)))))
   (spelling [_ vp]
-    (try (let [real (.toRealPath (.resolve root ^String vp) ^"[Ljava.nio.file.LinkOption;" no-links)]
-           (.replace (str (.relativize (.toRealPath root ^"[Ljava.nio.file.LinkOption;" no-links) real)) \\ \/))
+    (try (let [real (.toRealPath (.resolve root ^String vp) no-links)]
+           (.replace (str (.relativize (.toRealPath root no-links) real)) \\ \/))
          (catch IOException _ nil)))
   (open [_ vp flags]
-    (let [f (.resolve root ^String vp)
-          a (attrs f)]
+    (let [flags   (long flags)
+          f       (.resolve root ^String vp)
+          a       (attrs f)
+          create? (not (zero? (bit-and flags p/open-create)))]
       (cond
         (and a (.isDirectory a))
-        (if (zero? (bit-and (long flags) (bit-or p/open-write p/open-trunc p/open-append))) (DirHandle. prov/dir-stat) p/is-dir)
-        (and a (not (zero? (bit-and (long flags) p/open-create))) (not (zero? (bit-and (long flags) p/open-excl))))
+        (if (zero? (bit-and flags (bit-or p/open-write p/open-trunc p/open-append))) (DirHandle. prov/dir-stat) p/is-dir)
+        (and a create? (not (zero? (bit-and flags p/open-excl))))
         p/exists
         :else
         (guarded
          ;; creating makes missing parents, as vfs-compose's DiskProvider does
-         (when (and (nil? a) (not (zero? (bit-and (long flags) p/open-create))))
-           (Files/createDirectories (.getParent f) (make-array FileAttribute 0)))
+         (when (and (nil? a) create?)
+           (Files/createDirectories (.getParent f) no-attrs))
          (DiskHandle. (FileChannel/open f (options flags)))))))
   (mkdir! [_ vp]
     ;; with parents; an existing directory is fine, an existing file is not
@@ -136,7 +140,7 @@
           a (attrs d)]
       (cond (and a (.isDirectory a)) p/ok
             a                         p/io-error
-            :else (guarded (Files/createDirectories d (make-array FileAttribute 0)) p/ok))))
+            :else (guarded (Files/createDirectories d no-attrs) p/ok))))
   (delete! [_ vp]
     (guarded (Files/delete (.resolve root ^String vp)) p/ok))
   (rename! [_ from to]
@@ -147,6 +151,6 @@
 (defn disk
   "A provider serving the directory `dir` (created if missing)."
   [dir]
-  (let [root (.toAbsolutePath (.toPath (java.io.File. (str dir))))]
-    (Files/createDirectories root (make-array FileAttribute 0))
+  (let [root (.toAbsolutePath (.toPath (File. (str dir))))]
+    (Files/createDirectories root no-attrs)
     (Disk. root)))

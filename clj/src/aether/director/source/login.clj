@@ -13,6 +13,8 @@
             [aether.director.source.steam.cm :as cm])
   (:gen-class))
 
+(set! *warn-on-reflection* true)
+
 (defn- prompt ^String [msg]
   (print msg) (flush)
   (or (read-line) (throw (ex-info "no input" {}))))

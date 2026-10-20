@@ -19,14 +19,17 @@
      :volatile    bool                        ; never persisted
      :last-write  FILETIME}"
   (:require [aether.director.path :as path]
+            [aether.director.proto :as p]
             [clojure.java.io :as io])
   (:import (java.io ByteArrayOutputStream File)
            (java.nio ByteBuffer ByteOrder)
            (java.nio.charset StandardCharsets)
-           (java.nio.file Files StandardCopyOption CopyOption)
-           (java.util Arrays Comparator)
-           (java.util.concurrent Executors ScheduledExecutorService TimeUnit)
+           (java.nio.file CopyOption Files StandardCopyOption)
+           (java.util ArrayList Arrays Comparator)
+           (java.util.concurrent Executors ScheduledExecutorService ThreadFactory TimeUnit)
            (java.util.concurrent.atomic AtomicBoolean AtomicLong)))
+
+(set! *warn-on-reflection* true)
 
 (def ^:const max-key-name 255)
 (def ^:const max-value-name 16383)
@@ -69,8 +72,8 @@
 (defn- check-key-name [p]
   (when (some #(> (utf16-len %) max-key-name) (rest (parts p))) (fail :name-too-long)))
 
-(defn- check-depth [p max]
-  (when (> (- (count (parts p)) 2) max) (fail :too-deep)))
+(defn- check-depth [p limit]
+  (when (> (- (count (parts p)) 2) limit) (fail :too-deep)))
 
 (defn filetime-now
   "Now, as a Windows FILETIME (100 ns ticks since 1601)."
@@ -110,8 +113,8 @@
   "Tombstoned itself, or below a tombstoned ancestor."
   [o f]
   (loop [cur f]
-    (cond (contains? (:tombs o) cur) true
-          :else (if-let [p (parent cur)] (recur p) false))))
+    (or (contains? (:tombs o) cur)
+        (if-let [p (parent cur)] (recur p) false))))
 
 (defn lookup
   "[state below?]: state is :absent, :present, :present-created or :tombstoned;
@@ -126,7 +129,8 @@
 
 (defn node
   "The overlay's node at `p`, or nil."
-  [o p] (get-in o [:entries (fold p) :node]))
+  [o p]
+  (get-in o [:entries (fold p) :node]))
 
 (defn- bump [o] (let [v (inc (:version o))] [(assoc o :version v) v]))
 
@@ -169,39 +173,40 @@
     (loop [o o i 0 stored "" parent-key nil]
       (if (= i (count comps))
         o
-        (let [comp   (comps i)
+        (let [c      (comps i)
               target (= i (dec (count comps)))
-              stored (str stored "\\" comp)
+              stored (str stored "\\" c)
               k      (fold stored)]
           (if-let [e (get-in o [:entries k])]
             (recur o (inc i) (:path e) k)
             (let [revived (or (contains? (:tombs o) k)
                               (and parent-key
-                                   (= :tomb (second (get-in o [:entries parent-key :node :children (fold comp)])))))
+                                   (= :tomb (second (get-in o [:entries parent-key :node :children (fold c)])))))
                   o       (update o :tombs dissoc k)
                   pcreated (boolean (and parent-key (get-in o [:entries parent-key :node :created])))
                   created (or revived pcreated (and target (not target-real-exists)))
                   o       (assoc-in o [:entries k] {:path stored :node (new-node created now) :changed v :subtree 0})
                   o       (if parent-key
                             (update-in o [:entries parent-key]
-                                       #(-> % (assoc-in [:node :children (fold comp)] [comp :present])
+                                       #(-> % (assoc-in [:node :children (fold c)] [c :present])
                                             (assoc-in [:node :last-write] now)
                                             (assoc :changed v)))
                             o)]
               (recur o (inc i) stored k))))))))
 
 (defn set-value
-  "Sets value `name` of key `p` (making the key, and its ancestors, plain
+  "Sets value `vname` of key `p` (making the key, and its ancestors, plain
   presences if missing). Returns [overlay version]."
-  [o p ^String name ty ^bytes data now]
+  [o p ^String vname ty ^bytes data now]
   (when-not (overlay-path? p) (fail :invalid-path))
   (check-key-name p)
   (check-depth p max-write-depth)
-  (when (> (utf16-len name) max-value-name) (fail :name-too-long))
+  (when (> (utf16-len vname) max-value-name) (fail :name-too-long))
   (when (> (alength data) max-data) (fail :data-too-large))
   (let [[o v] (bump o)
         o     (ensure-chain o p true v now)
-        f     (fold p) fname (fold name)
+        f     (fold p)
+        fname (fold vname)
         o     (update-in o [:entries f :node]
                          (fn [n]
                            (-> n
@@ -209,21 +214,21 @@
                                (update :values (fn [vs]
                                                  (if (some #(= fname (fold (:name %))) vs)
                                                    (mapv #(if (= fname (fold (:name %))) (assoc % :ty ty :data data) %) vs)
-                                                   (conj vs {:name name :ty ty :data data}))))
+                                                   (conj vs {:name vname :ty ty :data data}))))
                                (assoc :last-write now))))]
     [(mark o p v) v]))
 
 (defn delete-value
-  "Deletes value `name` of key `p`; the tombstone also hides a real value of
+  "Deletes value `vname` of key `p`; the tombstone also hides a real value of
   that name, so this succeeds whether or not the overlay had it."
-  [o p ^String name now]
+  [o p ^String vname now]
   (when-not (overlay-path? p) (fail :invalid-path))
   (check-key-name p)
-  (when (> (utf16-len name) max-value-name) (fail :name-too-long))
+  (when (> (utf16-len vname) max-value-name) (fail :name-too-long))
   (when (= :tombstoned (first (lookup o p))) (fail :not-found))
   (let [[o v] (bump o)
         o     (ensure-chain o p true v now)
-        fname (fold name)
+        fname (fold vname)
         o     (update-in o [:entries (fold p) :node]
                          (fn [n]
                            (-> n
@@ -313,9 +318,8 @@
     (if-let [e (get-in o [:entries f])]
       (or (> (long (:changed e)) since) (and subtree? (> (long (:subtree e)) since)))
       (loop [cur f]
-        (if (> (long (get-in o [:deleted-at cur] 0)) since)
-          true
-          (if-let [par (parent cur)] (recur par) (> (long (:floor o)) since)))))))
+        (or (> (long (get-in o [:deleted-at cur] 0)) since)
+            (if-let [par (parent cur)] (recur par) (> (long (:floor o)) since)))))))
 
 (defn- insert-node
   "Rebuilding from a saved overlay: `node` at `p`, changed at `changed`."
@@ -384,8 +388,8 @@
            (u8 (if (:volatile n) 1 0))
            (u64 (:last-write n))
            (u32 (count (:values n)))
-           (doseq [{:keys [name ty ^bytes data]} (:values n)]
-             (put-str name) (u32 ty) (u32 (alength data)) (raw data))
+           (doseq [{vn :name :keys [ty ^bytes data]} (:values n)]
+             (put-str vn) (u32 ty) (u32 (alength data)) (raw data))
            (u32 (count (:value-tombs n)))
            (doseq [t (:value-tombs n)] (put-str t))
            (u32 (count (:children n)))
@@ -401,14 +405,14 @@
   "A registry request's fields, or throws (a bad request). Every request
   starts with the key path; decoding must consume the payload exactly."
   [op ^bytes payload]
-  (let [{:keys [u32 u64 bool bytes get-str left]} (reader payload)
+  (let [{:keys [u32 u64 bool get-str left] read-bytes :bytes} (reader payload)
         p (get-str)
         req (case (long op)
               15 {:op :lookup :path p}
               16 {:op :key :path p}
-              17 (let [name (get-str max-value-name) ty (u32) n (u32)]
+              17 (let [vn (get-str max-value-name) ty (u32) n (u32)]
                    (when (> n max-data) (fail :data-too-large))
-                   {:op :set-value :path p :name name :ty ty :data (bytes n)})
+                   {:op :set-value :path p :name vn :ty ty :data (read-bytes n)})
               18 {:op :delete-value :path p :name (get-str max-value-name)}
               19 {:op :create-key :path p :volatile (bool)}
               20 {:op :delete-key :path p}
@@ -451,8 +455,8 @@
                              (u64 (:last-write n))
                              (u32 (count (:values n))) (u32 (count (:value-tombs n)))
                              (u32 (count tombs)) (u32 (count kids))
-                             (doseq [{:keys [name ty ^bytes data]} (:values n)]
-                               (put-str name) (u32 ty) (u32 (alength data)) (raw data))
+                             (doseq [{vn :name :keys [ty ^bytes data]} (:values n)]
+                               (put-str vn) (u32 ty) (u32 (alength data)) (raw data))
                              (doseq [t (:value-tombs n)] (put-str t))
                              (doseq [t tombs] (put-str t))
                              (doseq [[nm cp cn] kids] (enc nm cp cn))))
@@ -469,10 +473,10 @@
     (let [body (Arrays/copyOf b (- n 8))
           sum  (.getLong (.order (ByteBuffer/wrap b (- n 8) 8) ByteOrder/LITTLE_ENDIAN))]
       (when-not (= sum (checksum body (alength body))) (fail :bad-checksum))
-      (let [{:keys [u8 u32 u64 bytes get-str left]} (reader (Arrays/copyOfRange body 8 (alength body)))
+      (let [{:keys [u8 u32 u64 get-str left] read-bytes :bytes} (reader (Arrays/copyOfRange body 8 (alength body)))
             key-name (fn [] (let [s (get-str max-key-name)] (when (or (= "" s) (.contains ^String s "\\")) (fail :bad-key-name)) s))
             count* (fn [] (let [c (u32)] (when (> c (long (left))) (fail :truncated)) c))
-            nodes (transient [])
+            nodes (ArrayList.)                 ; [path node] in decode order
             dec-node (fn dec-node [p depth]
                        (when (> depth max-decode-depth) (fail :too-deep))
                        (let [flags (u8)
@@ -482,23 +486,24 @@
                              values (vec (for [_ (range nv)]
                                            (let [nm (get-str max-value-name) ty (u32) dl (u32)]
                                              (when (> dl max-data) (fail :data-too-large))
-                                             {:name nm :ty ty :data (bytes dl)})))
+                                             {:name nm :ty ty :data (read-bytes dl)})))
                              vtombs (vec (for [_ (range nt)] (let [t (get-str max-value-name)] (when-not (= t (fold t)) (fail :unfolded)) t)))
                              _ (when-not (apply distinct? (concat [::none] (map (comp fold :name) values) vtombs)) (fail :duplicate-value))
                              ctombs (vec (for [_ (range nct)] (key-name)))
-                             slot (count nodes)]
-                         (conj! nodes nil)
+                             slot (.size nodes)]
+                         (.add nodes nil)
                          (let [kids (loop [i 0 acc []]
-                                      (if (= i nc) acc
-                                          (let [nm (key-name)]
-                                            (dec-node (str p "\\" nm) (inc depth))
-                                            (recur (inc i) (conj acc nm)))))
+                                      (if (= i nc)
+                                        acc
+                                        (let [nm (key-name)]
+                                          (dec-node (str p "\\" nm) (inc depth))
+                                          (recur (inc i) (conj acc nm)))))
                                children (reduce (fn [m [nm st]]
                                                   (when (contains? m (fold nm)) (fail :duplicate-child))
                                                   (assoc m (fold nm) [nm st]))
                                                 (sorted-map-by utf8-order)
                                                 (concat (map vector ctombs (repeat :tomb)) (map vector kids (repeat :present))))]
-                           (assoc! nodes slot [p {:values values :value-tombs vtombs :children children
+                           (.set nodes slot [p {:values values :value-tombs vtombs :children children
                                                   :created (= 1 (bit-and flags 1)) :volatile false :last-write lw}]))))
             _ (case (long (u8))
                 0 nil
@@ -506,7 +511,7 @@
                     (when-not (= "registry" (fold nm)) (fail :bad-root))
                     (dec-node (str "\\" nm) 0)))]
         (when-not (zero? (long (left))) (fail :trailing-bytes))
-        (assoc (reduce (fn [o [p nd]] (insert-node o p nd 1)) empty-overlay (persistent! nodes)) :version 1)))))
+        (assoc (reduce (fn [o [p nd]] (insert-node o p nd 1)) empty-overlay nodes) :version 1)))))
 
 ;; --- the director's registry: overlay + reg_gen + persistence ------------------------------------
 
@@ -519,8 +524,9 @@
     (try (decode (Files/readAllBytes (.toPath f)))
          (catch Exception _
            ;; a damaged file is moved aside, and the overlay starts empty
-           (Files/move (.toPath f) (.toPath (io/file (.getParentFile f) (str (.getName f) ".corrupt-" (quot (System/currentTimeMillis) 1000))))
-                       (make-array CopyOption 0))
+           (let [aside (io/file (.getParentFile f)
+                                (str (.getName f) ".corrupt-" (quot (System/currentTimeMillis) 1000)))]
+             (Files/move (.toPath f) (.toPath aside) (make-array CopyOption 0)))
            empty-overlay))))
 
 (defn save!
@@ -539,7 +545,7 @@
   [dir]
   (let [f   (io/file dir "overlay.reg")
         ex  (Executors/newSingleThreadScheduledExecutor
-             (reify java.util.concurrent.ThreadFactory
+             (reify ThreadFactory
                (newThread [_ r] (doto (Thread. ^Runnable r "registry-saver") (.setDaemon true)))))
         reg (->Registry (atom (load-file* f)) (Object.) (AtomicLong. 1) (atom []) f (AtomicBoolean.) ex)]
     (.scheduleWithFixedDelay ex ^Runnable #(try (save! reg) (catch Exception _)) 1 1 TimeUnit/SECONDS)
@@ -569,24 +575,32 @@
 
 (def error-status
   "Overlay failures as ring statuses."
-  {:not-found -1 :already-exists -10})
+  {:not-found p/not-found :already-exists p/exists})
+
+(defn- written
+  "Applies write `f` (write!) and answers with the new version."
+  [reg f]
+  [p/ok (encode-version-reply (write! reg f))])
 
 (defn serve
   "Answers registry request `req` (decode-request). Returns [status ^bytes reply]."
   [{:keys [state] :as reg} {:keys [op path] :as req}]
   (if-not (valid-path? path)
-    [-3 nil]
+    [p/bad-request nil]
     (try
       (case op
-        :lookup (let [o @state [st below] (lookup o path)] [0 (encode-lookup-reply (version o) st below)])
-        :key    (let [o @state] [0 (encode-key-reply (version o) (node o path))])
-        :changed (let [o @state] [0 (encode-changed-reply (version o) (changed-since? o path (:subtree req) (:since req)))])
-        :set-value    [0 (encode-version-reply (write! reg #(set-value % path (:name req) (:ty req) (:data req) (filetime-now))))]
-        :delete-value [0 (encode-version-reply (write! reg #(delete-value % path (:name req) (filetime-now))))]
-        :create-key   [0 (encode-version-reply (write! reg #(create-key % path (:volatile req) false (filetime-now))))]
-        :delete-key   [0 (encode-version-reply (write! reg #(delete-key % path (filetime-now))))]
+        :lookup       (let [o @state [st below] (lookup o path)]
+                        [p/ok (encode-lookup-reply (version o) st below)])
+        :key          (let [o @state]
+                        [p/ok (encode-key-reply (version o) (node o path))])
+        :changed      (let [o @state]
+                        [p/ok (encode-changed-reply (version o) (changed-since? o path (:subtree req) (:since req)))])
+        :set-value    (written reg #(set-value % path (:name req) (:ty req) (:data req) (filetime-now)))
+        :delete-value (written reg #(delete-value % path (:name req) (filetime-now)))
+        :create-key   (written reg #(create-key % path (:volatile req) false (filetime-now)))
+        :delete-key   (written reg #(delete-key % path (filetime-now)))
         :rename-key   (if (#{"." ".."} (:new-leaf req))
-                        [-3 nil]
-                        [0 (encode-version-reply (write! reg #(rename-key % path (:new-leaf req) (filetime-now))))]))
+                        [p/bad-request nil]
+                        (written reg #(rename-key % path (:new-leaf req) (filetime-now)))))
       (catch clojure.lang.ExceptionInfo e
-        [(get error-status (::error (ex-data e)) -3) nil]))))
+        [(get error-status (::error (ex-data e)) p/bad-request) nil]))))

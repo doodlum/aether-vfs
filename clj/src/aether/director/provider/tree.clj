@@ -12,8 +12,10 @@
   (:import (aether.director.provider Entry Stat)
            (java.lang.foreign Arena MemorySegment)
            (java.nio.channels FileChannel FileChannel$MapMode)
-           (java.nio.file Files LinkOption OpenOption Path StandardOpenOption)
-           (java.util HashMap)))
+           (java.nio.file FileVisitOption Files LinkOption OpenOption Path StandardOpenOption)
+           (java.util HashMap LinkedHashMap Map)))
+
+(set! *warn-on-reflection* true)
 
 (deftype File [^Stat stat ^MemorySegment data])
 (deftype Dir [^bytes listing entries])          ; the encoded READDIR reply, and its Entries
@@ -72,7 +74,8 @@
 
 (defn lookup
   "The File or Dir at folded `vpath`, or nil."
-  [^Tree t ^String vpath] (.get ^HashMap (.-nodes t) vpath))
+  [^Tree t ^String vpath]
+  (.get ^HashMap (.-nodes t) vpath))
 
 (defn build
   "An index of `files`, a seq of [path ^MemorySegment data] with paths as the
@@ -82,14 +85,14 @@
   [files]
   (let [children (HashMap.)                     ; folded dir -> {folded name -> Entry}, in order
         add!     (fn [^String dir ^String folded ^Entry e replace?]
-                   (let [^java.util.Map m (or (.get children dir)
-                                              (let [m (java.util.LinkedHashMap.)] (.put children dir m) m))]
+                   (let [^Map m (or (.get children dir)
+                                    (let [m (LinkedHashMap.)] (.put children dir m) m))]
                      (if-let [^Entry old (.get m folded)]
                        (when replace? (.put m folded (Entry. (.-name old) (.-stat e))))
                        (.put m folded e))))
         nodes    (HashMap.)
         spelled  (HashMap.)]
-    (.put children "" (java.util.LinkedHashMap.))
+    (.put children "" (LinkedHashMap.))
     (.put spelled "" "")
     (doseq [[p ^MemorySegment data] files
             :let [p  (path/normalize p)
@@ -105,7 +108,7 @@
         (when-not (= "" d)
           (add! (path/fold (path/parent d)) (path/fold (path/file-name d)) (Entry. (path/file-name d) prov/dir-stat) false)
           (recur (path/parent d)))))
-    (doseq [[dir ^java.util.Map m] children
+    (doseq [[dir ^Map m] children
             :let [entries (vec (vals m))]]
       (.put nodes dir (Dir. (prov/encode-listing entries) entries)))
     (Tree. nodes spelled)))
@@ -128,7 +131,7 @@
   Empty directories aren't served (only paths implied by files)."
   [^Arena arena dir]
   (let [root (.toAbsolutePath (.toPath (java.io.File. (str dir))))]
-    (with-open [paths (Files/walk root (make-array java.nio.file.FileVisitOption 0))]
+    (with-open [paths (Files/walk root (make-array FileVisitOption 0))]
       (vec (for [^Path p (iterator-seq (.iterator paths))
                  :when (Files/isRegularFile p (make-array LinkOption 0))]
              [(.replace (str (.relativize root p)) \\ \/) (map-file arena p)])))))

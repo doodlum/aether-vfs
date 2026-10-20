@@ -17,11 +17,12 @@
   buffered here), and `sync!` forces them before a commit points at them."
   (:require [clojure.java.io :as io])
   (:import (aether.director Codec)
-           (java.io File)
+           (java.io File IOException)
            (java.lang.foreign Arena MemorySegment ValueLayout)
            (java.nio ByteBuffer ByteOrder)
            (java.nio.channels FileChannel)
            (java.nio.file StandardOpenOption)
+           (java.util Arrays)
            (java.util.concurrent ConcurrentHashMap)
            (java.util.concurrent.locks ReentrantLock)))
 
@@ -37,16 +38,16 @@
 
 (defn pack-id
   "The id in a pack file's name, or nil for any other file."
-  [^String name]
-  (when-let [[_ n] (re-matches #"(\d{8})\.pack" name)] (parse-long n)))
+  [^String fname]
+  (when-let [[_ n] (re-matches #"(\d{8})\.pack" fname)] (parse-long n)))
 
 ;; --- records -----------------------------------------------------------------------
 
 (defn encode
-  "The record for raw block `data` (bytes) with BLAKE3-128 `hash`: the zstd
-  frame at `level` when it's smaller than the block, else the block itself.
-  Returns {:bytes record :raw-len :stored-len}."
-  [^bytes data ^bytes hash level]
+  "The record for raw block `data` (bytes) with BLAKE3-128 `block-hash`: the
+  zstd frame at `level` when it's smaller than the block, else the block
+  itself. Returns {:bytes record :raw-len :stored-len}."
+  [^bytes data ^bytes block-hash level]
   (let [frame  (Codec/compress (MemorySegment/ofArray data) (int level))
         comp?  (< (alength frame) (alength data))
         ^bytes payload (if comp? frame data)
@@ -57,7 +58,7 @@
     (.put bb (byte-array 3))
     (.putInt bb (alength data))
     (.putInt bb n)
-    (.put bb hash)
+    (.put bb block-hash)
     (.putLong bb (Codec/xxh3 (MemorySegment/ofArray payload)))
     (.put bb payload)
     {:bytes (.array bb) :raw-len (alength data) :stored-len n}))
@@ -80,19 +81,19 @@
   "Checks the record in `rec` (header and payload, exactly) against what the
   index expects (raw and stored lengths, hash) and writes the block into
   `dst` (exactly raw-len bytes). Returns nil, or why the record is bad."
-  [^MemorySegment rec raw-len stored-len ^bytes hash ^MemorySegment dst]
+  [^MemorySegment rec raw-len stored-len ^bytes block-hash ^MemorySegment dst]
   (if-let [{:keys [flags ^long checksum] :as h} (header rec 0)]
     (let [payload (.asSlice rec header-len)]
       (cond
-        (not= raw-len (:raw-len h))                 "raw length differs from the index"
-        (not= stored-len (:stored-len h))           "stored length differs from the index"
-        (not= stored-len (.byteSize payload))       "short record"
-        (not (java.util.Arrays/equals hash ^bytes (:hash h))) "hash differs from the index"
-        (not= checksum (Codec/xxh3 payload))        "checksum mismatch"
+        (not= raw-len (:raw-len h))                         "raw length differs from the index"
+        (not= stored-len (:stored-len h))                   "stored length differs from the index"
+        (not= stored-len (.byteSize payload))               "short record"
+        (not (Arrays/equals block-hash ^bytes (:hash h)))   "hash differs from the index"
+        (not= checksum (Codec/xxh3 payload))                "checksum mismatch"
         (pos? (bit-and (long flags) flag-compressed))
-        (try (if (= (long raw-len) (Codec/decompress dst payload)) nil "zstd frame decodes to the wrong length")
+        (try (when-not (= (long raw-len) (Codec/decompress dst payload)) "zstd frame decodes to the wrong length")
              (catch Exception e (str "zstd: " (.getMessage e))))
-        (not= raw-len stored-len)                   "raw record of the wrong length"
+        (not= raw-len stored-len)                           "raw record of the wrong length"
         :else (do (MemorySegment/copy payload 0 dst 0 (long raw-len)) nil)))
     "bad header"))
 
@@ -106,7 +107,8 @@
 (defn channel
   ^FileChannel [{:keys [dir ^ConcurrentHashMap channels]} id]
   (or (.get channels id)
-      (let [ch (FileChannel/open (.toPath (pack-file dir id)) (into-array StandardOpenOption [StandardOpenOption/READ]))]
+      (let [ch (FileChannel/open (.toPath (pack-file dir id))
+                                 (into-array StandardOpenOption [StandardOpenOption/READ]))]
         (if-let [other (.putIfAbsent channels id ch)]
           (do (.close ch) other)
           ch))))
@@ -181,7 +183,7 @@
       (let [{:keys [id ^FileChannel ch ^long pos]} @state]
         (try
           (loop [p pos] (when (.hasRemaining buf) (recur (+ p (.write ch buf p)))))
-          (catch java.io.IOException e
+          (catch IOException e
             (swap! state assoc :abandoned? true)
             (throw e)))
         (swap! state #(-> % (assoc :pos (+ pos total)) (update-in [:in-flight id] (fnil inc 0))))
@@ -205,7 +207,7 @@
     (let [{:keys [id ^FileChannel ch ^long pos ^long synced sealed]} @state]
       (when (> pos synced)
         (try (.force ch false)
-             (catch java.io.IOException e (swap! state assoc :abandoned? true) (throw e)))
+             (catch IOException e (swap! state assoc :abandoned? true) (throw e)))
         (swap! state assoc :synced pos))
       {:id id :end pos :sealed sealed})
     (finally (.unlock lock))))
@@ -224,11 +226,11 @@
 
 (defn scratch
   "A per-thread native buffer of at least `n` bytes, for reading records."
-  (^MemorySegment [^ThreadLocal tl n]
-   (let [n (long n)
-         ^MemorySegment s (.get tl)]
-     (if (and s (>= (.byteSize s) n))
-       (.asSlice s 0 n)
-       (let [s (.allocate (Arena/ofAuto) (max n 65536) 16)]
-         (.set tl s)
-         (.asSlice s 0 n))))))
+  ^MemorySegment [^ThreadLocal tl n]
+  (let [n (long n)
+        ^MemorySegment s (.get tl)]
+    (if (and s (>= (.byteSize s) n))
+      (.asSlice s 0 n)
+      (let [s (.allocate (Arena/ofAuto) (max n 65536) 16)]
+        (.set tl s)
+        (.asSlice s 0 n)))))

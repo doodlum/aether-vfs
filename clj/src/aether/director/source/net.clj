@@ -11,20 +11,23 @@
   Errors are ex-info with ::error (see `error`). No error message, label or
   event ever holds a URL's query: signed URLs and tokens live there (see
   `redact`)."
-  (:require [clojure.string :as str])
+  (:require [clojure.java.io :as io]
+            [clojure.string :as str])
   (:import (aether.director Codec$Xxh64)
            (java.io InputStream)
            (java.net URI)
            (java.net.http HttpClient HttpClient$Redirect HttpClient$Version HttpRequest
                           HttpRequest$BodyPublishers HttpResponse HttpResponse$BodyHandlers
                           HttpTimeoutException)
-           (java.nio.channels FileChannel)
            (java.nio ByteBuffer)
+           (java.nio.channels FileChannel)
+           (java.nio.file CopyOption Files StandardCopyOption)
            (java.time Duration)
-           (java.util Locale)
-           (java.util.concurrent ConcurrentHashMap Executors ExecutorService Future
-                                 ScheduledExecutorService Semaphore TimeUnit)
-           (java.util.concurrent.atomic AtomicLong)))
+           (java.util LinkedHashMap Locale Map$Entry)
+           (java.util.concurrent CompletableFuture ConcurrentHashMap ExecutionException Executors
+                                 ExecutorService Future ScheduledExecutorService Semaphore TimeUnit)
+           (java.util.concurrent.atomic AtomicLong)
+           (java.util.concurrent.locks Lock)))
 
 (set! *warn-on-reflection* true)
 
@@ -58,6 +61,11 @@
   (ex-info msg (assoc data ::error kind)))
 
 (defn kind [e] (::error (ex-data e)))
+
+(defn- unexpected [url what] (error :protocol (str "unexpected response from " (redact url) ": " what)))
+
+(defn- network-error [url detail]
+  (error :network (str "network error talking to " (redact url) ": " detail) {:url (redact url)}))
 
 (defn retryable?
   "Transient: network, 429, a corrupt part or frame checksum, and 5xx (but a
@@ -107,8 +115,7 @@
   a global one, so a busy host never holds global slots others could use."
   ^java.lang.AutoCloseable [^Limiter l ^String host]
   (let [^Semaphore hs (.computeIfAbsent ^ConcurrentHashMap (.-hosts l) (.toLowerCase (str host) Locale/ROOT)
-                                        (reify java.util.function.Function
-                                          (apply [_ _] (Semaphore. (int (.-per-host l)) true))))
+                                        (fn [_] (Semaphore. (int (.-per-host l)) true)))
         ^Semaphore g (.-global l)]
     (.acquire hs)
     (try (.acquire g) (catch Throwable t (.release hs) (throw t)))
@@ -180,24 +187,31 @@
   (try (URI. (str url))
        (catch Exception _ (throw (error :protocol (str "bad URL " (redact url)))))))
 
+(defn host "`url`'s host." ^String [url] (.getHost (uri url)))
+
+(defn- send-over
+  "Sends a request over `c` (see send!)."
+  ^HttpResponse [^HttpClient c h url {:keys [method headers body timeout-ms]}]
+  (let [b   (-> (HttpRequest/newBuilder (uri url))
+                (.timeout (Duration/ofMillis (long (or timeout-ms (:read-timeout-ms h)))))
+                (.header "User-Agent" (:user-agent h)))
+        _   (doseq [[k v] headers] (.header b (name k) (str v)))
+        req (.build (case (or method :get)
+                      :get  (.GET b)
+                      :post (.POST b (if body
+                                       (HttpRequest$BodyPublishers/ofByteArray body)
+                                       (HttpRequest$BodyPublishers/noBody)))))]
+    (try
+      (.send c req (HttpResponse$BodyHandlers/ofInputStream))
+      (catch HttpTimeoutException _ (throw (network-error url "timed out")))
+      (catch java.io.IOException e (throw (network-error url (.getMessage e)))))))
+
 (defn send!
   "Sends a request, returning the response with an InputStream body (headers
   received; the body not yet read). `headers` is a map; `:api?` uses the
   client that never follows redirects."
-  ^HttpResponse [h url {:keys [method headers api? body timeout-ms]}]
-  (let [u   (uri url)
-        b   (cond-> (HttpRequest/newBuilder u)
-              true (.timeout (Duration/ofMillis (long (or timeout-ms (:read-timeout-ms h)))))
-              true (.header "User-Agent" (:user-agent h)))
-        _   (doseq [[k v] headers] (.header b (name k) (str v)))
-        req (.build (case (or method :get)
-                      :get  (.GET b)
-                      :post (.POST b (if body (HttpRequest$BodyPublishers/ofByteArray body) (HttpRequest$BodyPublishers/noBody)))))
-        ^HttpClient c (if api? (:api-client h) (:client h))]
-    (try
-      (.send c req (HttpResponse$BodyHandlers/ofInputStream))
-      (catch HttpTimeoutException e (throw (error :network (str "network error talking to " (redact url) ": timed out") {:url (redact url)})))
-      (catch java.io.IOException e (throw (error :network (str "network error talking to " (redact url) ": " (.getMessage e)) {:url (redact url)}))))))
+  ^HttpResponse [h url {:keys [api?] :as opts}]
+  (send-over (if api? (:api-client h) (:client h)) h url opts))
 
 (defn header ^String [^HttpResponse resp ^String k]
   (.orElse (.firstValue (.headers resp) k) nil))
@@ -216,10 +230,9 @@
         buf (byte-array 65536)]
     (.put ^ConcurrentHashMap live in [at lim])
     (try
-      (loop [total (long 0)]
+      (loop [total 0]
         (let [n (long (try (.read in buf)
-                     (catch java.io.IOException e
-                       (throw (error :network (str "network error talking to " (redact url) ": " (.getMessage e)))))))]
+                           (catch java.io.IOException e (throw (network-error url (.getMessage e))))))]
           (if (neg? n)
             (do (when (and expect (not= total (long expect)))
                   (throw (error :corrupt-part (str (redact url) " is corrupt: body ended after " total " of " expect " bytes"))))
@@ -227,8 +240,7 @@
             (let [t (+ total n)]
               (.set at (System/nanoTime))
               (when (> t cap)
-                (throw (error :protocol (str "unexpected response from " (redact url) ": body longer than the "
-                                             (if expect "expected" "allowed") " " cap " bytes"))))
+                (throw (unexpected url (str "body longer than the " (if expect "expected" "allowed") " " cap " bytes"))))
               (when job (progress! job n))
               (.write out buf 0 n)
               (recur t)))))
@@ -258,9 +270,9 @@
             body (error-body resp)]
         (case st
           404 (throw (error :not-found (str "not found (HTTP 404): " (redact url)) {:what (redact url)}))
-          429 (throw (error :rate-limited (str "rate limited by " (.getHost (uri url)) " (HTTP 429)"
+          429 (throw (error :rate-limited (str "rate limited by " (host url) " (HTTP 429)"
                                                (when ra (str ", retry after " ra "s")))
-                            {:host (.getHost (uri url)) :retry-after-ms (some-> ra (* 1000))}))
+                            {:host (host url) :retry-after-ms (some-> ra (* 1000))}))
           (throw (error :status (str "HTTP " st " from " (redact url) ": " body)
                         {:url (redact url) :status st :body body})))))))
 
@@ -270,7 +282,26 @@
   (when-let [[_ a b t] (and s (re-matches #"(?i)bytes\s+(\d+)-(\d+)/(\d+)" (str/trim s)))]
     [(parse-long a) (parse-long b) (parse-long t)]))
 
-(defn- host ^String [url] (.getHost (uri url)))
+(defn- reject!
+  "Drops the response and throws `e`."
+  [resp e]
+  (close-body resp)
+  (throw e))
+
+(defn- check-range!
+  "Rejects a ranged response unless it is a 206 for exactly [a, b) of a file
+  of `total` bytes (when given)."
+  [^HttpResponse resp url a b total]
+  (let [st (.statusCode resp)
+        [s e t :as cr] (content-range (header resp "Content-Range"))]
+    (when (not= 206 st)
+      (reject! resp (unexpected url (str "HTTP " st " to a range request"))))
+    (when (and total cr (not= (long t) (long total)))
+      (reject! resp (error :archive-changed (str "archive changed on the server: now " t " bytes, was " total
+                                                 " (" (redact url) ")")
+                           {:now t :was total})))
+    (when-not (and cr (= (long a) (long s)) (= (dec (long b)) (long e)))
+      (reject! resp (unexpected url (str "Content-Range " (header resp "Content-Range")))))))
 
 ;; --- requests ----------------------------------------------------------------------------------
 
@@ -289,22 +320,12 @@
   file of `total` bytes when given (else :archive-changed)."
   ^bytes [h url a b total job & [opts]]
   (let [a (long a) b (long b)]
-  (if (>= a b)
-    (byte-array 0)
-    (with-open [_ (acquire! (:limiter h) (host url))]
-      (let [resp (check (send! h url (assoc-in opts [:headers "Range"] (str "bytes=" a "-" (dec b)))) url)
-            [s e t :as cr] (content-range (header resp "Content-Range"))]
-        (when (not= 206 (.statusCode resp))
-          (close-body resp)
-          (throw (error :protocol (str "unexpected response from " (redact url) ": HTTP " (.statusCode resp) " to a range request"))))
-        (when (and total cr (not= (long t) (long total)))
-          (close-body resp)
-          (throw (error :archive-changed (str "archive changed on the server: now " t " bytes, was " total " (" (redact url) ")")
-                        {:now t :was total})))
-        (when-not (and cr (= a (long s)) (= (dec b) (long e)))
-          (close-body resp)
-          (throw (error :protocol (str "unexpected response from " (redact url) ": Content-Range " (header resp "Content-Range")))))
-        (read-body h resp url {:expect (- b a) :job job}))))))
+    (if (>= a b)
+      (byte-array 0)
+      (with-open [_ (acquire! (:limiter h) (host url))]
+        (let [resp (check (send! h url (assoc-in opts [:headers "Range"] (str "bytes=" a "-" (dec b)))) url)]
+          (check-range! resp url a b total)
+          (read-body h resp url {:expect (- b a) :job job}))))))
 
 (defn get-suffix
   "One attempt at the last `n` bytes: [bytes total]."
@@ -315,14 +336,13 @@
       (if (= 206 (.statusCode resp))
         (let [[s e t] (content-range (header resp "Content-Range"))]
           (when-not (and t (= (inc (long e)) (long t)) (= (long s) (max 0 (- (long t) n))))
-            (close-body resp)
-            (throw (error :protocol (str "unexpected response from " (redact url) ": Content-Range " (header resp "Content-Range")))))
+            (reject! resp (unexpected url (str "Content-Range " (header resp "Content-Range")))))
           [(read-body h resp url {:expect (- (long t) (long s)) :job job}) t])
         (let [^bytes b (try (read-body h resp url {:max n :job job})
-                     (catch clojure.lang.ExceptionInfo e
-                       (if (= :protocol (kind e))
-                         (throw (error :protocol (str "unexpected response from " (redact url) ": file host ignored the Range header")))
-                         (throw e))))]
+                            (catch clojure.lang.ExceptionInfo e
+                              (throw (if (= :protocol (kind e))
+                                       (unexpected url "file host ignored the Range header")
+                                       e))))]
           [b (alength b)])))))
 
 (defn range-len
@@ -338,7 +358,7 @@
           (when (= 206 (.statusCode resp))
             (let [[s e t] (content-range (header resp "Content-Range"))]
               (when-not (and t (zero? (long s)) (zero? (long e)))
-                (throw (error :protocol (str "unexpected response from " (redact url) ": Content-Range " (header resp "Content-Range")))))
+                (throw (unexpected url (str "Content-Range " (header resp "Content-Range")))))
               t)))))))
 
 ;; --- sinks ------------------------------------------------------------------------------------
@@ -394,7 +414,7 @@
                                  xs))]
           (when-let [[x ^Future f] (.poll q)]
             (let [r (try (.get f)
-                         (catch java.util.concurrent.ExecutionException e
+                         (catch ExecutionException e
                            (doseq [[_ ^Future g] q] (.cancel g true))
                            (throw (.getCause e))))]
               (consume x r)
@@ -410,7 +430,7 @@
     (with-job [job h label expected-len]
       (let [len (with-retry h job #(range-len h url job))]
         (when (and len expected-len (not= (long len) (long expected-len)))
-          (throw (error :protocol (str "unexpected response from " (redact url) ": " len " bytes, expected " expected-len))))
+          (throw (unexpected url (str len " bytes, expected " expected-len))))
         (let [result
               (if len
                 (let [cs (long (:chunk-size h))
@@ -431,18 +451,16 @@
                             ^InputStream in (.body resp)
                             declared (some-> (header resp "Content-Length") parse-long)]
                         (when (not= 200 (.statusCode resp))
-                          (close-body resp)
-                          (throw (error :protocol (str "unexpected response from " (redact url) ": HTTP " (.statusCode resp)))))
+                          (reject! resp (unexpected url (str "HTTP " (.statusCode resp)))))
                         (when (and declared expected-len (not= (long declared) (long expected-len)))
-                          (close-body resp)
-                          (throw (error :protocol (str "unexpected response from " (redact url) ": " declared " bytes, expected " expected-len))))
+                          (reject! resp (unexpected url (str declared " bytes, expected " expected-len))))
                         (with-open [in in]
                           (let [buf (byte-array (* 1024 1024))]
                             (loop [off 0]
                               (let [n (.readNBytes in buf 0 (alength buf))]
                                 (if (pos? n)
                                   (do (when (and expected-len (> (+ off n) (long expected-len)))
-                                        (throw (error :protocol (str "unexpected response from " (redact url) ": longer than " expected-len " bytes"))))
+                                        (throw (unexpected url (str "longer than " expected-len " bytes"))))
                                       (progress! job n)
                                       (.update x buf 0 n)
                                       (write-at! sink off (java.util.Arrays/copyOf buf n))
@@ -455,6 +473,68 @@
                           {:expected expected-hash :actual (:hash result)})))
           result)))))
 
+;; --- what the sources share: locks, fetches, caches, files ---------------------------------------
+
+(defmacro with-lock
+  "Runs body holding `lock` (a java.util.concurrent.locks.Lock)."
+  [lock & body]
+  `(let [l# ~lock]
+     (.lock ^Lock l#)
+     (try ~@body (finally (.unlock ^Lock l#)))))
+
+(defn single-flight
+  "(f) for key `k`, run once however many callers miss together (`inflight`:
+  k -> CompletableFuture); every caller gets its value or its error.
+  `detached?` runs it on its own virtual thread, so the first caller being
+  cancelled doesn't fail the others."
+  [^ConcurrentHashMap inflight k detached? f]
+  (let [mine (CompletableFuture.)
+        ^CompletableFuture cf (or (.putIfAbsent inflight k mine) mine)]
+    (when (identical? cf mine)
+      (let [run (fn []
+                  (try (.complete mine (f))
+                       (catch Throwable t (.completeExceptionally mine t))
+                       (finally (.remove inflight k))))]
+        (if detached? (Thread/startVirtualThread ^Runnable run) (run))))
+    (try (.get cf) (catch ExecutionException e (throw (.getCause e))))))
+
+(defn lru-put!
+  "Puts byte array `v` under `k` in access-ordered `m` (unless there), then
+  drops the eldest entries while the bytes (counted in `used`) exceed
+  `max-bytes` or the entries `max-entries` (when given). Locks `m`."
+  [^LinkedHashMap m ^AtomicLong used k ^bytes v max-bytes & [max-entries]]
+  (let [max-bytes (long max-bytes) max-entries (long (or max-entries Long/MAX_VALUE))]
+    (locking m
+      (when-not (.containsKey m k)
+        (.put m k v)
+        (.addAndGet used (alength v))
+        (let [it (.iterator (.entrySet m))]
+          (while (and (.hasNext it) (or (> (.size m) max-entries) (> (.get used) max-bytes)))
+            (let [^Map$Entry victim (.next it)]
+              (.addAndGet used (- (alength ^bytes (.getValue victim))))
+              (.remove it))))))))
+
+(defn write-file!
+  "Writes `data` over file `f` by way of a temporary beside it
+  (f.<pid>.<nanos>.partial, deleted on failure), so readers see the old file
+  or the new one. `private?`: owner-only, synced, and renamed atomically."
+  [f ^bytes data & [{:keys [private?]}]]
+  (let [f   (io/file f)
+        dir (.getParentFile (.getAbsoluteFile f))
+        _   (.mkdirs dir)
+        tmp (io/file dir (str (.getName f) "." (.pid (ProcessHandle/current)) "." (System/nanoTime) ".partial"))]
+    (try
+      (with-open [o (java.io.FileOutputStream. tmp)]
+        (.write o data)
+        (when private? (.sync (.getFD o))))
+      (when private?
+        (.setReadable tmp false false) (.setReadable tmp true true)
+        (.setWritable tmp false false) (.setWritable tmp true true))
+      (Files/move (.toPath tmp) (.toPath f)
+                  (into-array CopyOption (cond-> [StandardCopyOption/REPLACE_EXISTING]
+                                           private? (conj StandardCopyOption/ATOMIC_MOVE))))
+      (catch Exception e (.delete tmp) (throw e)))))
+
 ;; --- bulk ----------------------------------------------------------------------------------------
 
 (defn bulk
@@ -464,8 +544,8 @@
   [h & [{:keys [conns] :or {conns 8}}]]
   {:h h :clients (vec (repeatedly (max 1 conns) #(client h HttpClient$Redirect/NORMAL))) :next (AtomicLong.)})
 
-(defn next-conn ^long [{:keys [clients ^AtomicLong next]}]
-  (mod (.getAndIncrement next) (count clients)))
+(defn next-conn ^long [{:keys [clients] ^AtomicLong n :next}]
+  (mod (.getAndIncrement n) (count clients)))
 
 (defn bulk-range
   "Bytes [a, b) of `url` (of `total` bytes) over connection `conn`, as a stream
@@ -474,23 +554,6 @@
   (when (or (>= (long a) (long b)) (and total (> (long b) (long total))))
     (throw (error :unsupported (str "bad range " a "-" b " of " total))))
   (let [a    (long a) b (long b)
-        u    (uri url)
-        req  (-> (HttpRequest/newBuilder u)
-                 (.timeout (Duration/ofMillis (long (:read-timeout-ms h))))
-                 (.header "User-Agent" (:user-agent h))
-                 (.header "Range" (str "bytes=" a "-" (dec b)))
-                 (.GET) (.build))
-        resp (try (.send ^HttpClient (nth clients conn) req (HttpResponse$BodyHandlers/ofInputStream))
-                  (catch java.io.IOException e (throw (error :network (str "network error talking to " (redact url) ": " (.getMessage e))))))
-        resp (check resp url)
-        [s e t :as cr] (content-range (header resp "Content-Range"))]
-    (when (not= 206 (.statusCode resp))
-      (close-body resp)
-      (throw (error :protocol (str "unexpected response from " (redact url) ": HTTP " (.statusCode resp)))))
-    (when (and total cr (not= (long t) (long total)))
-      (close-body resp)
-      (throw (error :archive-changed (str "archive changed on the server: now " t " bytes, was " total) {:now t :was total})))
-    (when-not (and cr (= a (long s)) (= (dec b) (long e)))
-      (close-body resp)
-      (throw (error :protocol (str "unexpected response from " (redact url) ": Content-Range"))))
+        resp (check (send-over (nth clients conn) h url {:headers {"Range" (str "bytes=" a "-" (dec b))}}) url)]
+    (check-range! resp url a b total)
     {:in (.body resp) :len (- b a)}))

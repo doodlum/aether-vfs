@@ -11,6 +11,7 @@
   (:import (aether.director Codec Codec$Xxh64)
            (java.lang.foreign MemorySegment)
            (java.net URI)
+           (java.nio.charset StandardCharsets)
            (java.util Locale)
            (java.util.zip GZIPInputStream)))
 
@@ -60,7 +61,7 @@
                          (when (> (alength b) max-definition) (throw (net/error :protocol "CDN definition too large")))
                          b))
                      body)
-        d (json/read-json (String. ^bytes json-bytes "UTF-8"))
+        d (json/read-json (String. ^bytes json-bytes StandardCharsets/UTF_8))
         size (long (get d "Size"))
         parts (mapv (fn [p] {:size (long (get p "Size")) :offset (long (get p "Offset"))
                              :hash (net/b64-xxh64 (get p "Hash")) :index (long (get p "Index"))})

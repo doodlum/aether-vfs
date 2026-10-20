@@ -14,9 +14,13 @@
             [clojure.java.io :as io]
             [clojure.string :as str])
   (:import (aether.director.provider Stat)
+           (java.io File)
            (java.lang.foreign MemorySegment ValueLayout)
            (java.nio.channels FileChannel)
-           (java.nio.file OpenOption StandardOpenOption)))
+           (java.nio.charset StandardCharsets)
+           (java.nio.file Files OpenOption StandardOpenOption)))
+
+(set! *warn-on-reflection* true)
 
 ;; --- PE import tables ---------------------------------------------------------
 
@@ -55,7 +59,7 @@
                      (let [end (loop [i off] (if (zero? (.get s ValueLayout/JAVA_BYTE i)) i (recur (inc i))))
                            b   (byte-array (- end off))]
                        (MemorySegment/copy s ValueLayout/JAVA_BYTE off b (int 0) (alength b))
-                       (String. b java.nio.charset.StandardCharsets/US_ASCII)))]
+                       (String. b StandardCharsets/US_ASCII)))]
       (when-let [d (and imp-rva (pos? imp-rva) (offset imp-rva))]
         (loop [d (long d) out []]
           (let [name-rva (u32 s (+ d 12))]
@@ -73,13 +77,13 @@
     "ucrtbase.dll" "sechost.dll" "rpcrt4.dll" "combase.dll" "shlwapi.dll" "version.dll" "imm32.dll" "dwmapi.dll"
     "uxtheme.dll" "bcrypt.dll" "bcryptprimitives.dll" "crypt32.dll" "wintrust.dll"})
 
-(defn system-dll? [^String name]
-  (let [n (str/lower-case name)]
+(defn system-dll? [^String dll]
+  (let [n (str/lower-case dll)]
     (or (str/starts-with? n "api-ms-") (str/starts-with? n "ext-ms-") (contains? system-dlls n))))
 
 ;; --- staging --------------------------------------------------------------------
 
-(defn- write! [^MemorySegment data ^java.io.File dest]
+(defn- write! [^MemorySegment data ^File dest]
   (io/make-parents dest)
   (with-open [ch (FileChannel/open (.toPath dest) (into-array OpenOption [StandardOpenOption/CREATE
                                                                           StandardOpenOption/TRUNCATE_EXISTING
@@ -89,8 +93,8 @@
 
 (defn- on-disk
   "A DLL from a fallback directory, matched case-insensitively."
-  [dirs ^String name]
-  (some (fn [d] (some #(when (.equalsIgnoreCase name (.getName ^java.io.File %)) %)
+  [dirs ^String dll]
+  (some (fn [d] (some #(when (.equalsIgnoreCase dll (.getName ^File %)) %)
                       (.listFiles (io/file d))))
         dirs))
 
@@ -121,32 +125,32 @@
         target  (io/file dir exe-dir)
         lookup  (fn [vp] (read-file t vp))]
     (loop [pending (vec (cons exe also)) seen #{} staged [] files []]
-      (if-let [[name & more] (seq pending)]
-        (let [base (path/file-name (path/normalize name))
-              key  (str/lower-case base)
-              data (or (lookup name)
+      (if-let [[image & more] (seq pending)]
+        (let [base (path/file-name (path/normalize image))
+              k    (str/lower-case base)
+              data (or (lookup image)
                        (lookup (if (= "" exe-dir) base (str exe-dir "/" base)))
                        (lookup base)
                        (when-let [f (on-disk fallback base)]
-                         (MemorySegment/ofArray (java.nio.file.Files/readAllBytes (.toPath ^java.io.File f)))))]
+                         (MemorySegment/ofArray (Files/readAllBytes (.toPath ^File f)))))]
           (cond
-            (contains? seen key) (recur (vec more) seen staged files)
-            (and (nil? data) (= name exe)) (throw (ex-info (str "the VFS has no " exe) {:exe exe}))
-            (or (nil? data) (not (pe? data))) (recur (vec more) (conj seen key) staged files)
+            (contains? seen k) (recur (vec more) seen staged files)
+            (and (nil? data) (= image exe)) (throw (ex-info (str "the VFS has no " exe) {:exe exe}))
+            (or (nil? data) (not (pe? data))) (recur (vec more) (conj seen k) staged files)
             :else
             (let [dest (io/file target base)]
               (write! data dest)
               (recur (into (vec more) (remove system-dll? (import-names data)))
-                     (conj seen key) (conj staged base) (conj files dest)))))
+                     (conj seen k) (conj staged base) (conj files dest)))))
         {:exe (.getCanonicalPath (io/file target (path/file-name (path/normalize exe))))
          :staged staged :files files}))))
 
 (defn cleanup!
   "Deletes what `stage` wrote, then any directories it leaves empty up to `dir`."
   [{:keys [files]} dir]
-  (doseq [^java.io.File f files] (io/delete-file f true))
+  (doseq [^File f files] (io/delete-file f true))
   (let [stop (.getCanonicalFile (io/file dir))]
-    (doseq [^java.io.File f files]
+    (doseq [^File f files]
       (loop [d (.getParentFile (.getCanonicalFile f))]
         (when (and d (not= d (.getParentFile stop)) (.isDirectory d) (empty? (.list d)))
           (.delete d)

@@ -14,14 +14,12 @@
   name is its last component as it was spelled. Store file ids: a layer
   file's is \"L\" + its GUID, a live file's \"F\" + its key, a cache file's
   \"C\" + a hash of its source."
-  (:require [aether.director.store :as store]
-            [aether.director.store.lmdb :as l])
-  (:import (aether.director Codec)
+  (:require [aether.director.store.lmdb :as l])
+  (:import (aether.director Codec Lmdb)
            (java.lang.foreign MemorySegment ValueLayout)
            (java.nio ByteBuffer ByteOrder)
            (java.nio.charset StandardCharsets)
-           (java.security SecureRandom)
-           (java.util Arrays)))
+           (java.security SecureRandom)))
 
 (set! *warn-on-reflection* true)
 
@@ -30,9 +28,14 @@
 (def ^:const kind-file 1)
 (def ^:const kind-dir 2)
 
-(defn- dbi ^long [store name] (l/dbi (:env store) name))
+(defn- dbi ^long [store db-name] (l/dbi (:env store) db-name))
 (defn- utf8 ^bytes [^String s] (.getBytes s StandardCharsets/UTF_8))
 (defn- le ^ByteBuffer [n] (.order (ByteBuffer/allocate n) ByteOrder/LITTLE_ENDIAN))
+
+(defn- utf8-str
+  "The UTF-8 string of segment `s` from byte `off` on."
+  ^String [^MemorySegment s off]
+  (String. ^bytes (.toArray (.asSlice s (long off)) ValueLayout/JAVA_BYTE) StandardCharsets/UTF_8))
 
 ;; --- ids ---------------------------------------------------------------------------
 
@@ -42,13 +45,13 @@
 
 (defn- prefixed ^bytes [^long tag ^bytes b]
   (let [out (byte-array (inc (alength b)))]
-    (aset-byte out 0 (unchecked-byte tag))
+    (aset out 0 (unchecked-byte tag))
     (System/arraycopy b 0 out 1 (alength b))
     out))
 
 (defn layer-file-id ^bytes [^bytes guid] (prefixed (int \L) guid))
-(defn live-file-id ^bytes [^bytes key] (prefixed (int \F) key))
-(defn cache-file-id ^bytes [^bytes key] (prefixed (int \C) key))
+(defn live-file-id ^bytes [^bytes k] (prefixed (int \F) k))
+(defn cache-file-id ^bytes [^bytes k] (prefixed (int \C) k))
 
 (defn cache-key
   "The 16-byte key of a cache file: a hash of where its content comes from."
@@ -65,8 +68,8 @@
   (let [p (utf8 folded) bb (ByteBuffer/allocate (+ 8 (alength p)))]
     (.putLong bb (long layer)) (.put bb p) (.array bb)))
 
-(defn- encode-entry ^bytes [{:keys [dir? ^bytes guid len mtime ^String name]}]
-  (let [n (utf8 name) bb (le (+ 34 (alength n)))]
+(defn- encode-entry ^bytes [{:keys [dir? ^bytes guid len mtime] nm :name}]
+  (let [n (utf8 nm) bb (le (+ 34 (alength n)))]
     (.put bb (byte 1))
     (.put bb (byte (if dir? kind-dir kind-file)))
     (.put bb (or guid (byte-array 16)))
@@ -82,7 +85,7 @@
      :guid  (when-not dir? (.toArray (.asSlice v 2 16) ValueLayout/JAVA_BYTE))
      :len   (l/le-u64 v 18)
      :mtime (l/le-u64 v 26)
-     :name  (String. ^bytes (.toArray (.asSlice v 34) ValueLayout/JAVA_BYTE) StandardCharsets/UTF_8)}))
+     :name  (utf8-str v 34)}))
 
 (defn get-entry
   "Layer `layer`'s entry at folded path `folded`, or nil."
@@ -104,30 +107,29 @@
         prefix (entry-key layer base)
         more?  (l/prefix? prefix)
         np     (alength prefix)]
-    (with-open [c (aether.director.Lmdb/cursor (long txn) (int (dbi store "entries")))]
+    (with-open [c (Lmdb/cursor (long txn) (int (dbi store "entries")))]
       (loop [ok (.seek c prefix) out []]
         (if (and ok (more? (.key c)))
-          (let [^MemorySegment k (.key c)
-                rest (String. ^bytes (.toArray (.asSlice k np) ValueLayout/JAVA_BYTE) StandardCharsets/UTF_8)
-                slash (.indexOf rest "/")]
+          (let [tail  (utf8-str (.key c) np)
+                slash (.indexOf tail "/")]
             (cond
-              (= "" rest) (recur (.next c) out)                      ; the directory itself
-              (neg? slash) (let [out (conj out [(str base rest) (decode-entry (.val c))])]  ; before the cursor moves
+              (= "" tail) (recur (.next c) out)                      ; the directory itself
+              (neg? slash) (let [out (conj out [(str base tail) (decode-entry (.val c))])]  ; before the cursor moves
                              (recur (.next c) out))
               ;; deeper: jump past the child's subtree ('0' sorts right after '/')
-              :else (recur (.seek c (entry-key layer (str base (subs rest 0 slash) "0"))) out)))
+              :else (recur (.seek c (entry-key layer (str base (subs tail 0 slash) "0"))) out)))
           out)))))
 
 (defn subtree
   "[[folded-path entry] …] of `dir` and everything under it."
   [store txn layer ^String dir]
-  (let [self (when-let [e (get-entry store txn layer dir)] [[dir e]])
+  (let [self   (when-let [e (get-entry store txn layer dir)] [[dir e]])
         prefix (entry-key layer (if (= "" dir) "" (str dir "/")))
-        np (alength (entry-key layer ""))]
+        np     (alength (entry-key layer ""))]
     (into (vec self)
           (l/reduce-range txn (dbi store "entries") prefix (l/prefix? prefix)
-                          (fn [acc ^MemorySegment k v]
-                            (let [p (String. ^bytes (.toArray (.asSlice k np) ValueLayout/JAVA_BYTE) StandardCharsets/UTF_8)]
+                          (fn [acc k v]
+                            (let [p (utf8-str k np)]
                               (if (= p dir) acc (conj acc [p (decode-entry v)]))))
                           []))))
 
@@ -137,58 +139,65 @@
   (when-let [v (l/get-seg txn (dbi store "smeta") (utf8 k))] (l/le-u64 v 0)))
 
 (defn layer-id
-  "The id of layer `name`, or nil."
-  [store txn ^String name]
-  (when-let [v (l/get-seg txn (dbi store "layers") (utf8 name))] (l/le-u64 v 0)))
+  "The id of layer `layer-name`, or nil."
+  [store txn ^String layer-name]
+  (when-let [v (l/get-seg txn (dbi store "layers") (utf8 layer-name))] (l/le-u64 v 0)))
 
 (defn create-layer!
-  "In a write txn: layer `name`'s id, creating it (with its root) if needed."
-  [store txn ^String name]
-  (or (layer-id store txn name)
+  "In a write txn: layer `layer-name`'s id, creating it (with its root) if needed."
+  [store txn ^String layer-name]
+  (or (layer-id store txn layer-name)
       (let [id (long (or (get-smeta store txn "next_layer_id") 1))]
         (l/put! txn (dbi store "smeta") (utf8 "next_layer_id") (.array (.putLong (le 8) (inc id))))
-        (l/put! txn (dbi store "layers") (utf8 name) (.array (.putLong (le 8) id)))
+        (l/put! txn (dbi store "layers") (utf8 layer-name) (.array (.putLong (le 8) id)))
         (put-entry! store txn id "" {:dir? true :name ""})
         id)))
 
 (defn layer-names [store txn]
   (l/reduce-range txn (dbi store "layers") nil (constantly true)
-                  (fn [acc ^MemorySegment k _] (conj acc (String. ^bytes (.toArray k ValueLayout/JAVA_BYTE) StandardCharsets/UTF_8)))
+                  (fn [acc k _] (conj acc (utf8-str k 0)))
                   []))
 
 (defn drop-layer!
-  "In a write txn: removes layer `name`'s row (its entries are the caller's)."
-  [store txn ^String name]
-  (l/del! txn (dbi store "layers") (utf8 name)))
+  "In a write txn: removes layer `layer-name`'s row (its entries are the caller's)."
+  [store txn ^String layer-name]
+  (l/del! txn (dbi store "layers") (utf8 layer-name)))
 
 ;; --- live files and cache files -------------------------------------------------------------
 
-(defn get-live [store txn ^bytes key]
-  (when-let [v (l/get-seg txn (dbi store "live") key)]
+(defn- le-pair
+  "Two u64s, little-endian."
+  ^bytes [a b]
+  (.array (doto (le 16) (.putLong (long a)) (.putLong (long b)))))
+
+(defn get-live [store txn ^bytes k]
+  (when-let [v (l/get-seg txn (dbi store "live") k)]
     {:len (l/le-u64 v 0) :mtime (l/le-u64 v 8)}))
 
-(defn put-live! [store txn ^bytes key {:keys [len mtime]}]
-  (l/put! txn (dbi store "live") key (.array (doto (le 16) (.putLong (long len)) (.putLong (long mtime))))))
+(defn put-live! [store txn ^bytes k {:keys [len mtime]}]
+  (l/put! txn (dbi store "live") k (le-pair len mtime)))
 
-(defn del-live! [store txn ^bytes key] (l/del! txn (dbi store "live") key))
+(defn del-live! [store txn ^bytes k] (l/del! txn (dbi store "live") k))
 
 (defn live-keys [store txn]
   (l/reduce-range txn (dbi store "live") nil (constantly true)
                   (fn [acc ^MemorySegment k _] (conj acc (.toArray k ValueLayout/JAVA_BYTE))) []))
 
-(defn get-cache-file [store txn ^bytes key]
-  (when-let [v (l/get-seg txn (dbi store "cache_files") key)]
-    {:access (l/le-u64 v 0) :bytes (l/le-u64 v 8)}))
+(defn- decode-cache-file [^MemorySegment v]
+  {:access (l/le-u64 v 0) :bytes (l/le-u64 v 8)})
 
-(defn put-cache-file! [store txn ^bytes key {:keys [access bytes]}]
-  (l/put! txn (dbi store "cache_files") key (.array (doto (le 16) (.putLong (long access)) (.putLong (long bytes))))))
+(defn get-cache-file [store txn ^bytes k]
+  (some-> (l/get-seg txn (dbi store "cache_files") k) decode-cache-file))
 
-(defn del-cache-file! [store txn ^bytes key] (l/del! txn (dbi store "cache_files") key))
+(defn put-cache-file! [store txn ^bytes k {:keys [access] n :bytes}]
+  (l/put! txn (dbi store "cache_files") k (le-pair access n)))
+
+(defn del-cache-file! [store txn ^bytes k] (l/del! txn (dbi store "cache_files") k))
 
 (defn cache-files
   "[[key {:access :bytes}] …], every cache file."
   [store txn]
   (l/reduce-range txn (dbi store "cache_files") nil (constantly true)
-                  (fn [acc ^MemorySegment k ^MemorySegment v]
-                    (conj acc [(.toArray k ValueLayout/JAVA_BYTE) {:access (l/le-u64 v 0) :bytes (l/le-u64 v 8)}]))
+                  (fn [acc ^MemorySegment k v]
+                    (conj acc [(.toArray k ValueLayout/JAVA_BYTE) (decode-cache-file v)]))
                   []))

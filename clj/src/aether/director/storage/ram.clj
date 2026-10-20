@@ -28,11 +28,11 @@
   (^boolean referenced [])
   (clear []))
 
-(deftype Slot [^bytes data ^:volatile-mutable ^boolean ref]
+(deftype Slot [^bytes data ^:volatile-mutable ^boolean ref-bit]
   ISlot
-  (touch [_] (set! ref (boolean true)) data)
-  (referenced [_] ref)
-  (clear [_] (set! ref (boolean false))))
+  (touch [_] (set! ref-bit (boolean true)) data)
+  (referenced [_] ref-bit)
+  (clear [_] (set! ref-bit (boolean false))))
 
 (deftype Shard [^ConcurrentHashMap slots ^ArrayDeque clock ^AtomicLong bytes ^long budget])
 
@@ -77,7 +77,7 @@
                 ^Slot s     (.get slots victim)]
             (cond
               (nil? s) nil
-              (and (.referenced ^Slot s) (not= victim k)) (do (.clear ^Slot s) (.addLast clock victim))
+              (and (.referenced s) (not= victim k)) (do (.clear s) (.addLast clock victim))
               (= victim k) (.addLast clock victim)
               :else (do (.remove slots victim) (.addAndGet used (- (alength ^bytes (.-data s))))))
             (recur (dec laps))))))))

@@ -145,12 +145,12 @@
                            (when (> e (alength b)) (throw (integrity "truncated manifest section")))
                            (recur e (assoc out magic [s e])))))))
         [ms me] (or (sections 0x1F4812BE) (throw (integrity "the manifest has no metadata section")))
-        meta (let [m (volatile! {})]
+        md (let [m (volatile! {})]
                (pb-fields b ms me (fn [f _ v] (case (long f) 1 (vswap! m assoc :depot v) 2 (vswap! m assoc :gid v)
                                                  4 (vswap! m assoc :encrypted (= 1 v)) nil)))
                @m)
-        _ (when (or (not= (long depot) (long (or (:depot meta) -1))) (not= (long gid) (long (or (:gid meta) -1))))
-            (throw (integrity (str "the manifest is for depot " (:depot meta) " / " (:gid meta) ", not " depot " / " gid))))
+        _ (when (or (not= (long depot) (long (or (:depot md) -1))) (not= (long gid) (long (or (:gid md) -1))))
+            (throw (integrity (str "the manifest is for depot " (:depot md) " / " (:gid md) ", not " depot " / " gid))))
         [ps pe] (or (sections 0x71F617D0) (throw (integrity "the manifest has no payload")))
         files (volatile! [])]
     (pb-fields b ps pe
@@ -178,7 +178,7 @@
                      (vswap! files conj @m)))))
     (let [files (for [{:keys [name size flags link] :as m} @files
                       :when (and (zero? (bit-and (long (or flags 0)) flag-directory)) (str/blank? link))]
-                  (let [path (if (:encrypted meta) (decrypt-name key name) name)
+                  (let [path (if (:encrypted md) (decrypt-name key name) name)
                         chunks (vec (sort-by :offset (:chunks m)))
                         size (long (or size 0))]
                     (doseq [{:keys [id len]} chunks]
