@@ -23,7 +23,10 @@ use reg::{
 };
 use vfs_registry::Lookup;
 use vfs_shim::{is_synthetic_key_handle, regclient, registry_handle_path};
-use windows_sys::Win32::System::Registry::{RegCloseKey, RegSetValueExW, HKEY};
+use windows_sys::Win32::System::Registry::{
+    RegCloseKey, RegOpenKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_WOW64_32KEY,
+    KEY_WOW64_64KEY,
+};
 
 static LOCK: Mutex<()> = Mutex::new(());
 
@@ -50,6 +53,7 @@ const DELETE: u32 = 0x1_0000;
 const OBJ_CASE_INSENSITIVE: u32 = reg::OBJ_CASE_INSENSITIVE;
 const KEY_VALUE_PARTIAL_INFORMATION: u32 = 2;
 const KEY_NAME_INFORMATION: u32 = 3;
+const KEY_SET_HANDLE_TAGS_INFORMATION: u32 = 5;
 const REG_SZ: u32 = 1;
 const REG_BINARY: u32 = 3;
 const REG_DWORD: u32 = 4;
@@ -268,6 +272,7 @@ fn fixture() -> (MutexGuard<'static, ()>, &'static Fixture) {
         real_key(r"Ren\Other", &[]);
         real_key("Denied", &[("v", 1)]);
         real_key("Info", &[("v", 1)]);
+        real_key("Tags", &[("v", 1)]);
         real_key("Dead", &[("v", 1)]);
         real_key("Pre", &[]);
         real_key("Names", &[("orig", 1)]);
@@ -666,6 +671,65 @@ fn flush_and_set_information_succeed_without_touching_the_real_key() {
     close(h);
     assert_eq!(f.real_info("Info"), before);
     assert!(!f.really_exists("InfoMade"));
+}
+
+/// `KeySetHandleTagsInformation` (class 5) tags the handle, not the key: Windows sets it on a
+/// read-only handle, and kernelbase does so after every `KEY_WOW64_32KEY`/`KEY_WOW64_64KEY`
+/// open, failing the `RegOpenKeyExW` when it is refused. Refusing it for want of
+/// `KEY_SET_VALUE` made Steam's client library unable to open
+/// `HKCU\Software\Valve\Steam\ActiveProcess`, so a game decided Steam was not running and
+/// handed itself to `steam://run`. No right is needed, nothing reaches the overlay, and the
+/// real key is untouched.
+#[test]
+fn handle_tags_need_no_write_right() {
+    isolate!();
+    let (_g, f) = fixture();
+    let before = f.real_info("Tags");
+    let (st, real_h) = f.open("Tags", NT_KEY_READ);
+    assert_eq!(st, STATUS_SUCCESS);
+    assert!(!is_synthetic_key_handle(real_h));
+    let tag = 0x600u32.to_le_bytes();
+    assert_eq!(
+        unsafe { NtSetInformationKey(real_h, KEY_SET_HANDLE_TAGS_INFORMATION, tag.as_ptr(), 4) },
+        STATUS_SUCCESS,
+        "a read-only real handle takes its tags"
+    );
+    // Through kernelbase, as a WOW64-flagged open of a key the overlay manages.
+    for view in [KEY_WOW64_32KEY, KEY_WOW64_64KEY] {
+        let mut hk: HKEY = core::ptr::null_mut();
+        let path = wide(&format!(r"{BASE}\Tags"));
+        let st = unsafe {
+            RegOpenKeyExW(
+                HKEY_CURRENT_USER,
+                path.as_ptr(),
+                0,
+                KEY_READ | view,
+                &mut hk,
+            )
+        };
+        assert_eq!(st, 0, "RegOpenKeyExW(KEY_READ | {view:#x})");
+        unsafe { RegCloseKey(hk) };
+    }
+    // A synthetic handle (the key overlaid first) takes them too.
+    regclient::set_value(&f.canon("Tags"), "o", REG_DWORD, &1u32.to_le_bytes()).unwrap();
+    let (st, synth) = f.open("Tags", NT_KEY_READ);
+    assert_eq!(st, STATUS_SUCCESS);
+    assert!(is_synthetic_key_handle(synth));
+    for h in [real_h, synth] {
+        assert_eq!(
+            unsafe { NtSetInformationKey(h, KEY_SET_HANDLE_TAGS_INFORMATION, tag.as_ptr(), 4) },
+            STATUS_SUCCESS
+        );
+        // The length is still checked.
+        assert_eq!(
+            unsafe { NtSetInformationKey(h, KEY_SET_HANDLE_TAGS_INFORMATION, tag.as_ptr(), 8) },
+            STATUS_INFO_LENGTH_MISMATCH
+        );
+    }
+    close(real_h);
+    close(synth);
+    assert_eq!(f.real_info("Tags"), before);
+    assert_eq!(f.real_value("Tags", "o"), "none");
 }
 
 #[test]

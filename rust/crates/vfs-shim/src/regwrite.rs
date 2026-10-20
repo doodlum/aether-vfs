@@ -538,6 +538,9 @@ unsafe fn copy_rename(real: &Real, t: &KeyRef, dest: &str) -> Result<(), NTSTATU
 
 // ---- NtSetInformationKey and NtFlushKey ----
 
+/// `KeySetHandleTagsInformation`, the `KEY_SET_INFORMATION_CLASS` that tags a handle.
+const KEY_SET_HANDLE_TAGS_INFORMATION: u32 = 5;
+
 /// `NtSetInformationKey` with the overlay on. The class and length are checked as Windows
 /// checks them, then `KEY_SET_VALUE`; the call then succeeds and changes nothing. No ring
 /// operation carries a key's last-write time or flags, so neither the real key nor the overlay
@@ -556,6 +559,23 @@ pub(crate) unsafe fn set_information_key(
         Ok(t) => t,
         Err(w) => return w,
     };
+    // KeySetHandleTagsInformation tags the handle, not the key: Windows needs no access right
+    // for it (kernelbase tags every KEY_WOW64_32KEY/64KEY open's read-only handle so), and
+    // nothing of it belongs in the overlay. A real handle gets the real call; a synthetic one
+    // has no kernel object to tag.
+    if class == KEY_SET_HANDLE_TAGS_INFORMATION {
+        if len != 4 {
+            return Write::Done(STATUS_INFO_LENGTH_MISMATCH);
+        }
+        if info.is_null() {
+            return Write::Done(STATUS_ACCESS_VIOLATION);
+        }
+        return if t.synthetic || t.real.is_none() {
+            Write::Done(STATUS_SUCCESS)
+        } else {
+            Write::Pass
+        };
+    }
     done((|| {
         let want = match class {
             // KeyWriteTimeInformation: a LARGE_INTEGER.
