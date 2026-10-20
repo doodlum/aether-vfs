@@ -279,6 +279,7 @@ pub fn install() -> Result<HookGuard, InstallError> {
     // Before the detours go live: creating the breadcrumb file is real I/O, and
     // once hooks are installed that I/O re-enters them.
     crate::breadcrumb::init();
+    crate::exception_log::install();
     crate::hookstats::start_reporter();
     claim_install()?;
     // SAFETY: ntdll lookup + detour install; each hook matches its ABI.

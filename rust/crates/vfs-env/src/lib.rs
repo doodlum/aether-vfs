@@ -325,6 +325,11 @@ pub const SHIM_PANIC_LOG: &str = "VFS_SHIM_PANIC_LOG";
 /// clock and no thread, unlike [`SHIM_STATS_LOG`], whose reporter thread has
 /// been measured to suppress the very race it would be used to find.
 pub const SHIM_BREADCRUMB: &str = "VFS_SHIM_BREADCRUMB";
+/// Path the shim appends a record to for every fatal-class exception raised in
+/// the process (code, faulting module and offset, thread, unwound stack), from a
+/// vectored handler that runs on every thread, including ones a debugger cannot
+/// see. Diagnostic; off unless set.
+pub const SHIM_EXCEPTION_LOG: &str = "VFS_SHIM_EXCEPTION_LOG";
 /// Label for the benchmark row emitted under [`BENCH`].
 pub const BENCH_LABEL: &str = "VFS_BENCH_LABEL";
 
@@ -751,6 +756,11 @@ pub const ALL: &[Var] = &[
         name: SHIM_BREADCRUMB,
         kind: Kind::Diagnostic,
         default: "off (no breadcrumb)",
+    },
+    Var {
+        name: SHIM_EXCEPTION_LOG,
+        kind: Kind::Diagnostic,
+        default: "off",
     },
     Var {
         name: BENCH_LABEL,

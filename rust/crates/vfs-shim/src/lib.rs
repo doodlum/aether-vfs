@@ -6,6 +6,7 @@
 
 #[macro_use]
 mod detour_table;
+mod exception_log;
 mod bootstrap;
 /// Lock-free record of the hook currently executing, in a shared file.
 pub mod breadcrumb;
