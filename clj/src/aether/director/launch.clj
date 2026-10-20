@@ -80,7 +80,7 @@
   target; `launch-image` (a staged EXE) makes that EXE's folder an alias of
   the root. Waits, and returns the exit code (the injector's own failures are
   3, explained in <ready>.injector-error); output goes to ours."
-  [session {:keys [natives exe args env launch-image]}]
+  [session {:keys [natives exe args env launch-image cwd]}]
   (let [native (fn [n] (let [f (io/file natives n)]
                          (when-not (.isFile f) (throw (ex-info (str n " not found in " natives) {:file f})))
                          (canonical f)))
@@ -99,7 +99,7 @@
       (.remove "VFS_RING_PATH")
       (.remove "VFS_REGISTRY")
       (.putAll ^java.util.Map (:env session))
-      (.put "VFS_INJECT_CWD" (:root session))
+      (.put "VFS_INJECT_CWD" (if cwd (str (io/file (:root session) (str cwd))) (:root session)))
       ;; Remote-thread injection, always: the shim is loaded into the
       ;; suspended process by full path. (The injector's alternative patches
       ;; the image's import table in memory, which a self-verifying SteamStub

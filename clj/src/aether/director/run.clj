@@ -60,6 +60,42 @@
                    :dir (tree/dir-files arena src)))
                layers)))
 
+(defn launch!
+  "Serves `root` (a provider: root 0) and `roots` ({id {:path p :provider
+  prov}}: more roots, each virtualized at the real path p) and runs the
+  program; returns its exit code once it has ended and the director has
+  stopped. Options:
+    :session dir (required)   :natives dir (rust/'s vfs-injector and shim)
+    :stage vpath  :fallback [dir]  :also [vpath]   the launch image, staged from root 0
+    :exe path :args [arg]     a real program instead (or the staged one's args)
+    :cwd vpath                the program's working directory in root 0 (default: its root)
+    :env {k v}  :registry dir  :trace bool
+    :log (fn [& xs])          progress lines"
+  [root roots {:keys [session stage fallback also registry trace log] :or {log (fn [& _])} :as opts}]
+  (let [stage-dir (io/file session "stage")
+        ;; STAGE_EXEC: a child EXE that only the VFS holds, staged on demand
+        on-demand (fn [vpath] (:exe (stage/stage root vpath {:dir stage-dir :fallback fallback})))
+        reg    (when registry (registry/registry (doto (io/file registry) (.mkdirs))))
+        server (ring/start root {:name (str "Local\\vfs_ring_clj_" (.pid (ProcessHandle/current)))
+                                 :stage-exec on-demand
+                                 :trace trace
+                                 :registry reg
+                                 :roots (into {} (for [[id {:keys [provider]}] roots] [id provider]))})
+        _      (log "serving; warm-up" (:warm-up server))
+        s      (launch/session server session {:roots (into {} (for [[id {:keys [path]}] roots] [id path]))})
+        staged (when stage
+                 (stage/stage root stage {:dir stage-dir :fallback fallback :also also}))
+        _      (when staged (log "staged" (:staged staged)))]
+    (try
+      (let [code (launch/launch s (assoc opts :exe (or (:exe staged) (:exe opts)) :launch-image (:exe staged)))]
+        (log "exit" code (ring/stats server))
+        (doseq [[k n] (ring/trace-top server 25)] (log "trace" n k))
+        code)
+      (finally
+        (when staged (stage/cleanup! staged stage-dir))
+        (ring/stop server)
+        (when reg (registry/close! reg))))))
+
 (defn -main [& args]
   (let [{:keys [session natives stage fallback also] :as opts} (parse args)
         t0     (System/nanoTime)
@@ -76,29 +112,10 @@
                                (some-> (get-in opts [:write id]) disk/disk))]
                    (if upper (compose/overlay upper lower) lower)))
         t      (root 0 (:content opts))
-        more   (into {} (for [[id _] (:roots opts)] [id (root id (get-in opts [:root-content id] []))]))
+        more   (into {} (for [[id path] (:roots opts)]
+                          [id {:path path :provider (root id (get-in opts [:root-content id] []))}]))
         _      (log "content indexed")
-        stage-dir (io/file session "stage")
-        ;; STAGE_EXEC: a child EXE that only the VFS holds, staged on demand
-        on-demand (fn [vpath] (:exe (stage/stage t vpath {:dir stage-dir :fallback fallback})))
-        reg    (when-let [d (:registry opts)] (registry/registry (doto (io/file d) (.mkdirs))))
-        server (ring/start t {:name (str "Local\\vfs_ring_clj_" (.pid (ProcessHandle/current)))
-                              :stage-exec on-demand
-                              :trace (:trace opts)
-                              :registry reg
-                              :roots more})
-        _      (log "serving; warm-up" (:warm-up server))
-        s      (launch/session server session {:roots (:roots opts)})
-        staged (when stage
-                 (stage/stage t stage {:dir stage-dir :fallback fallback :also also}))
-        _      (when staged (log "staged" (:staged staged)))
-        exe    (or (:exe staged) (:exe opts))
-        code   (launch/launch s (assoc opts :exe exe :launch-image (:exe staged)))]
-    (log "exit" code (ring/stats server))
-    (doseq [[k n] (ring/trace-top server 25)] (log "trace" n k))
-    (when staged (stage/cleanup! staged stage-dir))
-    (ring/stop server)
-    (when reg (registry/close! reg))
+        code   (launch! t more (assoc opts :log log))]
     (when stor (storage/close stor))
     (.close arena)
     (shutdown-agents)

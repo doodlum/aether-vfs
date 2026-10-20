@@ -1,4 +1,7 @@
+;; As a library (a :local/root or git dependency), the Java helpers under
+;; java/ are compiled by `clojure -X:deps prep` (the :build alias's javac).
 {:paths ["src" "resources" "target/classes"]
+ :deps/prep-lib {:alias :build :fn javac :ensure "target/classes"}
 
  :deps {org.clojure/clojure {:mvn/version "1.13.0-alpha9"}
         com.cnuernber/charred {:mvn/version "1.043"}

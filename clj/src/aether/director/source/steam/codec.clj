@@ -86,7 +86,7 @@
 (defn decrypt-name
   "A manifest's encrypted file name."
   ^String [^bytes key ^String b64]
-  (let [^bytes plain (try (decrypt key (.decode (Base64/getDecoder) (str/trim b64)))
+  (let [^bytes plain (try (decrypt key (.decode (Base64/getDecoder) (str/replace b64 #"\s" "")))
                    (catch Exception e (throw (integrity (str "file names: " (ex-message e))))))
         n (let [i (.indexOf (String. plain StandardCharsets/ISO_8859_1) (int 0))] (if (neg? i) (alength plain) i))]
     (String. plain 0 (int n) StandardCharsets/UTF_8)))

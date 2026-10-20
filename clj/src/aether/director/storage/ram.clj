@@ -20,7 +20,7 @@
          (= block (.-block ^Key o))
          (Arrays/equals id ^bytes (.-id ^Key o)))))
 
-(defn- key ^Key [^bytes id ^long block]
+(defn- slot-key ^Key [^bytes id ^long block]
   (Key. id block (unchecked-int (+ (* 31 (Arrays/hashCode id)) (Long/hashCode block)))))
 
 (definterface ISlot
@@ -51,7 +51,7 @@
 (defn get-block
   "The cached block, or nil."
   ^bytes [^Ram r ^bytes id ^long block]
-  (let [k (key id block)
+  (let [k (slot-key id block)
         s (.get ^ConcurrentHashMap (.-slots (shard r k)) k)]
     (if s
       (do (.incrementAndGet ^AtomicLong (.-hits r)) (.touch ^Slot s))
@@ -60,7 +60,7 @@
 (defn put-block!
   "Caches `data` (not to be changed afterwards) as block `block` of `id`."
   [^Ram r ^bytes id ^long block ^bytes data]
-  (let [k  (key id block)
+  (let [k  (slot-key id block)
         sh (shard r k)
         ^ConcurrentHashMap slots (.-slots sh)
         ^ArrayDeque clock (.-clock sh)

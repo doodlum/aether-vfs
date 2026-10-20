@@ -23,7 +23,7 @@
 //! code can still say why.
 use std::time::Duration;
 use vfs_inject::{
-    check_helper_command, clear_active_process_pid, parse_injector_args, run_target_with_shim,
+    check_helper_command, clear_active_process_pid, parse_injector_args, spawn_target_with_shim,
     running_under_wine, start_steam_helper, InjectError, RunConfig, ACTIVE_PROCESS_KEY,
 };
 
@@ -65,7 +65,7 @@ fn main() {
     }
 
     eprintln!("[vfs-injector] target={target} shim={dll} cwd={current_dir:?}");
-    let exit = run_target_with_shim(RunConfig {
+    let exit = spawn_target_with_shim(RunConfig {
         target_exe: target,
         args,
         current_dir,
@@ -82,6 +82,15 @@ fn main() {
         // import patch edits the image's headers, which a SteamStub wrapper
         // that verifies itself (SkyrimSE.exe) refuses to run under.
         force_injection: vfs_env::opt_in(vfs_env::FORCE_INJECTION),
+    })
+    // The whole tree, not just the first process: a launcher that starts the
+    // game and exits (skse64_loader.exe) has not ended the launch, and the
+    // host stops serving the VFS once this returns.
+    .and_then(|mut tree| {
+        if let Some(why) = tree.untracked_reason() {
+            eprintln!("[vfs-injector] {why}");
+        }
+        tree.wait()
     })
     .unwrap_or_else(|e| {
         eprintln!("[vfs-injector] inject error: {e:?}");

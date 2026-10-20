@@ -133,7 +133,7 @@
   [{:keys [rpc-timeout-ms] :as s} app depot gid]
   (call s (fn [^SteamClient c _]
             (try (long (or (await! (deferred (.getManifestRequestCode ^SteamContent (.getHandler c SteamContent)
-                                                                      (int app) (int depot) (long gid) nil nil scope))
+                                                                      (int depot) (int app) (long gid) "public" nil scope))
                                    rpc-timeout-ms "manifest request code")
                            0))
                  (catch clojure.lang.ExceptionInfo e

@@ -143,7 +143,7 @@
 (defn fetch!
   "GETs `path` from the pool's hosts and returns (decode body), failing over
   on errors, bad bodies and timeouts; `token-fn` (host -> token or nil)
-  answers a host's first 403. Errors never hold a URL."
+  answers a host's first 401/403. Errors never hold a URL."
   [h {:keys [cfg] :as pool} path max-body decode what token-fn ^ConcurrentHashMap tokens]
   (loop [attempt 1 last-error nil refreshed #{}]
     (if (> attempt (long (:max-attempts cfg)))
@@ -162,12 +162,12 @@
                                          v (decode body)]
                                      (success! pool srv (- (System/nanoTime) t0))
                                      {:ok v})
-                        (= 403 st) (do (net/close-body resp)
-                                       (if (and token-fn (not (contains? refreshed host)))
-                                         (if-let [t (token-fn host)]
-                                           (do (.put tokens host t) {:retry-host host})
-                                           (do (failure! pool srv nil) {:error (str host ": HTTP 403")}))
-                                         (do (failure! pool srv nil) {:error (str host ": HTTP 403")})))
+                        (#{401 403} st) (do (net/close-body resp)
+                                            (if (and token-fn (not (contains? refreshed host)))
+                                              (if-let [t (token-fn host)]
+                                                (do (.put tokens host t) {:retry-host host})
+                                                (do (failure! pool srv nil) {:error (str host ": HTTP " st)}))
+                                              (do (failure! pool srv nil) {:error (str host ": HTTP " st)})))
                         :else (let [ra (some-> (net/header resp "Retry-After") str/trim parse-long (* 1000))]
                                 (net/close-body resp)
                                 (failure! pool srv ra)
@@ -196,7 +196,7 @@
 (defn fetch-manifest
   "Manifest `gid` of the reader's depot, parsed (and its raw CDN body)."
   [{:keys [h pool depot key token-fn tokens]} gid request-code]
-  (let [path (str "/depot/" depot "/manifest/" gid "/5" (when (pos? (long request-code)) (str "/" request-code)))
+  (let [path (str "/depot/" depot "/manifest/" (Long/toUnsignedString (long gid)) "/5" (when-not (zero? (long request-code)) (str "/" (Long/toUnsignedString (long request-code)))))
         body (fetch! h pool path max-manifest-body identity (str "steam " depot " manifest " gid) token-fn tokens)]
     [(codec/parse-manifest body depot gid key) body]))
 
@@ -251,10 +251,11 @@
 
 (defn content
   "Steam content in `cache-dir`, logged in as the login saved in
-  `login-file` (or anonymous when there's none). Options: :cdn (pool
-  settings), :session (cm settings), :session-fn (tests)."
-  [h cache-dir login-file & [{:keys [cdn session session-fn]}]]
-  (let [login (some-> login-file load-login)]
+  `login-file` (or anonymous when there's none). Options: :login (a login
+  map, instead of the file), :cdn (pool settings), :session (cm settings),
+  :session-fn (tests)."
+  [h cache-dir login-file & [{:keys [cdn session session-fn] :as opts}]]
+  (let [login (or (:login opts) (some-> login-file load-login))]
     (when-let [exp (some-> login :refresh-token token-expires-at)]
       (when (<= (long exp) (quot (now) 1000))
         (throw (net/error :login-expired (str "the Steam login for " (:account login) " has expired; log in to Steam again")))))
@@ -312,7 +313,7 @@
 (defn manifest
   "Manifest `gid` of `depot`: the cached body, else fetched (with a request code)."
   [{:keys [dir session ^ConcurrentHashMap keys] :as c} app depot gid]
-  (let [f (io/file dir "manifests" (str depot "_" gid ".bin"))
+  (let [f (io/file dir "manifests" (str depot "_" (Long/toUnsignedString (long gid)) ".bin"))
         key (depot-key c app depot)]
     (or (when (.exists f)
           (try (codec/parse-manifest (java.nio.file.Files/readAllBytes (.toPath f)) depot gid key)
