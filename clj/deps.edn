@@ -1,6 +1,9 @@
 {:paths ["src" "resources" "target/classes"]
 
- :deps {org.clojure/clojure {:mvn/version "1.13.0-alpha9"}}
+ :deps {org.clojure/clojure {:mvn/version "1.13.0-alpha9"}
+        com.cnuernber/charred {:mvn/version "1.043"}
+        in.dragonbra/javasteam {:mvn/version "1.8.0"}
+        org.tukaani/xz {:mvn/version "1.12"}}
 
  :aliases
  {;; compile java/ (the ring's atomics and kernel32 downcalls) into target/classes

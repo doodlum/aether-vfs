@@ -202,6 +202,29 @@ its write layer. `rust/`'s `vfs-fixture-writepath` passes with one
 (including the copy-up of a read-only file), and Skyrim SE runs with all
 three of its roots' writes in layers (below).
 
+## Content sources
+
+`aether.director.source.*` ports aether-vfs's add-on crates (except 7z):
+where game and mod content comes from, each a read-only provider meant to
+sit behind `storage/cached`.
+
+| Namespace | |
+|---|---|
+| `source.net` | The HTTP base (aether-net): a client that follows redirects and one that never does (anything with credentials), a limiter (64 overall, 16 per host), retries (500 ms doubling to 30 s, Retry-After honoured), events, ranged reads, whole-file downloads in parallel 8 MiB ranges hashed as they arrive, bulk connections. Virtual threads, no async layer. |
+| `source.archive` | Byte sources, seekable zstd (seek tables in primitive arrays, frames decoded by the native zstd straight into the reader's buffer), zip central directories (ZIP64, CP437 names, Nexus `0x4E58` seek tables). |
+| `source.wj-cdn` | The Wabbajack CDN: a gzipped definition and xxHash64-checked parts in parallel (a downloader, not a provider). |
+| `source.nexus` | Nexus Mods: the v3 API, signed repacked-zip links (minted once per file, renewed before expiry or on refusal, kept in a link file), quota tracking, and random access: opening an archive is one request, a read fetches only its frames (runs of up to 32 MiB, in parallel), decoded frames kept in an LRU. |
+| `source.gog` | GOG Galaxy v2 (via NexusMods.App's port, GPL-3.0): OAuth (paste the redirect URL), builds, manifests (cached), secure links (secrets scrubbed from errors), chunks checked by MD5 before and after inflating, an LRU, one fetch per chunk however many readers. |
+| `source.steam`, `.steam.cm`, `.steam.codec` | Steam depots: the client protocol through JavaSteam 1.8 (logons, depot keys, request codes, CDN servers and tokens, PICS); our own manifest and chunk codecs (AES envelope, VSZa/VZa/zip, Steam's Adler-32, SHA-1); a CDN pool ranked by time to first byte, failing over; chunks decoded once, LRU'd, copied straight into the reader's buffer. Keys, manifests and server lists cached on disk. |
+| `source.tree` | The read-only tree the sources share: lazy, case-insensitive, first file wins. |
+| `source.login` | `clojure -M -m aether.director.source.login gog …` / `steam …`: logging in at a terminal. |
+
+Performance over the Rust versions: decoded-frame and chunk caches where
+upstream decodes every read afresh, in-flight sharing for Steam chunks
+(upstream fetches twice), decodes straight into the destination segment.
+The tests run offline against fake hosts (`test/aether/director/source/`):
+84 tests across the whole director.
+
 ## Launching a game
 
 `aether.director.run` serves layered content (Stored zips and folders, later

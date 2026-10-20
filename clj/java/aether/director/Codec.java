@@ -40,6 +40,18 @@ public final class Codec {
         FunctionDescriptor.of(JAVA_LONG, JAVA_LONG), Linker.Option.critical(false));
     private static final MethodHandle XXH3 = NativeLib.fn("XXH3_64bits",
         FunctionDescriptor.of(JAVA_LONG, ADDRESS, JAVA_LONG), HEAP);
+    private static final MethodHandle XXH64 = NativeLib.fn("XXH64",
+        FunctionDescriptor.of(JAVA_LONG, ADDRESS, JAVA_LONG, JAVA_LONG), HEAP);
+    private static final MethodHandle XXH64_CREATE = NativeLib.fn("XXH64_createState",
+        FunctionDescriptor.of(JAVA_LONG));
+    private static final MethodHandle XXH64_FREE = NativeLib.fn("XXH64_freeState",
+        FunctionDescriptor.of(JAVA_INT, JAVA_LONG));
+    private static final MethodHandle XXH64_RESET = NativeLib.fn("XXH64_reset",
+        FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_LONG), Linker.Option.critical(false));
+    private static final MethodHandle XXH64_UPDATE = NativeLib.fn("XXH64_update",
+        FunctionDescriptor.of(JAVA_INT, JAVA_LONG, ADDRESS, JAVA_LONG), HEAP);
+    private static final MethodHandle XXH64_DIGEST = NativeLib.fn("XXH64_digest",
+        FunctionDescriptor.of(JAVA_LONG, JAVA_LONG), Linker.Option.critical(false));
     private static final MethodHandle BLAKE3 = NativeLib.fn("aether_blake3",
         FunctionDescriptor.ofVoid(ADDRESS, JAVA_LONG, ADDRESS, JAVA_LONG), HEAP);
     private static final MethodHandle BLAKE3_EACH = NativeLib.fn("aether_blake3_128_each",
@@ -126,6 +138,39 @@ public final class Codec {
     /** xxh3-64 of `src`. */
     public static long xxh3(MemorySegment src) {
         try { return (long) XXH3.invokeExact(src, src.byteSize()); } catch (Throwable t) { throw Lmdb.rethrow(t); }
+    }
+
+    /** xxHash64 of `src` with `seed` (Wabbajack's and the downloaders' file hash uses seed 0). */
+    public static long xxh64(MemorySegment src, long seed) {
+        try { return (long) XXH64.invokeExact(src, src.byteSize(), seed); } catch (Throwable t) { throw Lmdb.rethrow(t); }
+    }
+
+    /** A streaming xxHash64: feed it in order, then {@link Xxh64#digest}; {@link Xxh64#close} frees it. */
+    public static final class Xxh64 implements AutoCloseable {
+        private long state;
+        public Xxh64(long seed) {
+            try {
+                state = (long) XXH64_CREATE.invokeExact();
+                if (state == 0) throw new OutOfMemoryError("xxh64 state");
+                int rc = (int) XXH64_RESET.invokeExact(state, seed);
+            } catch (Throwable t) { throw Lmdb.rethrow(t); }
+        }
+        public Xxh64 update(MemorySegment src) {
+            try { int rc = (int) XXH64_UPDATE.invokeExact(state, src, src.byteSize()); } catch (Throwable t) { throw Lmdb.rethrow(t); }
+            return this;
+        }
+        public Xxh64 update(byte[] src, int off, int len) {
+            return update(MemorySegment.ofArray(src).asSlice(off, len));
+        }
+        public long digest() {
+            try { return (long) XXH64_DIGEST.invokeExact(state); } catch (Throwable t) { throw Lmdb.rethrow(t); }
+        }
+        @Override public void close() {
+            if (state != 0) {
+                try { int rc = (int) XXH64_FREE.invokeExact(state); } catch (Throwable t) { throw Lmdb.rethrow(t); }
+                state = 0;
+            }
+        }
     }
 
     /** The first `n` bytes of BLAKE3(src). */
