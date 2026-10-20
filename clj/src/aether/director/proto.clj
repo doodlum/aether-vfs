@@ -1,20 +1,23 @@
 (ns aether.director.proto
   "The ring's wire contract, as the shim speaks it (rust/crates/vfs-ipc and
-  vfs-protocol). Everything is little-endian. Offsets are from the start of
+  vfs-protocol; golden vectors in vfs-protocol/tests/golden/vectors.txt).
+  Wire version 4. Everything is little-endian. Offsets are from the start of
   the shared mapping; nothing in shared memory is a pointer.")
 
 ;; --- ring header (vfs-ipc/src/layout.rs) -----------------------------------
 
 (def ^:const magic 0x56464950)          ; "VFIP"
-(def ^:const version 2)                 ; the shim refuses any other
-(def ^:const ring-header-size 40)
+(def ^:const version 4)                 ; the shim refuses any other
+(def ^:const ring-header-size 48)
 (def ^:const rh-magic 0)
 (def ^:const rh-version 4)
 (def ^:const rh-slot-count 8)
 (def ^:const rh-slot-stride 12)
 (def ^:const rh-payload-cap 16)
+(def ^:const rh-worker-hint 20)         ; u32; how many workers serve: the client sizes its data concurrency by it
 (def ^:const rh-req-seq 24)             ; u64; written by clients, never read here
 (def ^:const rh-submit-seq 32)          ; u32; likewise
+(def ^:const rh-reg-gen 40)             ; u64; registry generation, 0 = no registry served
 
 ;; --- slot header -----------------------------------------------------------
 
@@ -24,15 +27,19 @@
 (def ^:const sh-flags 8)
 (def ^:const sh-payload-len 12)
 (def ^:const sh-status 16)
+(def ^:const sh-ack 20)                 ; u32: the low 32 bits of the req_id a reply answers
 (def ^:const sh-req-id 24)
 
 ;; slot states: FREE -> CLAIMED (client) -> SUBMITTED (client) -> PROCESSING
-;; (server, CAS) -> COMPLETED (server, release) -> FREE (client)
+;; (server, CAS) -> COMPLETED (server, CAS) -> FREE (client). A client that
+;; gives up on a slot the server is processing marks it ABANDONED; the server
+;; then drops its reply and frees the slot.
 (def ^:const st-free 0)
 (def ^:const st-claimed 1)
 (def ^:const st-submitted 2)
 (def ^:const st-processing 3)
 (def ^:const st-completed 4)
+(def ^:const st-abandoned 5)
 
 ;; --- geometry, as vfs-director's IpcServe lays it out ----------------------
 
@@ -70,12 +77,18 @@
 (def ^:const op-mkdir 10)
 (def ^:const op-close 11)
 (def ^:const op-heartbeat 13)
+(def ^:const op-stored-names 14)        ; root u32, skip u32 | path -> stored spellings from component `skip`
+(def ^:const op-reg-first 15)           ; 15-22: registry ops, only sent when VFS_REGISTRY=1
+(def ^:const op-reg-last 22)
+(def ^:const op-rename-x 23)            ; rename across roots
+(def ^:const op-stage-exec 24)          ; root u32 | path -> a real path to start a VFS-only EXE from
 
 (def ^:const flag-read-bulk 1)
 (def ^:const read-resp-bulk-bit 0x80000000)
 (def ^:const bulk-threshold 65536)      ; reads this big go to the arena regardless of the flag
 
 (def ^:const open-write 2)
+(def ^:const open-flag-immutable 1)     ; OPEN reply byte 17: content never changes (enables the shim's read cache)
 
 ;; --- status codes (vfs-provider/src/status.rs) ------------------------------
 
@@ -86,5 +99,6 @@
 (def ^:const io-error -4)
 (def ^:const is-dir -5)
 (def ^:const bad-fh -6)
+(def ^:const not-supported -8)
 (def ^:const read-only -9)
 (def ^:const overflow Integer/MIN_VALUE)  ; a reply too big for the slot

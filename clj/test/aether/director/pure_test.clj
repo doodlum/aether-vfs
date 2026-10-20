@@ -12,7 +12,8 @@
 
 (deftest geometry-matches-the-rust-director
   ;; vfs-director's IpcServe: 32 slots of 1 MiB, a 32 MiB arena, rounded to 64 KiB
-  (is (= {:slots 32 :cap 1048576 :stride 1048608 :ring-bytes 33555496 :arena-offset 33555496
+  ;; ring version 4: a 48-byte header
+  (is (= {:slots 32 :cap 1048576 :stride 1048608 :ring-bytes 33555504 :arena-offset 33555504
           :arena-len 33554432 :bank-size 1048576 :map-bytes 67174400}
          (p/geometry))))
 

@@ -37,7 +37,8 @@
                tree                                 ; aether.director.tree.Tree
                ^ConcurrentHashMap handles ^AtomicLong next-fh
                ^long srv-event ^long cli-event ^long spin-ns
-               ^AtomicBoolean stop ^AtomicLong served])
+               ^AtomicBoolean stop ^AtomicLong served
+               stage-exec])                         ; (fn [vpath] real-path-or-nil), or nil
 
 ;; A handler gets the slot's payload offset and request length, writes its
 ;; reply at the payload offset, and returns (status << 32) | reply-length.
@@ -104,7 +105,14 @@
           (.put ^ConcurrentHashMap (.-handles r) fh node)
           (put-i64 seg off fh)
           (put-i64 seg (+ off 8) (if (instance? File node) (.-size ^File node) 0))
-          (put-i64 seg (+ off 16) (if (instance? Dir node) 1 0))   ; is_dir:u8 + 7 pad
+          ;; is_dir u8, flags u8, pad[2], mount_gen u32. A tree never changes
+          ;; while served, so content is immutable and its generation is 1:
+          ;; that lets the shim cache small reads.
+          (put-u8 seg (+ off 16) (if (instance? Dir node) 1 0))
+          (put-u8 seg (+ off 17) p/open-flag-immutable)
+          (put-u8 seg (+ off 18) 0)
+          (put-u8 seg (+ off 19) 0)
+          (put-i32 seg (+ off 20) 1)
           (reply p/ok 24))))))
 
 (defn- op-read
@@ -148,6 +156,49 @@
       (reply p/ok 0)
       (reply p/bad-fh 0))))
 
+(defn- utf8-at
+  "The UTF-8 string of `n` bytes at `off`."
+  ^String [^MemorySegment seg ^long off ^long n]
+  (let [b (byte-array n)]
+    (MemorySegment/copy seg ValueLayout/JAVA_BYTE off b (int 0) (int n))
+    (String. b StandardCharsets/UTF_8)))
+
+(defn- reply-utf8
+  "Writes `s` as the reply at `off` (raw UTF-8, no length prefix)."
+  ^long [^Ring r ^long off ^String s]
+  (let [b (.getBytes s StandardCharsets/UTF_8)]
+    (if (> (alength b) (.-cap r))
+      (reply p/overflow 0)
+      (do (MemorySegment/copy b (int 0) ^MemorySegment (.-seg r) ValueLayout/JAVA_BYTE off (alength b))
+          (reply p/ok (alength b))))))
+
+(defn- op-stored-names
+  "root u32, skip u32 | path -> the content's spelling of the path's components
+  from `skip` on, joined by `/` (for GetFinalPathNameByHandle)."
+  ^long [^Ring r ^long off ^long len]
+  (let [^MemorySegment seg (.-seg r)]
+    (if (or (< len 8) (not (zero? (u32 seg off))))
+      (reply p/not-found 0)
+      (let [skip    (u32 seg (+ off 4))
+            vp      (some-> (path/normalize (utf8-at seg (+ off 8) (- len 8))) path/fold)
+            spelled (when vp (tree/spelling (.-tree r) vp))]
+        (if (nil? spelled)
+          (reply p/not-found 0)
+          (let [parts (if (= "" spelled) [] (vec (.split spelled "/")))]
+            (reply-utf8 r off (String/join "/" ^Iterable (drop skip parts)))))))))
+
+(defn- op-stage-exec
+  "root u32 | path -> a real path the shim can start a VFS-only EXE from."
+  ^long [^Ring r ^long off ^long len]
+  (let [f  (.-stage-exec r)
+        vp (path-req r off len)]
+    (cond
+      (nil? f)  (reply p/not-supported 0)
+      (nil? vp) (reply p/not-found 0)
+      :else     (if-let [real (f vp)]
+                  (reply-utf8 r off real)
+                  (reply p/not-found 0)))))
+
 (defn- dispatch ^long [r ^long slot]
   (let [^Ring r r]
   (let [^MemorySegment seg (.-seg r)
@@ -164,54 +215,75 @@
         3  (op-open r off len)
         5  (op-read r off len (bit-or (bit-shift-left (u32 seg (+ base p/sh-flags)) 32) slot))
         11 (op-close r off len)
-        (6 7 8 9 10) (reply p/read-only 0)                        ; writes: this tree is read-only
+        14 (op-stored-names r off len)
+        24 (op-stage-exec r off len)
+        (6 7 8 9 10 23) (reply p/read-only 0)                     ; writes: this tree is read-only
+        (15 16 17 18 19 20 21 22) (reply p/not-supported 0)       ; registry: not served
         (reply p/bad-request 0))))))
 
-(defn- serve-slot [^Ring r ^long slot]
+(defn- serve-slot
+  "Serves the request in `slot` (taken: PROCESSING) and completes it. The
+  reply carries `ack`, the low half of the request's id, which the client
+  checks. A client that gave up meanwhile has marked the slot ABANDONED: its
+  reply is dropped and the slot freed."
+  [^Ring r ^long slot]
   (let [^MemorySegment seg (.-seg r)
         base   (+ p/ring-header-size (* slot (.-stride r)))
+        state  (+ base p/sh-state)
+        req-id (u64 seg (+ base p/sh-req-id))
         result (Guard/call dispatch r slot (reply p/io-error 0))]
     (put-i32 seg (+ base p/sh-status) (bit-shift-right result 32))
     (put-i32 seg (+ base p/sh-payload-len) (bit-and result 0xFFFFFFFF))
-    (Native/setRelease seg (+ base p/sh-state) p/st-completed)
-    (Native/setEvent (.-cli-event r))))
+    (put-i32 seg (+ base p/sh-ack) req-id)
+    (if (Native/cas seg state p/st-processing p/st-completed)
+      (Native/setEvent (.-cli-event r))
+      (Native/cas seg state p/st-abandoned p/st-free))))
 
 (defn- serve-pass
-  "Serve every slot that is SUBMITTED now. Returns how many were served."
-  ^long [^Ring r]
+  "Serve every slot that is SUBMITTED now, scanning from `start` (workers
+  rotate it, so no slot is always last). Returns how many were served."
+  ^long [^Ring r ^long start]
   (let [^MemorySegment seg (.-seg r) stride (.-stride r)]
-    (loop [slot 0 served 0]
-      (if (= slot p/slot-count)
+    (loop [i 0 served 0]
+      (if (= i p/slot-count)
         served
-        (let [st (+ p/ring-header-size (* slot stride))]
+        (let [slot (rem (+ start i) p/slot-count)
+              st   (+ p/ring-header-size (* slot stride))]
           (if (and (= p/st-submitted (Native/getAcquire seg st))
                    (Native/cas seg st p/st-submitted p/st-processing))
-            (do (serve-slot r slot) (recur (inc slot) (inc served)))
-            (recur (inc slot) served)))))))
+            (do (serve-slot r slot) (recur (inc i) (inc served)))
+            (recur (inc i) served)))))))
 
 (defn- worker [^Ring r]
   (let [stop (.-stop r) spin-ns (.-spin-ns r)]
-    (loop [last-served (long 0)]
+    (loop [last-served (long 0) start (long 0)]
       (when-not (.get ^AtomicBoolean stop)
-        (let [n (serve-pass r)]
+        (let [n    (serve-pass r start)
+              next (rem (inc start) p/slot-count)]
           (if (pos? n)
             (do (.addAndGet ^AtomicLong (.-served r) n)
-                (recur (System/nanoTime)))
+                (recur (System/nanoTime) next))
             (do (if (< (- (System/nanoTime) last-served) spin-ns)
                   (dotimes [_ 64] (Thread/onSpinWait))
                   (Native/waitFor (.-srv-event r) 1))
-                (recur last-served))))))))
+                (recur last-served next))))))))
 
 ;; --- lifecycle -----------------------------------------------------------------
 
-(defn- init-header! [^MemorySegment seg {:keys [slots cap stride]}]
+(defn- init-header!
+  "Writes the ring header (version 4) and frees every slot. `workers` is
+  published as worker_hint: a client sizes how many data requests it keeps in
+  flight by it."
+  [^MemorySegment seg {:keys [slots cap stride]} workers]
   (put-i32 seg p/rh-magic p/magic)
   (put-i32 seg p/rh-version p/version)
   (put-i32 seg p/rh-slot-count slots)
   (put-i32 seg p/rh-slot-stride stride)
   (put-i32 seg p/rh-payload-cap cap)
+  (put-i32 seg p/rh-worker-hint workers)
   (put-i64 seg p/rh-req-seq 0)
   (put-i32 seg p/rh-submit-seq 0)
+  (put-i64 seg p/rh-reg-gen 0)
   (dotimes [s slots]
     (put-i32 seg (+ p/ring-header-size (* (long s) (long stride))) p/st-free)))
 
@@ -247,7 +319,7 @@
     (.toByteArray out)))
 
 (defn warm-up!
-  "Runs `rounds` rounds of synthetic requests (8 per round; 3 when the tree
+  "Runs `rounds` rounds of synthetic requests (9 per round; 3 when the tree
   has no files) through the server's code on a private ring over `tree`.
   Returns {:requests :ms}; throws if a reply is wrong."
   [tree {:keys [rounds] :or {rounds 3000}}]
@@ -255,10 +327,10 @@
     (let [g      (p/geometry)
           seg    (.allocate arena (long (:map-bytes g)) 64)
           stride (long (:stride g))
-          _      (init-header! seg g)
+          _      (init-header! seg g 1)
           r      (Ring. seg stride (:cap g) (:arena-offset g) (:bank-size g)
                         tree (ConcurrentHashMap.) (AtomicLong.)
-                        0 0 0 (AtomicBoolean.) (AtomicLong.))
+                        0 0 0 (AtomicBoolean.) (AtomicLong.) nil)
           {:keys [files dirs]} (tree/sample tree 64)
           slot   (long-array 1)
           n      (long-array 1)
@@ -268,7 +340,7 @@
                      (aset slot 0 (inc (aget slot 0)))
                      (aset n 0 (inc (aget n 0)))
                      (request! seg stride s op flags payload)
-                     (when-not (= 1 (serve-pass r))
+                     (when-not (= 1 (serve-pass r 0))
                        (throw (ex-info "warm-up: request not served" {:op op})))
                      (let [status (.get seg ValueLayout/JAVA_INT_UNALIGNED (+ base p/sh-status))
                            fh     (.get seg ValueLayout/JAVA_LONG_UNALIGNED (+ base p/slot-header-size))]
@@ -286,6 +358,7 @@
           (ok! (call p/op-readdir 0 (le-bytes :u32 0 :utf8 d)) "readdir")
           (when-let [^String f (when (seq files) (nth files (rem i (count files))))]
             (ok! (call p/op-getattr 0 (le-bytes :u32 0 :utf8 f)) "getattr")
+            (ok! (call p/op-stored-names 0 (le-bytes :u32 0 :u32 0 :utf8 f)) "stored names")
             (let [fh (ok! (call p/op-open 1 (le-bytes :u32 0 :u32 1 :utf8 f)) "open")]
             (ok! (call p/op-read 0 (le-bytes :u64 fh :u64 0 :u32 4096 :u32 0)) "read")
             (ok! (call p/op-read p/flag-read-bulk (le-bytes :u64 fh :u64 0 :u32 4096 :u32 0)) "bulk read")
@@ -298,19 +371,20 @@
   shim needs :name and :map-bytes (VFS_RING_SECTION / VFS_RING_BYTES).
 
   First runs `warm-up` rounds of synthetic requests (see warm-up!; 0 skips
-  it), so the handlers are compiled before the first real request."
-  [tree {:keys [name workers spin-us warm-up] :or {workers 16 spin-us 400 warm-up 3000}}]
+  it), so the handlers are compiled before the first real request.
+  `stage-exec` answers STAGE_EXEC: (fn [vpath] real-path-or-nil)."
+  [tree {:keys [name workers spin-us warm-up stage-exec] :or {workers 16 spin-us 400 warm-up 3000}}]
   (let [warmed  (when (pos? (long warm-up)) (warm-up! tree {:rounds warm-up}))
         g       (p/geometry)
         section (Native/createSection name (:map-bytes g))
         seg     (.view section)
-        _       (init-header! seg g)
+        _       (init-header! seg g workers)
         srv     (Native/createEvent (str name "_srv"))
         cli     (Native/createEvent (str name "_cli"))
         ring    (Ring. seg (:stride g) (:cap g) (:arena-offset g) (:bank-size g)
                        tree (ConcurrentHashMap.) (AtomicLong.)
                        srv cli (* 1000 (long spin-us))
-                       (AtomicBoolean.) (AtomicLong.))
+                       (AtomicBoolean.) (AtomicLong.) stage-exec)
         threads (vec (for [i (range workers)]
                        (doto (Thread. ^Runnable #(worker ring) (str "ring-worker-" i))
                          (.setDaemon true)

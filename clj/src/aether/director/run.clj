@@ -3,7 +3,6 @@
 
     clojure -M:run --session <dir> --natives <dir>
                    [--zip <file>]... [--layer <dir>]...     ; content, later wins
-                   [--overlay <dir>]                       ; where the shim's writes go
                    [--stage <vpath> [--fallback <dir>]... [--also <vpath>]...]
                    [--env K=V]...
                    [<exe> [args...]]
@@ -28,7 +27,6 @@
       "--natives" (recur more (assoc opts :natives b))
       "--zip"     (recur more (update opts :content conj [:zip b]))
       "--layer"   (recur more (update opts :content conj [:dir b]))
-      "--overlay" (recur more (assoc opts :overlay b))
       "--stage"   (recur more (assoc opts :stage b))
       "--fallback" (recur more (update opts :fallback conj b))
       "--also"    (recur more (update opts :also conj b))
@@ -52,16 +50,20 @@
         arena  (Arena/ofShared)
         t      (tree/build (content arena (:content opts)))
         _      (log "content indexed")
-        server (ring/start t {:name (str "Local\\vfs_ring_clj_" (.pid (ProcessHandle/current)))})
+        stage-dir (io/file session "stage")
+        ;; STAGE_EXEC: a child EXE that only the VFS holds, staged on demand
+        on-demand (fn [vpath] (:exe (stage/stage t vpath {:dir stage-dir :fallback fallback})))
+        server (ring/start t {:name (str "Local\\vfs_ring_clj_" (.pid (ProcessHandle/current)))
+                              :stage-exec on-demand})
         _      (log "serving; warm-up" (:warm-up server))
-        s      (launch/session server session (select-keys opts [:overlay]))
+        s      (launch/session server session)
         staged (when stage
-                 (stage/stage t stage {:dir (io/file session "stage") :fallback fallback :also also}))
+                 (stage/stage t stage {:dir stage-dir :fallback fallback :also also}))
         _      (when staged (log "staged" (:staged staged)))
         exe    (or (:exe staged) (:exe opts))
-        code   (launch/launch s (assoc opts :exe exe))]
+        code   (launch/launch s (assoc opts :exe exe :launch-image (:exe staged)))]
     (log "exit" code (ring/stats server))
-    (when staged (stage/cleanup! staged (io/file session "stage")))
+    (when staged (stage/cleanup! staged stage-dir))
     (ring/stop server)
     (.close arena)
     (shutdown-agents)

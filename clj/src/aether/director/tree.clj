@@ -17,9 +17,15 @@
 (deftype File [^long size ^MemorySegment data])
 (deftype Dir [^bytes listing])              ; the encoded READDIR reply
 
-(deftype Tree [^HashMap nodes])             ; folded vpath -> File | Dir; the root is ""
+(deftype Tree [^HashMap nodes                ; folded vpath -> File | Dir; the root is ""
+               ^HashMap spellings])         ; folded vpath -> the path as the content spells it
 
 (defn lookup [^Tree t ^String vpath] (.get ^HashMap (.-nodes t) vpath))
+
+(defn spelling
+  "`vpath` (folded) as the content spells it, or nil."
+  ^String [^Tree t ^String vpath]
+  (.get ^HashMap (.-spellings t) vpath))
 
 (defn- encode-listing
   "count:u32, then per entry name_len:u32 name is_dir:u8 size:u64 mtime:i64."
@@ -50,11 +56,17 @@
                    (let [^java.util.Map m (or (.get children dir)
                                               (let [m (java.util.LinkedHashMap.)] (.put children dir m) m))]
                      (.putIfAbsent m (path/fold (:name entry)) entry)))
-        nodes    (HashMap.)]
+        nodes    (HashMap.)
+        spelled  (HashMap.)]
     (.put children "" (java.util.LinkedHashMap.))
+    (.put spelled "" "")
     (doseq [[p ^MemorySegment data] files
             :let [p (path/normalize p)]]
       (.put nodes (path/fold p) (File. (.byteSize data) data))
+      (loop [q p]                               ; first spelling of each path wins, like listings
+        (when-not (= "" q)
+          (.putIfAbsent spelled (path/fold q) q)
+          (recur (path/parent q))))
       (add! (path/fold (path/parent p)) {:name (path/file-name p) :size (.byteSize data)})
       (loop [d (path/parent p)]
         (when-not (= "" d)
@@ -62,7 +74,7 @@
           (recur (path/parent d)))))
     (doseq [[dir ^java.util.Map m] children]
       (.put nodes dir (Dir. (encode-listing (vals m)))))
-    (Tree. nodes)))
+    (Tree. nodes spelled)))
 
 (defn sample
   "Up to `n` file and `n` directory vpaths (folded), for warm-up requests."
