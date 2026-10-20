@@ -62,14 +62,15 @@
               out
               (recur (+ d 20) (if-let [o (offset name-rva)] (conj out (c-string o)) out)))))))))
 
-;; vfs-inject's is_system_import_dll: resolved from System32, never staged
+;; vfs-pe's is_system_import_dll: resolved from System32, never staged. The
+;; DirectX June 2010 runtime (xinput1_3, x3daudio1_7, d3dx9_*) is not part of
+;; Windows, so it is staged like any other import.
 (def ^:private system-dlls
   #{"kernel32.dll" "kernelbase.dll" "ntdll.dll" "user32.dll" "gdi32.dll" "gdi32full.dll" "advapi32.dll"
     "shell32.dll" "ole32.dll" "oleaut32.dll" "ws2_32.dll" "winhttp.dll" "winmm.dll" "setupapi.dll" "hid.dll"
-    "d3d11.dll" "dxgi.dll" "dinput8.dll" "xinput1_3.dll" "xinput1_4.dll" "x3daudio1_7.dll" "msvcp140.dll"
-    "vcruntime140.dll" "vcruntime140_1.dll" "ucrtbase.dll" "version.dll" "shlwapi.dll" "crypt32.dll"
-    "bcrypt.dll" "secur32.dll" "iphlpapi.dll" "dbghelp.dll" "psapi.dll" "comctl32.dll" "comdlg32.dll"
-    "imm32.dll" "uxtheme.dll" "dwmapi.dll" "powrprof.dll" "wintrust.dll" "userenv.dll" "rpcrt4.dll"})
+    "d3d11.dll" "dxgi.dll" "dinput8.dll" "xinput1_4.dll" "msvcp140.dll" "vcruntime140.dll" "vcruntime140_1.dll"
+    "ucrtbase.dll" "sechost.dll" "rpcrt4.dll" "combase.dll" "shlwapi.dll" "version.dll" "imm32.dll" "dwmapi.dll"
+    "uxtheme.dll" "bcrypt.dll" "bcryptprimitives.dll" "crypt32.dll" "wintrust.dll"})
 
 (defn system-dll? [^String name]
   (let [n (str/lower-case name)]

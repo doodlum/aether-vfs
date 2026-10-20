@@ -95,6 +95,10 @@
       (.remove "VFS_REGISTRY")
       (.putAll ^java.util.Map (:env session))
       (.put "VFS_INJECT_CWD" (:root session))
+      ;; The shim is activated by patching the target's imports in memory, by
+      ;; DLL name: the loader must find vfs_shim_dll.dll, and a staged EXE's
+      ;; folder doesn't hold it.
+      (.put "PATH" (str (canonical natives) java.io.File/pathSeparator (System/getenv "PATH")))
       (cond-> launch-image (.put "VFS_LAUNCH_IMAGE" (str launch-image)))
       (.putAll ^java.util.Map (or env {})))
     (.waitFor (.start pb))))
