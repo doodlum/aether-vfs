@@ -393,6 +393,11 @@ pub const FIXTURE_ORPHAN_OF: &str = "VFS_FIXTURE_ORPHAN_OF";
 /// `vfs-fixture-read`: write what the process believes about itself (its
 /// environment, cwd, module path and argv[0]) to this file first.
 pub const FIXTURE_PROBE_OUT: &str = "VFS_FIXTURE_PROBE_OUT";
+/// `vfs-fixture-read`: with [`FIXTURE_DLL_LOCATION`], a DLL named by its path under a root's
+/// backing directory, which the probe loads (see the fixture's `probe.rs`).
+pub const FIXTURE_DLL_BACKING: &str = "VFS_FIXTURE_DLL_BACKING";
+/// `vfs-fixture-read`: the same DLL named by its path under the root's location.
+pub const FIXTURE_DLL_LOCATION: &str = "VFS_FIXTURE_DLL_LOCATION";
 /// `vfs-fixture-read`: a script of filesystem operations to run first (see the
 /// fixture's `ops.rs`).
 pub const FIXTURE_OPS: &str = "VFS_FIXTURE_OPS";
@@ -856,6 +861,16 @@ pub const ALL: &[Var] = &[
         name: FIXTURE_PROBE_OUT,
         kind: Kind::Fixture,
         default: "unset: no probe",
+    },
+    Var {
+        name: FIXTURE_DLL_BACKING,
+        kind: Kind::Fixture,
+        default: "unset: no DLL loaded",
+    },
+    Var {
+        name: FIXTURE_DLL_LOCATION,
+        kind: Kind::Fixture,
+        default: "unset: no DLL loaded",
     },
     Var {
         name: FIXTURE_OPS,

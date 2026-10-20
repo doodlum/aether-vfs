@@ -1,23 +1,23 @@
-//! Load diagnostics: hooks that change nothing and only record what the loader
-//! and the native process-creation path do, to the shim load log
-//! (`crate::loadlog`). They exist to answer one question that user-mode tools
-//! outside the process cannot: when a "DLL not found" hard-error dialog appears,
-//! is it *this* (shimmed) process raising it — a late or dynamic load that
-//! resolves against the virtual game directory and misses — or another, un-shimmed
-//! process entirely?
+//! Load hooks: what the loader and the native process-creation path do, recorded
+//! to the shim load log (`crate::loadlog`). They exist to answer one question
+//! that user-mode tools outside the process cannot: when a "DLL not found"
+//! hard-error dialog appears, is it *this* (shimmed) process raising it — a late
+//! or dynamic load that resolves against the virtual game directory and misses —
+//! or another, un-shimmed process entirely?
 //!
 //!  - [`raise_hard_error_hook_body`] logs every `NtRaiseHardError`, with the
 //!    failing DLL name for `STATUS_DLL_NOT_FOUND`. If it fires in the primary,
 //!    the dialog is the primary's own.
 //!  - [`ldr_load_dll_hook_body`] logs every *failed* `LdrLoadDll`: the DLL name,
-//!    the search path and the status.
+//!    the search path and the status. It is also the one hook here that changes
+//!    a call: a DLL named by its path under a root's backing directory is loaded
+//!    by its path under the root's location (see the function).
 //!  - [`create_user_process_hook_body`] logs the image of every process created
 //!    through `NtCreateUserProcess`, the syscall `CreateProcessInternalW` funnels
 //!    into — catching any create that never reached `cpiw_hook_body`.
 //!
-//! All three call their trampoline unchanged; none alters behaviour. See
-//! `cpiw_hook_body` for the fail-closed containment on the `CreateProcessInternalW`
-//! path.
+//! The other two call their trampoline unchanged. See `cpiw_hook_body` for the
+//! fail-closed containment on the `CreateProcessInternalW` path.
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use super::{TRAMP_LDR_LOAD_DLL, TRAMP_NT_CREATE_USER_PROCESS, TRAMP_RAISE_HARD_ERROR};
@@ -104,11 +104,41 @@ pub(super) unsafe fn ldr_load_dll_hook_body(
     dll_name: *const UnicodeString,
     base: *mut *mut c_void,
 ) -> NTSTATUS {
+    // A DLL named by its path under a root's backing directory is loaded by its path under the
+    // root's location instead: the loader keys loaded modules by full path, so the same file
+    // under both spellings would be mapped twice (a plugin preloader that builds paths from its
+    // own module name, loaded from the backing directory before the shim renamed it, loads what
+    // SKSE later loads by the location).
+    // SAFETY: the caller's `UNICODE_STRING`, per the NT contract.
+    let asked = unsafe { us_string(dll_name) }.ok().flatten();
+    let respelled: Option<Vec<u16>> = asked
+        .as_deref()
+        .and_then(crate::whereami::virtual_spelling)
+        .map(|v| v.encode_utf16().collect());
+    let respelled_us = respelled.as_ref().and_then(|w| {
+        let bytes = u16::try_from(w.len() * 2).ok()?;
+        Some(UnicodeString {
+            length: bytes,
+            maximum_length: bytes,
+            buffer: w.as_ptr() as *mut u16,
+        })
+    });
+    let name_arg: *const UnicodeString = match &respelled_us {
+        Some(us) => us,
+        None => dll_name,
+    };
     let status = match TRAMP_LDR_LOAD_DLL.get() {
-        // SAFETY: the original NT function with the caller's arguments.
-        Some(tramp) => unsafe { tramp(search_path, characteristics, dll_name, base) },
+        // SAFETY: the original NT function with the caller's arguments (the name respelled, its
+        // buffer alive until the call returns).
+        Some(tramp) => unsafe { tramp(search_path, characteristics, name_arg, base) },
         None => return STATUS_UNSUCCESSFUL,
     };
+    if let (Some(a), Some(_)) = (&asked, &respelled_us) {
+        crate::loadlog::note(&format!(
+            "LdrLoadDll respelled \"{a}\" by its location, status={:#010x}",
+            status as u32
+        ));
+    }
     // NT error (high bit set): a failed load. Successes are the common case and
     // are not logged, so the hook stays cheap.
     if status < 0 {

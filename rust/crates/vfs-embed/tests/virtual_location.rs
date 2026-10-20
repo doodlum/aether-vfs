@@ -512,3 +512,131 @@ fn a_steamstub_marked_child_is_import_patched_in_memory_not_refused() {
         "a .bind section must no longer force remote injection:\n{log}"
     );
 }
+
+/// A DLL loaded by its path under root 0's **backing directory** is the same module as the
+/// one loaded by its path under the **location**. The loader keys loaded modules by full path,
+/// and a static import mapped from the backing directory (an SKSE plugin preloader) builds
+/// paths from its own module name: without the shim respelling such a load by the location,
+/// the preloader and SKSE each got a copy of `EngineFixes.dll`, and SKSE called the copy whose
+/// trampoline the preloader had never set up ("Failed to handle allocation request").
+#[cfg(windows)]
+#[test]
+fn a_dll_loaded_through_the_backing_directory_is_the_one_loaded_at_the_location() {
+    ensure_inject_artifacts();
+    let _launches = lock_launches();
+
+    let content = vfs_testkit::scratch_dir("vloc-dll-content");
+    std::fs::copy(
+        locate_artifact("vfs-fixture-read.exe"),
+        content.join("game.exe"),
+    )
+    .unwrap();
+    std::fs::copy(locate_artifact("vproxy.dll"), content.join("plugin.dll")).unwrap();
+    let out_dir = vfs_testkit::scratch_dir("vloc-dll-out");
+    let world = vfs_testkit::scratch_dir("vloc-dll-world");
+    let ancestor = world.join("Haskill");
+    let location = ancestor.join("list").join("game");
+
+    let mut session = LiveSession::create("vloc-dll");
+    session.declare_root(0, &location);
+    session
+        .add_source(0, "/", 0, Arc::new(DiskProvider::new(&*content)))
+        .expect("add source");
+
+    let out = out_dir.join("probe.txt");
+    let by_backing = session.root_backing().join("plugin.dll");
+    let by_location = location.join("plugin.dll");
+    let env: BTreeMap<String, String> = [
+        ("VFS_FIXTURE_PROBE_OUT", out.to_string_lossy().into_owned()),
+        (
+            "VFS_FIXTURE_DLL_BACKING",
+            by_backing.to_string_lossy().into_owned(),
+        ),
+        (
+            "VFS_FIXTURE_DLL_LOCATION",
+            by_location.to_string_lossy().into_owned(),
+        ),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect();
+    let code = launch_bounded(
+        session.shared(),
+        LaunchOpts {
+            image: "game.exe".into(),
+            env,
+            ..Default::default()
+        },
+        "dll by both spellings",
+    );
+    assert_eq!(code, 0, "the probe must run");
+
+    let facts = probe_facts(&out);
+    let fact = |k: &str| facts.get(k).map(String::as_str);
+    assert_eq!(fact("dll_loaded"), Some("1"), "both loads must succeed");
+    assert_eq!(
+        fact("dll_same"),
+        Some("1"),
+        "one DLL, not a copy per spelling (module path {:?})",
+        fact("dll_path")
+    );
+    assert_eq!(
+        fact("dll_path"),
+        Some(&*by_location.to_string_lossy()),
+        "the module is named by the location"
+    );
+    assert!(!ancestor.exists(), "nothing may appear above the location");
+}
+
+/// A static import staged beside the image in the backing directory, mapped by the loader
+/// before any hook exists, is named by the location once the shim is up — like the executable
+/// itself — so a DLL that builds paths from its own module name builds virtual ones.
+#[cfg(windows)]
+#[test]
+fn a_static_import_mapped_from_the_backing_directory_is_named_by_the_location() {
+    ensure_inject_artifacts();
+    let _launches = lock_launches();
+
+    let content = vfs_testkit::scratch_dir("vloc-import-content");
+    std::fs::copy(
+        locate_artifact("vfs-staticimp.exe"),
+        content.join("game.exe"),
+    )
+    .unwrap();
+    std::fs::copy(locate_artifact("vproxy.dll"), content.join("vproxy.dll")).unwrap();
+    let out_dir = vfs_testkit::scratch_dir("vloc-import-out");
+    let world = vfs_testkit::scratch_dir("vloc-import-world");
+    let ancestor = world.join("Haskill");
+    let location = ancestor.join("list").join("game");
+
+    let mut session = LiveSession::create("vloc-import");
+    session.declare_root(0, &location);
+    session
+        .add_source(0, "/", 0, Arc::new(DiskProvider::new(&*content)))
+        .expect("add source");
+
+    let out = out_dir.join("probe.txt");
+    let env: BTreeMap<String, String> =
+        [("VFS_FIXTURE_PROBE_OUT", out.to_string_lossy().into_owned())]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+    let code = launch_bounded(
+        session.shared(),
+        LaunchOpts {
+            image: "game.exe".into(),
+            env,
+            ..Default::default()
+        },
+        "static import at a virtual location",
+    );
+    assert_eq!(code, 0, "vproxy.dll must bind and answer 4242");
+
+    let facts = probe_facts(&out);
+    assert_eq!(
+        facts.get("vproxy").map(String::as_str),
+        Some(&*location.join("vproxy.dll").to_string_lossy()),
+        "GetModuleFileName of the static import"
+    );
+    assert!(!ancestor.exists(), "nothing may appear above the location");
+}

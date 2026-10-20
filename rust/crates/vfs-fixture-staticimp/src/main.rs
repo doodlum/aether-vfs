@@ -39,6 +39,25 @@ fn main() {
 #[cfg(windows)]
 fn main() {
     let v = unsafe { vproxy_value() };
+    // `VFS_FIXTURE_PROBE_OUT`: also write where the loader says the import came from
+    // (`vproxy <GetModuleFileNameW of vproxy.dll>`), for a launch at a virtual location.
+    if let Some(out) = std::env::var_os("VFS_FIXTURE_PROBE_OUT") {
+        use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
+        let name: Vec<u16> = "vproxy.dll\0".encode_utf16().collect();
+        let mut buf = [0u16; 1024];
+        // SAFETY: a NUL-terminated name; a module handle (or null) and a buffer of its length.
+        let n = unsafe {
+            GetModuleFileNameW(
+                GetModuleHandleW(name.as_ptr()),
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+            )
+        } as usize;
+        let _ = std::fs::write(
+            out,
+            format!("vproxy {}\n", String::from_utf16_lossy(&buf[..n])),
+        );
+    }
     let line = format!("vproxy_value={v}\n");
     let args: Vec<String> = std::env::args().collect();
     if let Some(path) = args.get(1) {

@@ -21,6 +21,8 @@ pub struct LiveSession {
     // directory) is dropped before the directories it lives in are removed.
     session: Arc<Session>,
     roots: BTreeMap<u32, RootSources>,
+    /// Root 0's backing directory (`set_root`'s): where its launched image is staged.
+    root_backing: PathBuf,
     _dirs: vfs_testkit::Scratch,
 }
 
@@ -43,8 +45,15 @@ impl LiveSession {
         LiveSession {
             session: Arc::new(session),
             roots: BTreeMap::new(),
+            root_backing: dirs.join("root"),
             _dirs: dirs,
         }
+    }
+
+    /// Root 0's backing directory: the real directory its launched image is staged into and
+    /// started from, which the shim routes as a second spelling of the root.
+    pub fn root_backing(&self) -> PathBuf {
+        self.root_backing.clone()
     }
 
     /// The session, for a launch on another thread.

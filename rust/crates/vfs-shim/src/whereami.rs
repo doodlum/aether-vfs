@@ -43,6 +43,25 @@ pub(crate) fn to_virtual(
     ))
 }
 
+/// `path` (a DOS path) under a backing directory, spelled under its root's location instead;
+/// `None` for any other path, or when no root is purely virtual. The backings and locations
+/// are read from the environment once.
+pub(crate) fn virtual_spelling(path: &str) -> Option<String> {
+    type Map = (Vec<(RootId, String)>, Vec<(RootId, String)>);
+    static MAP: std::sync::OnceLock<Option<Map>> = std::sync::OnceLock::new();
+    let (backings, locations) = MAP
+        .get_or_init(|| {
+            let backings = backings_from_env();
+            if backings.is_empty() {
+                return None;
+            }
+            let dir = vfs_env::text(vfs_env::VIRTUAL_DIR)?;
+            Some((backings, roots_from_env(&dir)))
+        })
+        .as_ref()?;
+    to_virtual(path, backings, locations)
+}
+
 /// Rename the image path and the executable's loader entry, if the process
 /// was started from a backing directory. Called once, by the bootstrap,
 /// after the director's client attached.
@@ -83,11 +102,21 @@ pub(crate) unsafe fn rename_image() {
         // The executable's loader entry: first in InLoadOrderModuleList
         // (PEB.Ldr @ 0x18, PEB_LDR_DATA.InLoadOrderModuleList @ 0x10);
         // LDR_DATA_TABLE_ENTRY.FullDllName @ 0x48.
+        // Every loader entry mapped from a backing directory, not only the executable's: the
+        // static imports staged beside it (a plugin preloader among them) are loaded from the
+        // backing directory too, and one that builds paths from its own module name would
+        // otherwise load what SKSE loads by the location under a second spelling — a second
+        // copy of the same DLL. The list is walked from its head; `map` leaves every other
+        // entry (system DLLs, the shim) as it is.
         let ldr = *((peb + 0x18) as *const usize);
         if ldr != 0 {
-            let first = *((ldr + 0x10) as *const usize);
-            if first != 0 && first != ldr + 0x10 {
-                rename_string(first + 0x48, &map);
+            let head = ldr + 0x10;
+            let mut entry = *(head as *const usize);
+            let mut seen = 0;
+            while entry != 0 && entry != head && seen < 4096 {
+                rename_string(entry + 0x48, &map);
+                entry = *(entry as *const usize);
+                seen += 1;
             }
         }
     }
