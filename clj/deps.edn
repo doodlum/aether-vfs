@@ -1,0 +1,20 @@
+{:paths ["src" "target/classes"]
+
+ :deps {org.clojure/clojure {:mvn/version "1.13.0-alpha9"}}
+
+ :aliases
+ {;; compile java/ (the ring's atomics and kernel32 downcalls) into target/classes
+  ;;   clojure -T:build javac
+  :build {:deps       {io.github.clojure/tools.build {:mvn/version "0.10.14"}}
+          :ns-default build}
+
+  ;; serve the benchmark fixture
+  ;;   clojure -M:serve
+  :serve {:main-opts ["-m" "aether.director.main"]
+          :jvm-opts  ["--enable-native-access=ALL-UNNAMED" "-XX:+UseZGC"]}
+
+  ;;   clojure -M:test
+  :test {:extra-paths ["test"]
+         :extra-deps  {lambdaisland/kaocha {:mvn/version "1.91.1392"}}
+         :jvm-opts    ["--enable-native-access=ALL-UNNAMED"]
+         :main-opts   ["-m" "kaocha.runner"]}}}
