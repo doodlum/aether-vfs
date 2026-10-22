@@ -35,7 +35,10 @@
   (testing "inside the spin window idle returns at once; outside it parks"
     (let [w (ParkWaker. 1000000000 20000000 20000000 20000000)]
       (is (< (nanos-of #(.idle w 0)) 5000000) "hot: spins")
-      (is (>= (nanos-of #(.idle w 2000000000)) 10000000) "quiet: parks (20 ms asked)")))
+      ;; on a fresh thread: one with an unpark permit pending returns at once
+      (let [took (promise)]
+        (doto (Thread. ^Runnable (fn [] (deliver took (nanos-of #(.idle w 2000000000))))) (.start))
+        (is (>= (long (deref took 5000 0)) 10000000) "quiet: parks (20 ms asked)"))))
   (testing "completed does nothing; wakeAll unparks a parked worker"
     (let [w     (ParkWaker. 0 5000000000 5000000000 5000000000)   ; 5 s parks
           done  (promise)
