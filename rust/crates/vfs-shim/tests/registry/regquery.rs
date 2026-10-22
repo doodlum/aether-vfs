@@ -1083,7 +1083,13 @@ fn a_handle_opened_before_the_hooks_is_recorded_with_its_granted_access() {
     // First sight: resolved from its name, recorded as pass-through with the kernel's access.
     assert_eq!(vfs_shim::registry_handle_path(f.pre), None);
     assert_eq!(subkey_names(f.pre), ["PreSub", "Added"]);
-    assert_eq!(vfs_shim::registry_handle_path(f.pre), Some(f.canon("Pre")));
+    // Its path comes from the kernel's name for the key, spelled as the hive
+    // stores it: `SOFTWARE` on a CI runner's profile, `Software` on most others.
+    // Registry paths compare case-insensitively, so this does too.
+    assert_eq!(
+        vfs_shim::registry_handle_path(f.pre).map(|p| vfs_registry::path::fold(&p)),
+        Some(vfs_registry::path::fold(&f.canon("Pre")))
+    );
     assert_eq!(qval(f.pre, "p", 2, 64).st, STATUS_ACCESS_DENIED);
     assert_eq!(qkey(f.pre, 0, 64).st, STATUS_ACCESS_DENIED);
 

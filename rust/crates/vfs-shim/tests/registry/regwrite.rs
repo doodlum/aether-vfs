@@ -383,7 +383,13 @@ fn a_handle_opened_before_the_hooks_writes_to_the_overlay() {
     assert_eq!(st, 0);
     assert_eq!(query_dword(f.pre, "viaWin32"), Ok(5));
     assert_eq!(f.real_value("Pre", "viaWin32"), "none");
-    assert_eq!(registry_handle_path(f.pre), Some(f.canon("Pre")));
+    // Its path comes from the kernel's name for the key, spelled as the hive
+    // stores it: `SOFTWARE` on a CI runner's profile, `Software` on most others.
+    // Registry paths compare case-insensitively, so this does too.
+    assert_eq!(
+        registry_handle_path(f.pre).map(|p| vfs_registry::path::fold(&p)),
+        Some(vfs_registry::path::fold(&f.canon("Pre")))
+    );
 }
 
 #[test]
