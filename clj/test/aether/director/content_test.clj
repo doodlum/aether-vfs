@@ -4,6 +4,7 @@
             [aether.director.provider :as prov]
             [aether.director.provider.tree :as tree]
             [aether.director.provider.zip :as zip]
+            [aether.director.test-support :as ts]
             [clojure.java.io :as io]
             [clojure.test :refer [deftest is testing]])
   (:import (aether.director.provider Stat)
@@ -46,6 +47,8 @@
           "compressed entries are refused, by name"))))
 
 (deftest import-tables
+  ;; reads java.exe, a PE, from java.home/bin
+  (ts/requires [(ts/windows)]
   (let [java-exe (io/file (System/getProperty "java.home") "bin" "java.exe")
         data     (MemorySegment/ofArray (Files/readAllBytes (.toPath java-exe)))]
     (is (stage/pe? data))
@@ -53,9 +56,11 @@
     (is (not (stage/pe? (MemorySegment/ofArray (.getBytes "not a program")))))
     (is (stage/system-dll? "KERNEL32.dll"))
     (is (stage/system-dll? "api-ms-win-crt-heap-l1-1-0.dll"))
-    (is (not (stage/system-dll? "steam_api64.dll")))))
+    (is (not (stage/system-dll? "steam_api64.dll"))))))
 
 (deftest staging-the-import-closure
+  ;; stages java.exe and jli.dll from java.home/bin
+  (ts/requires [(ts/windows)]
   (let [bin  (io/file (System/getProperty "java.home") "bin")
         seg  #(MemorySegment/ofArray (Files/readAllBytes (.toPath (io/file bin %))))
         t    (tree/build [["Game/Bin/Java.exe" (seg "java.exe")] ["Game/Bin/jli.dll" (seg "jli.dll")]])
@@ -66,4 +71,4 @@
     (is (= (.getCanonicalPath (io/file dir "Game/Bin/Java.exe")) (:exe r)) "the EXE keeps its folder")
     (stage/cleanup! r dir)
     (is (empty? (.list dir)) "cleanup removes what staging wrote, and the folders it made")
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"VFS has no" (stage/stage t "nope.exe" {:dir dir})))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"VFS has no" (stage/stage t "nope.exe" {:dir dir}))))))
