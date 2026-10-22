@@ -23,8 +23,8 @@
 //! code can still say why.
 use std::time::Duration;
 use vfs_inject::{
-    check_helper_command, clear_active_process_pid, parse_injector_args, spawn_target_with_shim,
-    running_under_wine, start_steam_helper, InjectError, RunConfig, ACTIVE_PROCESS_KEY,
+    check_helper_command, clear_active_process_pid, parse_injector_args, running_under_wine,
+    spawn_target_with_shim, start_steam_helper, InjectError, RunConfig, ACTIVE_PROCESS_KEY,
 };
 
 /// How long the Steam helper may take to publish itself before the target is

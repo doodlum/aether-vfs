@@ -152,7 +152,10 @@ unsafe fn record(info: *mut EXCEPTION_POINTERS) {
     if h == 0 {
         return;
     }
-    let mut out = Buf { bytes: [0; 4096], len: 0 };
+    let mut out = Buf {
+        bytes: [0; 4096],
+        len: 0,
+    };
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
