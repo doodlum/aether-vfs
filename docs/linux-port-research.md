@@ -625,3 +625,11 @@ and a DRM'd game (`SkyrimSE.exe` SteamStub). **Needs an NVIDIA GPU:** NVAPI/NGX.
     handler (`Guard` covers dispatch, but not necessarily the CAS and state writes).
 15. **Path fidelity.** A ring path, root or cwd containing non-ASCII or very long components goes
     through Wine's Unix→DOS conversion. This is untested from the Clojure side.
+16. **Disk provider case folding on a case-sensitive file system.** `provider/disk.clj` resolves
+    a folded vpath as it is and leaves case-insensitivity to the file system (`disk.clj:4-6`),
+    which holds only on Windows. On ext4 a caller's other spelling (`A.TXT` for `a.txt`) misses,
+    and an overlay with a disk upper misses its own copy-ups: they keep the lower's spelling
+    (`Data/Skyrim.esm`) while the overlay asks the upper by the folded one. The disk provider
+    needs to fold itself on Linux, for example by resolving each component against a folded
+    directory listing (check what vfs-compose's `DiskProvider` does there first). Until then
+    `provider_test.clj`'s case-folding assertions for disk-backed providers run on Windows only.

@@ -7,6 +7,7 @@
             [aether.director.provider :as prov]
             [aether.director.provider.tree :as tree]
             [aether.director.storage :as storage]
+            [aether.director.test-support :as ts]
             [clojure.java.io :as io]
             [clojure.test :refer [deftest is testing]])
   (:import (aether.director.provider Entry Stat)
@@ -73,117 +74,137 @@
 
 ;; --- the conformance suite ----------------------------------------------------------
 
+(defn- case-insensitive-disk
+  "nil where the disk provider folds case, else why its case assertions skip:
+  it relies on the file system for that (disk.clj), and only Windows' is
+  case-insensitive. Folding on a case-sensitive one is a Linux work item
+  (docs/linux-port-research.md §6)."
+  []
+  (when (ts/windows)
+    {:skip/kind :os :why "a case-insensitive file system (the disk provider folds through it)"}))
+
 (defn conformance
-  "Checks `prov`, which serves `fixture`. `writable?` adds the write cases."
-  [label prov writable?]
-  (testing label
-    (testing "common"
-      (is (dir? prov ""))
-      (is (= 5 (size prov "a.txt")))
-      (is (dir? prov "sub"))
-      (is (= 6 (size prov "sub/b.txt")))
-      (is (nil? (prov/stat prov "missing.txt")))
-      (is (= p/not-found (prov/open prov "missing.txt" p/open-read)))
-      (is (= [["a.txt" false 5] ["sub" true 0]] (names prov "")))
-      (is (= [["b.txt" false 6]] (names prov "sub")))
-      (is (= p/not-a-directory (prov/list-dir prov "a.txt")))
-      (is (nil? (prov/list-dir prov "nope")))
-      (let [h1 (prov/open prov "a.txt" p/open-read) h2 (prov/open prov "a.txt" p/open-read)]
-        (is (not (identical? h1 h2)) "two opens are two handles")
-        (prov/close! h1) (prov/close! h2)))
-    (testing "case"
-      (is (= "hello" (read-all prov "A.TXT")) "open folds the caller's spelling")
-      (is (= "a.txt" (prov/spelling prov "a.txt")))
-      (is (= "sub/b.txt" (prov/spelling prov "sub/b.txt")))
-      (is (= "" (prov/spelling prov "")))
-      (is (nil? (prov/spelling prov "missing.txt"))))
-    (testing "positional reads"
-      (is (= "hello" (read-all prov "a.txt" 3)))
-      (is (= "world!" (read-all prov "sub/b.txt" 4)))
-      (let [h (prov/open prov "a.txt" p/open-read)
-            buf (MemorySegment/ofArray (byte-array 16))]
-        (is (= 0 (prov/read-into h buf 0 5 4)) "at EOF")
-        (is (= 0 (prov/read-into h buf 0 50 4)) "past EOF")
-        (is (= 0 (prov/read-into h buf 0 0 0)) "an empty read")
-        (is (= 4 (prov/read-into h buf 0 1 10)))
-        (is (= "ello" (String. ^bytes (.toArray (.asSlice buf 0 4) ValueLayout/JAVA_BYTE) "UTF-8")))
-        (prov/close! h)))
-    (if-not writable?
-      (testing "read-only"
-        (is (= p/read-only (prov/open prov "a.txt" p/open-write)))
-        (is (= p/read-only (prov/open prov "new.txt" wcreate)))
-        (is (= p/read-only (prov/delete! prov "a.txt")))
-        (is (= "hello" (read-all prov "a.txt"))))
-      (testing "writable"
-        (is (= p/ok (write! prov "w_new.txt" wcreate [0 "hello"])))
-        (is (= 5 (size prov "w_new.txt")))
-        (is (= "hello" (read-all prov "w_new.txt")))
-        (is (neg? (long (let [h (prov/open prov "w_new.txt" (bit-or wcreate p/open-excl))]
-                          (if (number? h) h (do (prov/close! h) 0)))))
-            "EXCL on an existing file fails")
-        (is (= p/ok (write! prov "w_new.txt" (bit-or p/open-write p/open-trunc))))
-        (is (= 0 (size prov "w_new.txt")) "TRUNC")
-        (is (= p/ok (write! prov "w_new.txt" p/open-write [0 "abcdef"] [2 "XY"])))
-        (is (= "abXYef" (read-all prov "w_new.txt")) "positional writes")
-        (let [h (prov/open prov "w_new.txt" p/open-write)]
-          (prov/truncate! h 2) (prov/truncate! h 4) (prov/close! h))
-        (is (= "ab\u0000\u0000" (read-all prov "w_new.txt")) "truncate, then extend with zeros")
-        (is (= p/ok (prov/mkdir! prov "w_dir")))
-        (is (dir? prov "w_dir"))
-        (is (= p/ok (prov/mkdir! prov "w_dir")) "MKDIR of an existing directory is OK")
-        (is (= p/ok (prov/rename! prov "w_new.txt" "w_moved.txt")))
-        (is (nil? (prov/stat prov "w_new.txt")))
-        (is (= 4 (size prov "w_moved.txt")))
-        (is (= p/ok (prov/delete! prov "w_moved.txt")))
-        (is (= p/ok (prov/delete! prov "w_dir")))
-        (is (nil? (prov/stat prov "w_moved.txt")))
-        (is (nil? (prov/stat prov "w_dir")))
-        (testing "a non-empty directory: delete fails and keeps it, or succeeds and removes it all"
-          (write! prov "w_full/child.txt" wcreate [0 "x"])
-          (let [st (prov/delete! prov "w_full")]
-            (if (zero? (long st))
-              (is (nil? (prov/stat prov "w_full/child.txt")))
-              (is (= "x" (read-all prov "w_full/child.txt"))))))
-        (testing "names are created as spelled and found ignoring case"
-          (is (= p/ok (write! prov "Über.txt" wcreate [0 "x"])))
-          (is (= 1 (size prov "über.txt")))
-          (is (= "Über.txt" (prov/spelling prov "über.txt")))
-          (is (= p/ok (write! prov "A.TXT" p/open-write [0 "J"])))
-          (is (= "Jello" (read-all prov "a.txt")) "writing through another spelling writes the same file")
-          (write! prov "a.txt" (bit-or p/open-write p/open-trunc) [0 "hello"])
-          (is (= p/ok (write! prov "SUB/c.txt" wcreate [0 "c"])))
-          (is (some #{"c.txt"} (map first (names prov "sub")))))
-        (testing "creating makes missing parents"
-          (is (= p/ok (write! prov "deep/er/d.txt" wcreate [0 "d"])))
-          (is (dir? prov "deep/er")))
-        (is (= "hello" (read-all prov "a.txt")) "the fixture is intact")
-        (is (= "world!" (read-all prov "sub/b.txt")))))))
+  "Checks `prov`, which serves `fixture`. `writable?` adds the write cases.
+  `disk` is where a real directory takes part: :reads (the fixture is on disk)
+  or :writes (writes land on disk); its case-folding assertions need a
+  case-insensitive file system."
+  ([label prov writable?] (conformance label prov writable? nil))
+  ([label prov writable? disk]
+   (testing label
+     (testing "common"
+       (is (dir? prov ""))
+       (is (= 5 (size prov "a.txt")))
+       (is (dir? prov "sub"))
+       (is (= 6 (size prov "sub/b.txt")))
+       (is (nil? (prov/stat prov "missing.txt")))
+       (is (= p/not-found (prov/open prov "missing.txt" p/open-read)))
+       (is (= [["a.txt" false 5] ["sub" true 0]] (names prov "")))
+       (is (= [["b.txt" false 6]] (names prov "sub")))
+       (is (= p/not-a-directory (prov/list-dir prov "a.txt")))
+       (is (nil? (prov/list-dir prov "nope")))
+       (let [h1 (prov/open prov "a.txt" p/open-read) h2 (prov/open prov "a.txt" p/open-read)]
+         (is (not (identical? h1 h2)) "two opens are two handles")
+         (prov/close! h1) (prov/close! h2)))
+     (testing "case"
+       (ts/requires [(when (= :reads disk) (case-insensitive-disk))]
+         (is (= "hello" (read-all prov "A.TXT")) "open folds the caller's spelling"))
+       (is (= "a.txt" (prov/spelling prov "a.txt")))
+       (is (= "sub/b.txt" (prov/spelling prov "sub/b.txt")))
+       (is (= "" (prov/spelling prov "")))
+       (is (nil? (prov/spelling prov "missing.txt"))))
+     (testing "positional reads"
+       (is (= "hello" (read-all prov "a.txt" 3)))
+       (is (= "world!" (read-all prov "sub/b.txt" 4)))
+       (let [h (prov/open prov "a.txt" p/open-read)
+             buf (MemorySegment/ofArray (byte-array 16))]
+         (is (= 0 (prov/read-into h buf 0 5 4)) "at EOF")
+         (is (= 0 (prov/read-into h buf 0 50 4)) "past EOF")
+         (is (= 0 (prov/read-into h buf 0 0 0)) "an empty read")
+         (is (= 4 (prov/read-into h buf 0 1 10)))
+         (is (= "ello" (String. ^bytes (.toArray (.asSlice buf 0 4) ValueLayout/JAVA_BYTE) "UTF-8")))
+         (prov/close! h)))
+     (if-not writable?
+       (testing "read-only"
+         (is (= p/read-only (prov/open prov "a.txt" p/open-write)))
+         (is (= p/read-only (prov/open prov "new.txt" wcreate)))
+         (is (= p/read-only (prov/delete! prov "a.txt")))
+         (is (= "hello" (read-all prov "a.txt"))))
+       (testing "writable"
+         (is (= p/ok (write! prov "w_new.txt" wcreate [0 "hello"])))
+         (is (= 5 (size prov "w_new.txt")))
+         (is (= "hello" (read-all prov "w_new.txt")))
+         (is (neg? (long (let [h (prov/open prov "w_new.txt" (bit-or wcreate p/open-excl))]
+                           (if (number? h) h (do (prov/close! h) 0)))))
+             "EXCL on an existing file fails")
+         (is (= p/ok (write! prov "w_new.txt" (bit-or p/open-write p/open-trunc))))
+         (is (= 0 (size prov "w_new.txt")) "TRUNC")
+         (is (= p/ok (write! prov "w_new.txt" p/open-write [0 "abcdef"] [2 "XY"])))
+         (is (= "abXYef" (read-all prov "w_new.txt")) "positional writes")
+         (let [h (prov/open prov "w_new.txt" p/open-write)]
+           (prov/truncate! h 2) (prov/truncate! h 4) (prov/close! h))
+         (is (= "ab\u0000\u0000" (read-all prov "w_new.txt")) "truncate, then extend with zeros")
+         (is (= p/ok (prov/mkdir! prov "w_dir")))
+         (is (dir? prov "w_dir"))
+         (is (= p/ok (prov/mkdir! prov "w_dir")) "MKDIR of an existing directory is OK")
+         (is (= p/ok (prov/rename! prov "w_new.txt" "w_moved.txt")))
+         (is (nil? (prov/stat prov "w_new.txt")))
+         (is (= 4 (size prov "w_moved.txt")))
+         (is (= p/ok (prov/delete! prov "w_moved.txt")))
+         (is (= p/ok (prov/delete! prov "w_dir")))
+         (is (nil? (prov/stat prov "w_moved.txt")))
+         (is (nil? (prov/stat prov "w_dir")))
+         (testing "a non-empty directory: delete fails and keeps it, or succeeds and removes it all"
+           (write! prov "w_full/child.txt" wcreate [0 "x"])
+           (let [st (prov/delete! prov "w_full")]
+             (if (zero? (long st))
+               (is (nil? (prov/stat prov "w_full/child.txt")))
+               (is (= "x" (read-all prov "w_full/child.txt"))))))
+         (testing "names are created as spelled and found ignoring case"
+           (is (= p/ok (write! prov "Über.txt" wcreate [0 "x"])))
+           (ts/requires [(when disk (case-insensitive-disk))]
+             (is (= 1 (size prov "über.txt")))
+             (is (= "Über.txt" (prov/spelling prov "über.txt")))
+             (is (= p/ok (write! prov "A.TXT" p/open-write [0 "J"])))
+             (is (= "Jello" (read-all prov "a.txt")) "writing through another spelling writes the same file"))
+           (write! prov "a.txt" (bit-or p/open-write p/open-trunc) [0 "hello"])
+           (is (= p/ok (write! prov "SUB/c.txt" wcreate [0 "c"])))
+           (ts/requires [(when disk (case-insensitive-disk))]
+             (is (some #{"c.txt"} (map first (names prov "sub"))))))
+         (testing "creating makes missing parents"
+           (is (= p/ok (write! prov "deep/er/d.txt" wcreate [0 "d"])))
+           (is (dir? prov "deep/er")))
+         (is (= "hello" (read-all prov "a.txt")) "the fixture is intact")
+         (is (= "world!" (read-all prov "sub/b.txt"))))))))
 
 (deftest every-provider-conforms
   (conformance "index" (index-of fixture) false)
   (conformance "layered" (compose/layered [(index-of {"a.txt" "stale!!" "sub/b.txt" "world!"})
                                            (index-of {"a.txt" "hello"})])
                false)
-  (conformance "disk" (disk-of fixture) true)
+  (conformance "disk" (disk-of fixture) true :reads)
   (conformance "layer" (layer-of fixture) true)
   (conformance "overlay: layer over index" (compose/overlay (layer-of {}) (index-of fixture)) true)
-  (conformance "overlay: disk over index" (compose/overlay (disk/disk (temp-dir)) (index-of fixture)) true)
+  (conformance "overlay: disk over index" (compose/overlay (disk/disk (temp-dir)) (index-of fixture)) true :writes)
   (conformance "overlay: disk over layered" (compose/overlay (disk/disk (temp-dir))
                                                              (compose/layered [(index-of {"a.txt" "hello"})
                                                                                (index-of {"sub/b.txt" "world!"})]))
-               true))
+               true :writes))
 
 ;; --- the overlay ---------------------------------------------------------------------
 
-(deftest overlay-copy-on-write
+(defn- copy-on-write
+  "The overlay's behaviour over a disk upper, the lower spelling its files
+  `esm` and `nif` (data/skyrim.esm and data/meshes/a.nif, in any case); the
+  caller always spells them folded."
+  [esm nif]
   (let [upper-dir (temp-dir)
-        lower     (index-of {"Data/Skyrim.esm" "esm" "Data/Meshes/a.nif" "nif" "readme.txt" "r"})
+        lower     (index-of {esm "esm" nif "nif" "readme.txt" "r"})
         o         (compose/overlay (disk/disk upper-dir) lower)]
     (testing "a write copies the lower file up; the lower is untouched"
       (is (= p/ok (write! o "data/skyrim.esm" p/open-write [0 "ESM"])))
       (is (= "ESM" (read-all o "data/skyrim.esm")))
       (is (= "esm" (read-all lower "data/skyrim.esm")))
-      (is (.isFile (io/file upper-dir "Data/Skyrim.esm")) "the copy keeps the lower's spelling"))
+      (is (.isFile (io/file upper-dir esm)) "the copy keeps the lower's spelling"))
     (testing "a lower directory can't be opened for write"
       (is (= p/is-dir (prov/open o "data/meshes" p/open-write))))
     (testing "delete hides a lower file with a whiteout, and listings never show markers"
@@ -219,3 +240,13 @@
         (is (= "new" (read-all o2 "readme.txt")))
         (is (nil? (prov/stat o2 "data/meshes/a.nif")) "whiteouts persist")
         (is (= "nif" (read-all o2 "data/meshes/b.nif")))))))
+
+(deftest overlay-copy-on-write
+  (copy-on-write "data/skyrim.esm" "data/meshes/a.nif"))
+
+(deftest overlay-copy-on-write-folds-the-lower-s-case
+  ;; the lower spells them in mixed case and the caller folded: the copy-up
+  ;; lands in the lower's spelling, and the disk upper must find it by the
+  ;; folded one
+  (ts/requires [(case-insensitive-disk)]
+    (copy-on-write "Data/Skyrim.esm" "Data/Meshes/a.nif")))
