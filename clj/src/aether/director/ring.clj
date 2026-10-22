@@ -8,13 +8,14 @@
   a CAS to COMPLETED (or frees a slot its client abandoned). Bulk reads go
   straight from the provider into the slot's arena bank.
 
-  Waking matches vfs-win's EventNotifier: a worker that served a request in
-  the last `spin-us` spins; otherwise it waits on the server event for 1 ms."
+  Waking is an aether.director.Waker: EventWaker matches vfs-win's
+  EventNotifier (a worker that served a request in the last `spin-us` spins;
+  otherwise it waits on the server event for 1 ms)."
   (:require [aether.director.path :as path]
             [aether.director.proto :as p]
             [aether.director.provider :as prov]
             [aether.director.registry :as registry])
-  (:import (aether.director Guard Native Native$Section)
+  (:import (aether.director EventWaker Guard Native Native$Section Waker)
            (aether.director.provider Stat)
            (java.io ByteArrayOutputStream)
            (java.lang.foreign Arena MemorySegment ValueLayout)
@@ -56,7 +57,7 @@
                ^long arena-offset ^long bank-size
                ^objects roots                       ; root id -> provider (or nil)
                ^ConcurrentHashMap handles ^AtomicLong next-fh
-               ^long srv-event ^long cli-event ^long spin-ns
+               ^Waker waker
                ^AtomicBoolean stop ^AtomicLong served
                stage-exec                           ; (fn [vpath] real-path-or-nil), or nil
                registry                             ; an aether.director.registry, or nil (not served)
@@ -401,7 +402,7 @@
     (put-i32 seg (+ base p/sh-payload-len) (bit-and result 0xFFFFFFFF))
     (put-i32 seg (+ base p/sh-ack) req-id)
     (if (Native/cas seg state p/st-processing p/st-completed)
-      (Native/setEvent (.-cli-event r))
+      (.completed ^Waker (.-waker r))
       (Native/cas seg state p/st-abandoned p/st-free))))
 
 (defn- serve-pass
@@ -420,7 +421,7 @@
             (recur (inc i) served)))))))
 
 (defn- worker [^Ring r]
-  (let [stop (.-stop r) spin-ns (.-spin-ns r)]
+  (let [stop (.-stop r) ^Waker waker (.-waker r)]
     (loop [last-served 0 start 0]
       (when-not (.get ^AtomicBoolean stop)
         (let [n     (serve-pass r start)
@@ -428,9 +429,7 @@
           (if (pos? n)
             (do (.addAndGet ^AtomicLong (.-served r) n)
                 (recur (System/nanoTime) start))
-            (do (if (< (- (System/nanoTime) last-served) spin-ns)
-                  (dotimes [_ 64] (Thread/onSpinWait))
-                  (Native/waitFor (.-srv-event r) 1))
+            (do (.idle waker (- (System/nanoTime) last-served))
                 (recur last-served start))))))))
 
 ;; --- lifecycle -----------------------------------------------------------------
@@ -496,7 +495,7 @@
           _      (init-header! seg g 1)
           r      (Ring. seg stride (:cap g) (:arena-offset g) (:bank-size g)
                         (roots-array {0 provider}) (ConcurrentHashMap.) (AtomicLong.)
-                        0 0 0 (AtomicBoolean.) (AtomicLong.) nil nil nil)
+                        Waker/NONE (AtomicBoolean.) (AtomicLong.) nil nil nil)
           {:keys [files dirs]} (prov/sample provider 64)
           sent   (long-array 1)                ; requests so far: the next one's slot
           call   (fn [op flags ^bytes payload]
@@ -553,7 +552,7 @@
         cli     (Native/createEvent (str name "_cli"))
         ring    (Ring. seg (:stride g) (:cap g) (:arena-offset g) (:bank-size g)
                        (roots-array (assoc roots 0 provider)) (ConcurrentHashMap.) (AtomicLong.)
-                       srv cli (* 1000 (long spin-us))
+                       (EventWaker. srv cli (* 1000 (long spin-us)))
                        (AtomicBoolean.) (AtomicLong.) stage-exec registry
                        (when trace (ConcurrentHashMap.)))
         _       (when registry
@@ -568,10 +567,10 @@
 
 (defn stop [{:keys [^Ring ring ^Native$Section section threads]}]
   (.set ^AtomicBoolean (.-stop ring) true)
+  (.wakeAll ^Waker (.-waker ring))
   (doseq [^Thread t threads] (.join t 1000))
   (doseq [^Open o (.values ^ConcurrentHashMap (.-handles ring))] (prov/close! (.-handle o)))
-  (Native/closeHandle (.-srv-event ring))
-  (Native/closeHandle (.-cli-event ring))
+  (.close ^Waker (.-waker ring))
   (.close section))
 
 (defn trace-top
