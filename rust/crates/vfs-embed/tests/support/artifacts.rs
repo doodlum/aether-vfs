@@ -11,7 +11,7 @@ pub use vfs_testkit::artifacts::profile_dir;
 pub fn locate_artifact(name: &str) -> PathBuf {
     vfs_testkit::artifacts::locate_or_panic(
         name,
-        "build -p vfs-fixture-read -p vfs-shim-dll and vfs-payload (--manifest-path crates/vfs-payload/Cargo.toml) first",
+        "build -p vfs-shim-dll -p vfs-fixture-read -p vfs-fixture-writepath -p vfs-fixture-escape          -p vfs-fixture-prefs -p vfs-fixture-vproxy, then -p vfs-fixture-staticimp, first",
     )
 }
 
@@ -227,7 +227,26 @@ fn move_locked_artifacts_aside(names: &[&str]) {
     }
 }
 
+/// Readies the artefacts once per test process, before any test in it uses one.
+///
+/// Once, not per test, because the tests of a binary run in parallel and this
+/// moves a path aside when it can't open it for writing. A parallel test's
+/// `std::fs::copy` of the fixture (or a scanner) holds it open just long enough
+/// for that probe to fail, and the rename then leaves the path empty until the
+/// rebuild below restores it: another test's `locate_artifact` in that window
+/// panicked with "vfs-fixture-read.exe not found" on CI while every artefact
+/// had been built. Run once, every test waits here until the artefacts are in
+/// place, and nothing in this process moves them again.
 pub fn ensure_inject_artifacts() {
+    static DONE: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+    let mut done = DONE.lock().unwrap_or_else(|e| e.into_inner());
+    if !*done {
+        ensure_inject_artifacts_now();
+        *done = true;
+    }
+}
+
+fn ensure_inject_artifacts_now() {
     // Session::launch locates the shim near the current exe (the test
     // binary). Co-locate them into the profile dir if cargo left them only in
     // deps/ or they were never built for this package.
