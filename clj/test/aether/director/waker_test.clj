@@ -63,7 +63,19 @@
           (is (= 0x102 (Native/waitFor cli 0)) "auto-reset"))
         (testing "hot: spins; quiet: a 1 ms wait on the server event"
           (is (< (nanos-of #(.idle w 0)) 1000000))
-          (is (>= (nanos-of #(.idle w 1000000000)) 500000)))
+          ;; A 1 ms WaitForSingleObject ends at a timer tick, which can come
+          ;; well before 1 ms (239 µs on a CI runner), so one wait's length
+          ;; proves little. Ten in a row average far above the 64 pauses of a
+          ;; spin (a few µs each time), and a quiet idle consumes a pending
+          ;; server signal, which a spin never touches.
+          (is (>= (nanos-of #(dotimes [_ 10] (.idle w 1000000000))) 1000000)
+              "ten quiet idles wait, they don't spin (≥ 100 µs each on average)")
+          (Native/setEvent srv)
+          (.idle w 0)
+          (is (= 0 (Native/waitFor srv 0)) "a hot idle leaves the server event alone")
+          (Native/setEvent srv)
+          (.idle w 1000000000)
+          (is (= 0x102 (Native/waitFor srv 0)) "a quiet idle waited on the server event (auto-reset)"))
         (testing "wakeAll signals the server event, so a waiting worker returns"
           (.wakeAll w)
           (is (= 0 (Native/waitFor srv 0))))
