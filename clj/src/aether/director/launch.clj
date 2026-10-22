@@ -11,12 +11,16 @@
     fuse.cfg   the ring's coordinates as key=value lines (written for tools;
                the shim reads its environment instead)
 
+  The ring is a named section, or a file (ring/start's :transport); the env
+  that names it comes from aether.director.env.
+
   Starting the process stays native: rust/'s vfs-injector creates it with the
   shim, waits for the shim's ready file, and exits with the target's code.
   The target inherits the injector's environment, and the injector inherits
   ours, so the child's environment is built explicitly here, never by
   changing this process's own."
-  (:require [clojure.java.io :as io]
+  (:require [aether.director.env :as env]
+            [clojure.java.io :as io]
             [clojure.string :as str])
   (:import (java.io ByteArrayOutputStream File)
            (java.lang ProcessBuilder$Redirect)
@@ -44,6 +48,40 @@
 
 (defn- canonical ^String [f] (.getCanonicalPath (io/file f)))
 
+(defn fuse-cfg
+  "fuse.cfg's text for `server` and the managed root `root`: a section names
+  itself and its events, a file its path as the shim opens it."
+  ^String [server ^String root]
+  (let [{:keys [cap map-bytes arena-offset arena-len]} server
+        geometry (str "
+payload_cap=" cap "
+ring_bytes=" map-bytes
+                      "
+arena_offset=" arena-offset "
+arena_len=" arena-len)]
+    (case (:transport server)
+      :section (str "section=" (:name server) "
+root=" root geometry
+                    "
+server_ev=" (:server-event server) "
+client_ev=" (:client-event server) "
+")
+      :file    (str "ring_path=" (:ring-path server) "
+root=" root geometry "
+"))))
+
+(defn session-env
+  "The shim's env for `server`: the transport's (aether.director.env/transport-env),
+  fuse.cfg's path, the managed root, the roots beyond root 0 ({id path}), and
+  the registry switch when the server serves one."
+  [server {:keys [root fuse roots]}]
+  (cond-> (merge (env/transport-env server)
+                 {env/fuse-cfg      fuse
+                  env/virtual-dir   root
+                  ;; set even when empty, as it always was
+                  env/virtual-roots (or (env/encode-roots roots) "")})
+    (:registry? server) (assoc env/registry "1")))
+
 (defn session
   "Creates the session's directories under `dir`: root/ (the managed root,
   empty), overlay/ and state/, and writes shim.cfg and fuse.cfg for `server`
@@ -54,35 +92,54 @@
   (let [[root state] (for [d ["root" "state"]] (doto (io/file dir d) (.mkdirs)))
         root-s  (canonical root)
         shim    (io/file state "shim.cfg")
-        fuse    (io/file state "fuse.cfg")
-        {section :name
-         :keys [cap map-bytes arena-offset arena-len server-event client-event registry?]} server]
+        fuse    (io/file state "fuse.cfg")]
     (io/copy (shim-config root-s) shim)
-    (spit fuse (str "section=" section "\nroot=" root-s "\npayload_cap=" cap "\nring_bytes=" map-bytes
-                    "\narena_offset=" arena-offset "\narena_len=" arena-len
-                    "\nserver_ev=" server-event "\nclient_ev=" client-event "\n"))
+    (spit fuse (fuse-cfg server root-s))
     {:root root-s :state (canonical state)
      :shim-config (canonical shim) :ready (str (canonical state) File/separator "ready.flag")
-     :env (cond-> {"VFS_RING_SECTION"     section
-                  "VFS_RING_BYTES"       (str map-bytes)
-                  "VFS_RING_PAYLOAD_CAP" (str cap)
-                  "VFS_ARENA_OFFSET"     (str arena-offset)
-                  "VFS_ARENA_LEN"        (str arena-len)
-                  "VFS_SERVER_EV"        server-event
-                  "VFS_CLIENT_EV"        client-event
-                  "VFS_FUSE_CFG"         (canonical fuse)
-                  "VFS_VIRTUAL_DIR"      root-s
-                  "VFS_VIRTUAL_ROOTS"    (str/join ";" (for [[id at] (sort roots)] (str id "=" at)))}
-             registry? (assoc "VFS_REGISTRY" "1"))}))
+     :env (session-env server {:root root-s :fuse (canonical fuse) :roots roots})}))
+
+(defn launch-env
+  "The child's env for a launch under `session`, as {:remove names :set [[k
+  v] …]} for apply-env!: every transport name the launch doesn't set is
+  removed (an earlier session's would otherwise reach the child), and so is
+  each of `remove-env` (in any spelling); then the session's env, the
+  injector's, `natives-dir` in front of `host-path` on PATH, the staged
+  `launch-image`, and last the caller's `env`, which wins."
+  [session {:keys [env cwd launch-image remove-env]} ^String natives-dir host-path]
+  (let [sets (-> (vec (:env session))
+                 (conj [env/inject-cwd (if cwd (str (io/file (:root session) (str cwd))) (:root session))]
+                       ;; Remote-thread injection, always: the shim is loaded into the
+                       ;; suspended process by full path. (The injector's alternative patches
+                       ;; the image's import table in memory, which a self-verifying SteamStub
+                       ;; wrapper such as SkyrimSE.exe refuses: "Application load error
+                       ;; 3:0000065432".)
+                       [env/force-injection "1"]
+                       ;; The shim's own DLLs (vcruntime140 in a bundle) resolve from the
+                       ;; natives directory: a staged EXE's folder doesn't hold them.
+                       ["PATH" (str natives-dir File/pathSeparator host-path)])
+                 (cond-> launch-image (conj [env/launch-image (str launch-image)]))
+                 (into env))
+        set-names (set (map first sets))]
+    ;; transport names only: on Windows the host may set the injector's own
+    {:remove (into (env/stale set-names env/transport) (remove set-names) remove-env)
+     :set    sets}))
+
+(defn apply-env!
+  "Applies launch-env's result to `m`, a ProcessBuilder's environment."
+  ^Map [^Map m delta]
+  (env/apply! m delta))
 
 (defn launch
   "Runs `exe` (a real file) with `args` under `session`, via the injector at
   `natives` (a directory holding vfs-injector.exe and vfs_shim_dll.dll), with
   the managed root as its working directory. `env` adds variables for the
   target; `launch-image` (a staged EXE) makes that EXE's folder an alias of
-  the root. Waits, and returns the exit code (the injector's own failures are
-  3, explained in <ready>.injector-error); output goes to ours."
-  [session {:keys [natives exe args env launch-image cwd]}]
+  the root. `remove-env` names inherited variables the target must not see
+  (matched without case). Waits, and returns the exit code (the injector's
+  own failures are 3, explained in <ready>.injector-error); output goes to
+  ours."
+  [session {:keys [natives exe args] :as opts}]
   (let [native (fn [n] (let [f (io/file natives n)]
                          (when-not (.isFile f) (throw (ex-info (str n " not found in " natives) {:file f})))
                          (canonical f)))
@@ -95,23 +152,5 @@
                  (.redirectOutput ProcessBuilder$Redirect/INHERIT)
                  (.redirectError ProcessBuilder$Redirect/INHERIT))]
     (io/delete-file (:ready session) true)
-    (doto (.environment pb)
-      ;; a file-backed ring would take priority over our section; VFS_REGISTRY
-      ;; comes back with the session's env only when a registry is served
-      (.remove "VFS_RING_PATH")
-      (.remove "VFS_REGISTRY")
-      (.putAll ^Map (:env session))
-      (.put "VFS_INJECT_CWD" (if cwd (str (io/file (:root session) (str cwd))) (:root session)))
-      ;; Remote-thread injection, always: the shim is loaded into the
-      ;; suspended process by full path. (The injector's alternative patches
-      ;; the image's import table in memory, which a self-verifying SteamStub
-      ;; wrapper such as SkyrimSE.exe refuses: "Application load error
-      ;; 3:0000065432".)
-      (.put "VFS_FORCE_INJECTION" "1")
-      ;; The shim is activated by patching the target's imports in memory, by
-      ;; DLL name: the loader must find vfs_shim_dll.dll, and a staged EXE's
-      ;; folder doesn't hold it.
-      (.put "PATH" (str (canonical natives) File/pathSeparator (System/getenv "PATH")))
-      (cond-> launch-image (.put "VFS_LAUNCH_IMAGE" (str launch-image)))
-      (.putAll ^Map (or env {})))
+    (apply-env! (.environment pb) (launch-env session opts (canonical natives) (System/getenv "PATH")))
     (.waitFor (.start pb))))

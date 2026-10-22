@@ -561,7 +561,7 @@
                        (doto (Thread. ^Runnable #(worker ring) (str "ring-worker-" i))
                          (.setDaemon true)
                          (.start))))]
-    (merge g {:name name :ring ring :section section :threads threads :warm-up warmed
+    (merge g {:transport :section :name name :ring ring :section section :threads threads :warm-up warmed
               :registry? (some? registry)
               :server-event (str name "_srv") :client-event (str name "_cli")})))
 
