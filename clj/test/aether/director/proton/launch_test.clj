@@ -44,7 +44,7 @@
   (let [r (refusal #(launch/check-geometry (assoc sample :ring-bytes (* 2 1024 1024) :arena-offset 132136
                                                   :arena-len 33554432)
                                            nil))]
-    (is (= :launch/geometry (:launch/error r)))
+    (is (= :geometry (::launch/error r)))
     (is (str/includes? (:message r) "exceeds ring_bytes") (:message r))))
 
 (deftest a-consistent-geometry-passes
@@ -56,7 +56,7 @@
   (let [r (refusal #(launch/check-geometry (assoc sample :ring-host-path "/s/ring.bin" :ring-bytes 65536
                                                   :arena-offset 0 :arena-len 0)
                                            128))]
-    (is (= :launch/geometry (:launch/error r)))
+    (is (= :geometry (::launch/error r)))
     (is (str/includes? (:message r) "but ring_bytes is") (:message r))
     (is (str/includes? (:message r) "/s/ring.bin"))))
 
@@ -94,14 +94,14 @@
   (testing "2 and 3 are the injector's own: the target never ran"
     (doseq [code [2 3]]
       (let [r (launch/finish sample code nil)]
-        (is (= [:launch/injector-exit code] [(:launch/error r) (:code r)]))
+        (is (= [:injector-exit code] [(::launch/error r) (:code r)]))
         (is (str/includes? (:error r) (str "vfs-injector exited " code " without running the target")) (:error r))))
-    (is (= :launch/injector-exit (:launch/error (launch/finish sample 3 " \n"))) "an empty report says nothing")
+    (is (= :injector-exit (::launch/error (launch/finish sample 3 " \n"))) "an empty report says nothing")
     (let [r (launch/finish sample 3 "target-exited:0xc0000135")]
-      (is (= [:launch/injector 3] [(:launch/error r) (:code r)]))
+      (is (= [:injector 3] [(::launch/error r) (:code r)]))
       (is (str/starts-with? (:error r) "vfs-injector did not run the target: "))
       (is (str/includes? (:error r) "STATUS_DLL_NOT_FOUND") (:error r))))
   (testing "no code at all: signalled"
     (let [r (launch/finish sample nil nil)]
-      (is (= :launch/signalled (:launch/error r)))
+      (is (= :signalled (::launch/error r)))
       (is (str/includes? (:error r) "/ge/GE-Proton11-6-x86_64/files/bin/wine")))))

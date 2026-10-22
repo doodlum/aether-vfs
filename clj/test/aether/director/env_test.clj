@@ -52,7 +52,14 @@
   (is (nil? (env/encode-roots [])))
   (is (nil? (env/encode-roots {})))
   (is (= "1=C:\\a;2=C:\\b" (env/encode-roots [[1 "C:\\a"] [2 "C:\\b"]])))
-  (is (= "1=C:\\a;2=C:\\b" (env/encode-roots {2 "C:\\b" 1 "C:\\a"})) "a map is sorted by id"))
+  (is (= "1=C:\\a;2=C:\\b" (env/encode-roots {2 "C:\\b" 1 "C:\\a"})) "a map is sorted by id")
+  (is (= "2=C:\\b;1=C:\\a" (env/encode-roots [[2 "C:\\b"] [1 "C:\\a"]])) "pairs keep their order, as Rust's"))
+
+(deftest the-handshake-tables-are-disjoint-and-cover-the-handshake
+  (let [all (concat env/transport env/inject env/config)]
+    (is (= (count all) (count (set all))) "a name is in two tables")
+    (is (every? #(str/starts-with? % "VFS_") all))
+    (is (= 23 (count all)) "vfs-env/src/lib.rs:1121-1154 (handshake::TRANSPORT, INJECT, CONFIG)")))
 
 (deftest a-removed-name-is-cleared-in-every-inherited-spelling-unless-the-launch-sets-it
   ;; vfs-proton launch/mod.rs:765 (clear_env)

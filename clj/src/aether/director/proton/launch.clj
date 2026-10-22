@@ -30,23 +30,22 @@
       ;; and stderr appended to one log file, the notes first; retried on
       ;; ETXTBSY (error=26). Its Launch's await-exit is finish over the wine
       ;; exit code and the injector-error report, then wineserver -w."
-  (:require [clojure.string :as str]))
+  (:require [aether.director.proton.layout :as layout]
+            [aether.director.proton.steam :as steam]
+            [clojure.string :as str]))
 
 (set! *warn-on-reflection* true)
-
-(defn- under [runtime & parts]
-  (str/join "/" (cons (str/replace runtime #"/+$" "") parts)))
 
 (defn wine-binary
   "`wine` inside a GE-Proton runtime: never a host wine on PATH, which is not
   the verified build (launch/mod.rs:308-310)."
   [runtime]
-  (under runtime "files" "bin" "wine"))
+  (layout/join runtime "files" "bin" "wine"))
 
 (defn wineserver-binary
   "`wineserver` inside a GE-Proton runtime (prefix/wineserver.rs:27)."
   [runtime]
-  (under runtime "files" "bin" "wineserver"))
+  (layout/join runtime "files" "bin" "wineserver"))
 
 (defn command-line
   "[program argv] for a launch: wine, then the injector's positional contract
@@ -62,7 +61,7 @@
   anything is spawned (launch/mod.rs:471-496): an arena past ring-bytes, or a
   ring file (`host-length` bytes; nil skips, as does a missing file) shorter
   than ring-bytes. Both attach cleanly and fail only under load. nil when fine;
-  throws {:launch/error :launch/geometry}."
+  throws {::error :geometry}."
   [{:keys [ring-bytes arena-offset arena-len ring-host-path]} host-length]
   (let [need (+ (long arena-offset) (long arena-len))]
     (cond
@@ -70,12 +69,12 @@
       (throw (ex-info (str "ring geometry is inconsistent: arena_offset " arena-offset " + arena_len " arena-len
                            " = " need " exceeds ring_bytes " ring-bytes "; the child would map a view too small "
                            "to hold the arena and fail only under load")
-                      {:launch/error :launch/geometry}))
+                      {::error :geometry}))
       (and host-length (< (long host-length) (long ring-bytes)))
       (throw (ex-info (str "ring geometry is inconsistent: ring file " ring-host-path " is " host-length
                            " bytes but ring_bytes is " ring-bytes "; mapping past the end of a file faults on "
                            "touch rather than failing at map time")
-                      {:launch/error :launch/geometry})))))
+                      {::error :geometry})))))
 
 (defn injector-error-path
   "Where the injector says why it failed: the ready file + .injector-error (launch/injector.rs:7-11)."
@@ -92,7 +91,7 @@
   "The reports beside `ready` a launch deletes before it spawns, since one an
   earlier launch left would be read as this one's (launch/mod.rs:354-363)."
   [ready]
-  [(injector-error-path ready) (str ready ".steam-helper")])
+  [(injector-error-path ready) (steam/helper-report-path ready)])
 
 (defn child-refusals
   "The child-refused file's lines (`<image> <reason>` each), from its text or
@@ -137,20 +136,20 @@
   injector-error report's text (nil when absent) (launch/mod.rs:441-456):
   {:exit code} for the target's own code, any code but 2 and 3; for 2 (bad
   argv) and 3 (injection failed), the injector's, {:error msg :code c
-  :launch/error :launch/injector} when it said why, else :launch/injector-exit.
+  ::error :injector} when it said why, else ::error :injector-exit.
   A target that picks 2 or 3 itself is reported as the injector's: the loud
   mistake, where the quiet one would hide an injection that never happened."
   [{:keys [runtime]} code report]
   (cond
     (nil? code)
-    {:launch/error :launch/signalled :error (str (wine-binary runtime) " exited without a code (signalled)")}
+    {::error :signalled :error (str (wine-binary runtime) " exited without a code (signalled)")}
 
     (not (#{2 3} code)) {:exit code}
 
     (not (str/blank? report))
-    {:launch/error :launch/injector :code code
+    {::error :injector :code code
      :error (str "vfs-injector did not run the target: " (describe-injector-error report))}
 
     :else
-    {:launch/error :launch/injector-exit :code code
+    {::error :injector-exit :code code
      :error (str "vfs-injector exited " code " without running the target (2 = bad argv, 3 = injection failed)")}))

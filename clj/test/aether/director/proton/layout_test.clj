@@ -33,3 +33,15 @@
     (is (= "/u/.local/share/aether-vfs" (layout/home {"HOME" "/u"})))
     (is (= "C:\\Users\\me\\AppData\\Local\\aether-vfs" (layout/home {"LOCALAPPDATA" "C:\\Users\\me\\AppData\\Local"})))
     (is (nil? (layout/home {})))))
+
+(deftest join-drops-trailing-slashes-and-never-doubles-one
+  (is (= "/a/b/c" (layout/join "/a" "b" "c")))
+  (is (= "/a/b" (layout/join "/a//" "b")))
+  (is (= "/a/b/c" (layout/join "/a/" "b/" "c")) "each piece, not just the base")
+  (is (= "/x" (layout/join "/" "x")) "the root keeps its one slash"))
+
+(deftest blank-and-drive-lettered-ids-are-not-plain-components
+  (doseq [evil ["   " "C:" "c:x" "D:\\"]]
+    (is (not (layout/valid-component? evil)) (pr-str evil))
+    (is (refused? layout/try-session-dir evil) (pr-str evil)))
+  (is (layout/valid-component? "GE-Proton11-6")))

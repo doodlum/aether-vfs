@@ -14,8 +14,8 @@
 
     (ring-in-memory! state-dir named)
       ;; ring.rs:101-136. Gathers the inputs (System/getenv, slurp of
-      ;; /proc/self/mountinfo, the canonical runtime and state dirs, the uid as
-      ;; the owner of /proc/self, stat with NOFOLLOW_LINKS), takes
+      ;; /proc/self/mountinfo, canonicalisation, the canonical state dir, the
+      ;; uid as the owner of /proc/self, stat with NOFOLLOW_LINKS), takes
       ;; ring-in-memory's plan, makes each of :dirs 0700 and re-checks it with
       ;; private-dir?, removes any old :file, creates it CREATE_NEW 0600, and
       ;; symlinks `named` to it. Any failure undoes and returns nil: the ring
@@ -26,7 +26,8 @@
 
   The file is sparse, so a nearly full runtime dir can fault on page touch;
   reserving pages needs posix_fallocate (ring.rs:94-99), not done."
-  (:require [clojure.string :as str])
+  (:require [aether.director.proton.layout :as layout]
+            [clojure.string :as str])
   (:import (java.nio.charset StandardCharsets)
            (java.security MessageDigest)))
 
@@ -72,26 +73,30 @@
   DefaultHasher differs, and only has to agree with itself."
   [runtime ^String state-dir]
   (let [h (.digest (MessageDigest/getInstance "SHA-256") (.getBytes state-dir StandardCharsets/UTF_8))]
-    (str (str/replace runtime #"/+$" "") "/aether-vfs/ring-"
-         (apply str (for [i (range 8)] (format "%02x" (bit-and (aget h i) 0xff)))))))
+    (layout/join runtime "aether-vfs"
+                 (apply str "ring-" (for [i (range 8)] (format "%02x" (bit-and (aget h i) 0xff)))))))
 
 (defn ring-in-memory
   "Where the ring should live, given:
-    :xdg-runtime-dir  $XDG_RUNTIME_DIR, canonical (nil when unset)
+    :xdg-runtime-dir  $XDG_RUNTIME_DIR as set, raw (nil when unset)
+    :canonical        path -> its canonical form, or nil when it can't be
+                      resolved (default: the path itself)
     :mountinfo        /proc/self/mountinfo's text
     :uid              this process's uid
-    :stat             path -> stat data (see private-dir?), or nil when absent
+    :stat             path -> stat data, not following links (see
+                      private-dir?), or nil when absent
     :state-dir        the canonical state dir
     :file-name        the ring's name in the state dir (ring.bin)
-  {:dirs [dir…] :file path} when the runtime dir is absolute, in memory and
-  private (ring.rs:105-108): each of :dirs is to be made 0700 and must pass
-  private-dir? once made, and :file is to be created exclusively, 0600. nil
-  when the ring belongs in the state dir."
-  [{:keys [xdg-runtime-dir mountinfo uid stat state-dir file-name]}]
+  {:dirs [dir…] :file path} when the runtime dir is absolute as given, its
+  canonical form is in memory, and it is itself (not a link to) a private
+  dir (ring.rs:57-66, :105-108): each of :dirs is to be made 0700 and must
+  pass private-dir? once made, and :file is to be created exclusively,
+  0600. nil when the ring belongs in the state dir."
+  [{:keys [xdg-runtime-dir canonical mountinfo uid stat state-dir file-name] :or {canonical identity}}]
   (when (and (not (str/blank? xdg-runtime-dir))
              (str/starts-with? xdg-runtime-dir "/")
-             (memory-fs? (or mountinfo "") xdg-runtime-dir)
+             (some->> (canonical xdg-runtime-dir) (memory-fs? (or mountinfo "")))
              (private-dir? (stat xdg-runtime-dir) uid))
     (let [dir (ring-dir xdg-runtime-dir state-dir)]
-      {:dirs [(str (str/replace xdg-runtime-dir #"/+$" "") "/aether-vfs") dir]
-       :file (str dir "/" file-name)})))
+      {:dirs [(layout/join xdg-runtime-dir "aether-vfs") dir]
+       :file (layout/join dir file-name)})))

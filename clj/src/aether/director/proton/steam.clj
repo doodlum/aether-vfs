@@ -13,7 +13,8 @@
 
   The injector writes what it did to <ready>.steam-helper; helper-status reads
   it back and helper-note turns it into the one line a launch says."
-  (:require [clojure.java.io :as io]
+  (:require [aether.director.proton.layout :as layout]
+            [clojure.java.io :as io]
             [clojure.string :as str]))
 
 (set! *warn-on-reflection* true)
@@ -35,7 +36,7 @@
   home (steam.rs:194-198)."
   [home]
   (when-not (str/blank? home)
-    (str (str/replace home #"/+$" "") "/.steam")))
+    (layout/join home ".steam")))
 
 (defn client-pid
   "The client's pid, when `pid-text` (steam.pid's contents, or nil) names a
@@ -120,27 +121,22 @@
     (when (and id (pos? id)) id)))
 
 (defn steam-side
-  "The Steam side of a launch, as data (vfs-embed session/proton/mod.rs:210-252,
-  the env from vfs-proton launch/env.rs:121-142):
+  "The Steam side of a launch, as a decision (vfs-embed
+  session/proton/mod.rs:210-252):
     :prefix-init  :wineboot | {:proton {:steam-client dir :app-id n}}
     :helper?      whether the helper may start (default true)
     :env          the launch's own env, whose SteamAppId stands in for :app-id
     :state-dir    the client's state dir (state-dir), nil without HOME
     :client-pid   (running-client state-dir), nil when none runs
-  => {:mode :untouched|:off|:helper :env {…} :notes [line…]}, and with
-  :helper :app-id, :client and :dll-overrides (helper-override, to merge into
-  WINEDLLOVERRIDES). :client must be absolute: it is sent as is."
+  => {:mode :untouched|:off|:helper :notes [line…]}, and with :helper
+  :app-id and :client. proton.env/launch-env turns it into the env (the
+  :steam of a launch), and is the only thing that does."
   [{:keys [prefix-init helper? env state-dir client-pid] :or {helper? true}}]
-  (let [off (fn [notes] {:mode :off :env {"VFS_INJECT_STEAM_HELPER" "off"} :notes notes})
+  (let [off (fn [notes] {:mode :off :notes notes})
         id  (app-id prefix-init env)]
     (cond
-      (not (map? prefix-init))  {:mode :untouched :env {} :notes []}
+      (not (map? prefix-init))  {:mode :untouched :notes []}
       (not (and helper? id))    (off [])
       (nil? state-dir)          (off ["aether-vfs: HOME is not set, so no Steam client can be found and the program runs without Steam"])
       (nil? client-pid)         (off [(not-running-note state-dir)])
-      :else
-      (let [client (get-in prefix-init [:proton :steam-client])]
-        {:mode :helper :app-id id :client client :dll-overrides helper-override :notes []
-         :env {"SteamAppId" (str id) "SteamGameId" (str id)
-               "STEAM_COMPAT_CLIENT_INSTALL_PATH" client
-               "VFS_INJECT_STEAM_HELPER" helper-command}}))))
+      :else {:mode :helper :app-id id :client (get-in prefix-init [:proton :steam-client]) :notes []})))

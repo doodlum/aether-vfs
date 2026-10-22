@@ -95,19 +95,13 @@
 (def ^:private proton {:proton {:steam-client "/home/u/.local/share/Steam" :app-id 489830}})
 
 (deftest a-prefix-proton-did-not-set-up-is-untouched
-  (is (= {:mode :untouched :env {} :notes []}
+  (is (= {:mode :untouched :notes []}
          (steam/steam-side {:prefix-init :wineboot :state-dir "/home/u/.steam" :client-pid 1}))))
 
 (deftest the-helper-starts-when-there-is-an-app-id-and-a-running-client
-  (let [side (steam/steam-side {:prefix-init proton :state-dir "/home/u/.steam" :client-pid 4242})]
-    (is (= :helper (:mode side)))
-    (is (= 489830 (:app-id side)))
-    (is (= {"SteamAppId" "489830" "SteamGameId" "489830"
-            "STEAM_COMPAT_CLIENT_INSTALL_PATH" "/home/u/.local/share/Steam"
-            "VFS_INJECT_STEAM_HELPER" "C:\\windows\\system32\\steam.exe C:\\windows\\system32\\rundll32.exe"}
-           (:env side)))
-    (is (= "steam.exe=b" (:dll-overrides side)))
-    (is (= [] (:notes side))))
+  (is (= {:mode :helper :app-id 489830 :client "/home/u/.local/share/Steam" :notes []}
+         (steam/steam-side {:prefix-init proton :state-dir "/home/u/.steam" :client-pid 4242}))
+      "the decision only: proton.env/launch-env builds the env from it")
   (testing "the app id may come from the launch's SteamAppId"
     (let [side (steam/steam-side {:prefix-init {:proton {:steam-client "/s"}} :env {"SteamAppId" " 72850 "}
                                   :state-dir "/h/.steam" :client-pid 1})]
@@ -122,7 +116,7 @@
                            ["no client" {:client-pid nil} "/home/u/.steam/steam.pid"]]]
     (let [side (steam/steam-side (merge {:prefix-init proton :state-dir "/home/u/.steam" :client-pid 4242} opts))]
       (is (= :off (:mode side)) why)
-      (is (= {"VFS_INJECT_STEAM_HELPER" "off"} (:env side)) why)
+      (is (= #{:mode :notes} (set (keys side))) why)
       (if note
         (is (and (= 1 (count (:notes side))) (str/includes? (first (:notes side)) note)) why)
         (is (= [] (:notes side)) why)))))

@@ -2,7 +2,8 @@
   "aether.director.proton.prefix: the pure half, ported from vfs-proton's
   prefix/{mod,init,links}.rs tests and vfs-embed's session/proton/mod.rs
   (wine_cwd, link_roots). Every path here is a Linux-shaped string."
-  (:require [aether.director.proton.prefix :as prefix]
+  (:require [aether.director.proton.layout :as layout]
+            [aether.director.proton.prefix :as prefix]
             [clojure.test :refer [deftest is testing]]))
 
 (defn- refusal
@@ -11,11 +12,11 @@
   (try (f) nil (catch clojure.lang.ExceptionInfo e (assoc (ex-data e) :message (ex-message e)))))
 
 (deftest prefix-dir-follows-the-init
-  (is (= "/home/x/sessions/s/prefix" (prefix/prefix-dir "/home/x/sessions" "s" :wineboot)))
+  (is (= "/home/x/sessions/s/prefix" (prefix/prefix-dir "/home/x" "s" :wineboot)))
   (is (= "/home/x/sessions/s/compat/pfx"
-         (prefix/prefix-dir "/home/x/sessions/" "s" {:proton {:steam-client "/steam"}})))
-  (doseq [bad ["../x" "" "a/b" "a\\b" ".." "/abs"]]
-    (is (= :prefix/bad-session (:prefix/error (refusal #(prefix/prefix-dir "/home/x/sessions" bad :wineboot))))
+         (prefix/prefix-dir "/home/x/" "s" {:proton {:steam-client "/steam"}})))
+  (doseq [bad ["../x" "" " " "a/b" "a\\b" ".." "/abs" "C:x" nil]]
+    (is (= :invalid-tag (::layout/error (refusal #(prefix/prefix-dir "/home/x" bad :wineboot))))
         (pr-str bad))))
 
 (deftest initialised-means-system32-exists
@@ -65,7 +66,7 @@
   (is (= ["Games" "Fixture"] (prefix/parse-location "c:/Games/./Fixture/")))
   (doseq [bad ["D:\\Games" "C:\\a\\..\\b" "C:\\" "C:" "Games" "/srv/x" "\\\\srv\\share\\x" ""]]
     (let [r (refusal #(prefix/parse-location bad))]
-      (is (= :prefix/bad-location (:prefix/error r)) (pr-str bad))
+      (is (= :bad-location (::prefix/error r)) (pr-str bad))
       (is (= bad (:location r)))
       (is (.startsWith ^String (:message r) (str "bad root location " bad ":")) (:message r)))))
 
@@ -75,14 +76,23 @@
   (is (= "C:" (prefix/windows-path "/p" "/p/drive_c")))
   (is (nil? (prefix/windows-path "/p" "/etc/passwd")) "outside the prefix there is no C: form")
   (is (nil? (prefix/windows-path "/p" "/p/drive_c2/x")) "a sibling spelled alike is not under drive_c")
-  (is (nil? (prefix/windows-path "/p" "/p/drive_c/a/../b")) "never normalized into a C: form"))
+  (is (nil? (prefix/windows-path "/p" "/p/drive_c/a/../b")) "never normalized into a C: form")
+  (is (= "C:\\Games\\g.exe" (prefix/windows-path "/p//q" "/p/q/drive_c/Games/g.exe"))
+      "a doubled separator in the prefix is dropped too")
+  (is (= "C:\\Games" (prefix/windows-path "/p/q" "/p//q/drive_c/Games"))))
+
+(deftest a-root-without-a-backing-is-refused
+  (doseq [r [{:id 3 :location "C:\\Saves"} {:id 3 :location "C:\\Saves" :backing ""}]]
+    (let [e (refusal #(prefix/link-plan "/p" [r] {} #{}))]
+      (is (= [:no-backing 3] [(::prefix/error e) (:root e)]) (pr-str r))
+      (is (= "root 3 has no backing directory" (:message e))))))
 
 (deftest join-wine-appends-plain-components-and-refuses-the-rest
   (is (= "C:\\vfs-session\\state\\ring.bin" (prefix/join-wine "C:\\vfs-session\\state" "ring.bin")))
   (is (= "C:\\s\\a\\b" (prefix/join-wine "C:\\s" "a/./b/")))
   (is (= "C:\\s" (prefix/join-wine "C:\\s" "")))
   (doseq [bad ["../x" "a/../b" "/abs" "./a" "C:/x" "\\x"]]
-    (is (= :prefix/bad-join (:prefix/error (refusal #(prefix/join-wine "C:\\s" bad)))) (pr-str bad))))
+    (is (= :bad-join (::prefix/error (refusal #(prefix/join-wine "C:\\s" bad)))) (pr-str bad))))
 
 (deftest wine-cwd-defaults-to-the-image-directory
   (is (= "C:\\G\\bin" (prefix/wine-cwd nil "C:\\G" "C:\\G\\bin\\x.exe")))
@@ -98,7 +108,7 @@
 (deftest wine-cwd-refuses-empty-and-dot-dot
   (doseq [bad ["" "  " "..\\x" "C:\\G\\..\\Windows"]]
     (let [r (refusal #(prefix/wine-cwd bad "C:\\G" "C:\\G\\a.exe"))]
-      (is (= :prefix/bad-cwd (:prefix/error r)) (pr-str bad))
+      (is (= :bad-cwd (::prefix/error r)) (pr-str bad))
       (is (.contains ^String (:message r) "cwd")))))
 
 ;; --- link-plan ------------------------------------------------------------
@@ -141,21 +151,21 @@
                           [{drive-c {"Games" :dir} "/p/drive_c/Games" {"Mine" :dir}} "a directory"]
                           [{drive-c {"Games" :dir} "/p/drive_c/Games" {"Mine" :file}} "a file"]]]
     (let [r (refusal #(prefix/link-plan "/p" [{:id 1 :location "C:\\Games\\Mine" :backing "/b"}] listing #{}))]
-      (is (= :prefix/bad-location (:prefix/error r)) what)
+      (is (= :bad-location (::prefix/error r)) what)
       (is (.contains ^String (:message r) "real file or directory") (:message r))
       (is (.startsWith ^String (:message r) "root 1: bad root location C:\\Games\\Mine") (:message r)))))
 
 (deftest link-plan-refuses-a-symlink-it-did-not-create
   (let [r (refusal #(prefix/link-plan "/p" [{:id 1 :location "C:\\Games\\Skyrim" :backing "/b"}]
                                       {drive-c {"Games" :dir} "/p/drive_c/Games" {"Skyrim" :symlink}} #{}))]
-    (is (= :prefix/bad-location (:prefix/error r)))
+    (is (= :bad-location (::prefix/error r)))
     (is (.contains ^String (:message r) "did not create") (:message r))
     (is (.contains ^String (:message r) "/p/.aether-vfs-links") "names the manifest")))
 
 (deftest link-plan-refuses-bad-locations-by-root
   (doseq [bad ["D:\\Games" "C:\\a\\..\\b" "C:\\" "Games" "\\\\srv\\share\\x"]]
     (let [r (refusal #(prefix/link-plan "/p" [{:id 3 :location bad :backing "/b"}] {} #{}))]
-      (is (= :prefix/bad-location (:prefix/error r)) bad)
+      (is (= :bad-location (::prefix/error r)) bad)
       (is (= 3 (:root r))))))
 
 (deftest nested-roots-link-inside-the-outer-backing-dir-in-either-order
@@ -175,8 +185,8 @@
       (is (= "/p/drive_c/G/data/Saves" (:link (second plan))))
       (is (= [] (:mkdirs (second plan))))))
   (testing "a real directory in the outer backing dir is refused through the link"
-    (is (= :prefix/bad-location
-           (:prefix/error (refusal #(prefix/link-plan "/p" [{:id 2 :location "C:\\G" :backing "/s/roots/2"}
+    (is (= :bad-location
+           (::prefix/error (refusal #(prefix/link-plan "/p" [{:id 2 :location "C:\\G" :backing "/s/roots/2"}
                                                                {:id 1 :location "C:\\G\\Saves" :backing "/s/roots/1"}]
                                                       {"/s/roots/2" {"saves" :dir}} #{})))))))
 

@@ -14,40 +14,24 @@
     :registry?     a registry layer is served
     :cwd           the target's working directory as it sees it (C:\\…)
     :ready-timeout-secs  how long the injector waits for the shim
-    :steam         nil (untouched), :steam/off, or {:app-id n :client dir}
+    :steam         nil (untouched), or proton.steam/steam-side's decision:
+                   {:mode :untouched|:off|:helper :app-id n :client dir}
     :extra-env     the host's own variables for the child
 
   and the host is {:env {name value} :cwd dir}: this process's environment
   (cleaned of an AppImage's additions here, as hostenv.rs's var_os does) and
   working directory. Linux paths are strings throughout.
 
-  The handshake tables mirror vfs-env/src/lib.rs's handshake module
-  (lib.rs:1115-1165) until the director has one shared copy."
-  (:require [aether.director.proton.hostenv :as hostenv]
+  The handshake names and tables are aether.director.env's; the Steam
+  constants are proton.steam's. This is the one builder of the env."
+  (:require [aether.director.env :as henv]
+            [aether.director.proton.hostenv :as hostenv]
             [aether.director.proton.layout :as layout]
             [aether.director.proton.runtime :as runtime]
+            [aether.director.proton.steam :as steam]
             [clojure.string :as str]))
 
 (set! *warn-on-reflection* true)
-
-(def transport
-  "The names a launch sets or clears every time, so a value inherited from an
-  earlier session never reaches the child (handshake::TRANSPORT,
-  vfs-env/src/lib.rs:1121-1135)."
-  ["VFS_RING_PATH" "VFS_RING_SECTION" "VFS_RING_BYTES" "VFS_RING_PAYLOAD_CAP" "VFS_ARENA_OFFSET"
-   "VFS_ARENA_LEN" "VFS_SERVER_EV" "VFS_CLIENT_EV" "VFS_FUSE_CFG" "VFS_VIRTUAL_DIR" "VFS_VIRTUAL_ROOTS"
-   "VFS_ROOT_BACKINGS" "VFS_REGISTRY"])
-
-(def inject
-  "The names only the injector reads; a Wine launch sets or clears them like
-  transport (handshake::INJECT, vfs-env/src/lib.rs:1140)."
-  ["VFS_INJECT_CWD" "VFS_INJECT_STEAM_HELPER"])
-
-(def config
-  "The other handshake names: a launch doesn't set them, and extra-env may not
-  either (handshake::CONFIG, vfs-env/src/lib.rs:1145-1154)."
-  ["VFS_STATE_DIR" "VFS_HOME" "VFS_LAUNCH_IMAGE" "VFS_DISCOVERY_PATH" "VFS_SHIM_CONFIG" "VFS_SHIM_READY"
-   "VFS_CHILD_REFUSED_LOG" "VFS_FORCE_INJECTION"])
 
 (defn- ascii-lower
   "`s` with only A-Z lower-cased, as Rust's to_ascii_lowercase: Wine compares
@@ -59,26 +43,12 @@
       (let [c (aget cs i)] (when (<= (int \A) (int c) (int \Z)) (aset cs i (char (+ (int c) 32))))))
     (String. cs)))
 
-(def ^:private reserved-folded
-  (into #{} (map ascii-lower) (concat ["WINEPREFIX" "PROTONPATH"] transport inject config)))
-
 (def base-dll-overrides
   "WINEDLLOVERRIDES every launch carries: Mono's and Gecko's install prompts
   would otherwise block a launch on a fresh prefix (env.rs:12)."
   "mscoree=d;mshtml=d")
 
 (def default-winedebug "WINEDEBUG unless the host sets its own (env.rs:15)." "-all")
-
-(def steam-helper
-  "The command line that starts Proton's Steam helper: the helper, and a
-  program for it to run, without which it does no setup (STEAM_HELPER,
-  vfs-proton/src/steam.rs:77)."
-  "C:\\windows\\system32\\steam.exe C:\\windows\\system32\\rundll32.exe")
-
-(def steam-helper-override
-  "The override Proton sets so steam.exe is its builtin helper
-  (STEAM_HELPER_OVERRIDE, vfs-proton/src/steam.rs:81)."
-  "steam.exe=b")
 
 (def proton-graphics-overrides
   "What Proton itself sets to run a game on DXVK and vkd3d-proton, for a host
@@ -103,8 +73,11 @@
   may not: WINEPREFIX, PROTONPATH and every handshake name. ASCII
   case-insensitive, because Wine's environment is: vfs_virtual_dir reaches
   the shim as VFS_VIRTUAL_DIR (is_reserved_env, env.rs:191-196)."
-  [name]
-  (contains? reserved-folded (ascii-lower name)))
+  [^String name]
+  ;; ASCII folding, not equalsIgnoreCase (henv/handshake?), which would also
+  ;; fold the Kelvin sign to k
+  (let [n (ascii-lower name)]
+    (boolean (some #(= n (ascii-lower %)) (list* "WINEPREFIX" "PROTONPATH" (henv/handshake-names))))))
 
 (defn check-extra-env
   "nil, or an ex-info (::error :reserved-env, :name) for the first reserved
@@ -141,14 +114,6 @@
   [dlls]
   (str/join ";" (for [d dlls] (str (str/replace (ascii-lower d) #"\.dll$" "") "=n,b"))))
 
-(defn encode-roots
-  "VFS_VIRTUAL_ROOTS's id=location;id=location, or nil for no roots (the
-  variable is then unset, not empty) (handshake::encode_roots,
-  vfs-env/src/lib.rs:1182-1193). A map goes in id order."
-  [roots]
-  (when (seq roots)
-    (str/join ";" (for [[id at] (if (map? roots) (sort roots) roots)] (str id "=" at)))))
-
 (defn absolute
   "`p`, a Linux path, made absolute against `cwd` (unchanged if already, or
   with no cwd). Not canonicalized: the dir needn't exist yet, and resolving
@@ -184,11 +149,16 @@
     Wine event can't wake a Linux director.
   - The injector's VFS_INJECT_CWD and VFS_READY_TIMEOUT_SECS (at least 1, and
     over extra-env's).
-  - Steam, helper mode: SteamAppId, SteamGameId,
-    STEAM_COMPAT_CLIENT_INSTALL_PATH and VFS_INJECT_STEAM_HELPER; :steam/off:
-    VFS_INJECT_STEAM_HELPER=off only.
+  - Steam, by `:steam`'s :mode. :helper: SteamAppId, SteamGameId,
+    STEAM_COMPAT_CLIENT_INSTALL_PATH (absolute) and VFS_INJECT_STEAM_HELPER;
+    :off: VFS_INJECT_STEAM_HELPER=off only; :untouched or nil: nothing.
   - extra-env over all that, apart from reserved names (check-extra-env
     refuses those before a spawn; here they are skipped).
+
+  What the launch leaves out, it clears: (henv/stale env) names the
+  inherited transport and inject names to remove. That includes
+  VFS_REGISTRY, so a host that has it set can't turn the registry hooks on
+  for a launch with no registry (stale_env, env.rs:245-247).
 
   NVAPI's additions (env.rs:82-93) are not here yet: spec task 14."
   [{:keys [runtime prefix ring-path ring-bytes arena-offset arena-len payload-cap virtual-dir
@@ -197,35 +167,35 @@
   (let [host-env  (or host-env {})
         host-cwd  (or host-cwd (System/getProperty "user.dir"))
         rt        (absolute runtime host-cwd)
-        helper?   (map? steam)
-        overrides (cond-> base-dll-overrides helper? (merge-dll-overrides steam-helper-override))
-        roots     (encode-roots virtual-roots)]
+        mode      (:mode steam)
+        overrides (cond-> base-dll-overrides (= :helper mode) (merge-dll-overrides steam/helper-override))
+        roots     (henv/encode-roots virtual-roots)]
     (as-> (sorted-map "WINEPREFIX"           (str prefix)
                       "PROTONPATH"           rt
                       "WINEDLLOVERRIDES"     overrides
                       "WINEDEBUG"            default-winedebug
-                      "VFS_RING_PATH"        (str ring-path)
-                      "VFS_RING_BYTES"       (str ring-bytes)
-                      "VFS_RING_PAYLOAD_CAP" (str payload-cap)
-                      "VFS_ARENA_OFFSET"     (str arena-offset)
-                      "VFS_ARENA_LEN"        (str arena-len)
-                      "VFS_VIRTUAL_DIR"      (str virtual-dir)) env
+                      henv/ring-path         (str ring-path)
+                      henv/ring-bytes        (str ring-bytes)
+                      henv/ring-payload-cap  (str payload-cap)
+                      henv/arena-offset      (str arena-offset)
+                      henv/arena-len         (str arena-len)
+                      henv/virtual-dir       (str virtual-dir)) env
       (merge env (runtime/runtime-lib-env rt
                                           (caller-then-host extra-env host-env "LD_LIBRARY_PATH")
                                           (hostenv/inherited host-env "ORIG_LD_LIBRARY_PATH")
                                           (caller-then-host extra-env host-env "WINEDLLPATH")))
       (cond-> env
-        roots     (assoc "VFS_VIRTUAL_ROOTS" roots)
-        registry? (assoc "VFS_REGISTRY" "1")
-        cwd       (assoc "VFS_INJECT_CWD" (str cwd)))
-      (cond
-        (= :steam/off steam) (assoc env "VFS_INJECT_STEAM_HELPER" "off")
-        helper?              (assoc env
-                                    "SteamAppId" (str (:app-id steam))
-                                    "SteamGameId" (str (:app-id steam))
-                                    "STEAM_COMPAT_CLIENT_INSTALL_PATH" (absolute (str (:client steam)) host-cwd)
-                                    "VFS_INJECT_STEAM_HELPER" steam-helper)
-        :else                env)
+        roots     (assoc henv/virtual-roots roots)
+        registry? (assoc henv/registry "1")
+        cwd       (assoc henv/inject-cwd (str cwd)))
+      (case mode
+        :off    (assoc env henv/inject-steam-helper "off")
+        :helper (assoc env
+                       "SteamAppId" (str (:app-id steam))
+                       "SteamGameId" (str (:app-id steam))
+                       "STEAM_COMPAT_CLIENT_INSTALL_PATH" (absolute (str (:client steam)) host-cwd)
+                       henv/inject-steam-helper steam/helper-command)
+        (:untouched nil) env)
       (reduce-kv (fn [env k v]
                    (cond (reserved? k) env
                          (#{"LD_LIBRARY_PATH" "WINEDLLPATH"} k) env
@@ -234,12 +204,3 @@
                  env (or extra-env {}))
       (cond-> env
         ready-timeout-secs (assoc "VFS_READY_TIMEOUT_SECS" (str (max 1 (long ready-timeout-secs))))))))
-
-(defn stale
-  "The inherited names a launch with environment `env` clears in the child
-  because it didn't set them: every transport and inject name not in `env`.
-  That includes VFS_REGISTRY, so a host that has it set can't turn the
-  registry hooks on for a launch with no registry (stale_env, env.rs:245-247;
-  handshake::stale, vfs-env/src/lib.rs:1170-1178)."
-  [env]
-  (remove #(contains? env %) (concat transport inject)))

@@ -88,11 +88,13 @@
     (filterv want? inherited)))
 
 (defn encode-roots
-  "VFS_VIRTUAL_ROOTS: `id=location;…` for `roots` ({id location} or [[id
-  location] …], ids ascending), or nil for none."
+  "VFS_VIRTUAL_ROOTS: `id=location;…` for `roots`, or nil for none (the
+  variable is then unset, not empty) (handshake::encode_roots,
+  vfs-env/src/lib.rs:1182-1193). [[id location] …] keeps its order, as Rust
+  does; a map {id location} goes in id order."
   [roots]
   (when (seq roots)
-    (str/join ";" (for [[id at] (sort-by first roots)] (str id "=" at)))))
+    (str/join ";" (for [[id at] (if (map? roots) (sort roots) roots)] (str id "=" at)))))
 
 ;; --- the transport's env ---------------------------------------------------------
 

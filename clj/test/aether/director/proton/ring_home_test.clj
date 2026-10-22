@@ -67,3 +67,24 @@
   (testing "not private: XDG_RUNTIME_DIR=/tmp style"
     (is (nil? (home/ring-in-memory (assoc-in private-runtime [:stat "/run/user/1000" :mode] 01777))))
     (is (nil? (home/ring-in-memory (assoc-in private-runtime [:stat "/run/user/1000" :uid] 0))))))
+
+(deftest the-runtime-dir-is-checked-as-set-not-as-resolved
+  (testing "a link to a private tmpfs dir is refused: stat is of the raw path, not followed (ring.rs:57-66)"
+    (is (nil? (home/ring-in-memory (assoc private-runtime
+                                          :xdg-runtime-dir "/home/me/rt"
+                                          :canonical {"/home/me/rt" "/run/user/1000"}
+                                          :stat {"/home/me/rt" {:dir? false :symlink? true :uid 1000 :mode 0777}
+                                                 "/run/user/1000" {:dir? true :symlink? false :uid 1000 :mode 0700}})))))
+  (testing "a relative one is refused even when it resolves to an absolute dir (ring.rs:105)"
+    (is (nil? (home/ring-in-memory (assoc private-runtime :xdg-runtime-dir "run/user/1000"
+                                          :canonical {"run/user/1000" "/run/user/1000"}
+                                          :stat {"run/user/1000" {:dir? true :symlink? false :uid 1000 :mode 0700}})))))
+  (testing "the mount table is consulted for the canonical form; the ring's dirs are named from the raw one"
+    (let [raw  "/run/user//1000"
+          plan (home/ring-in-memory (assoc private-runtime :xdg-runtime-dir raw
+                                           :canonical {raw "/run/user/1000"}
+                                           :stat {raw {:dir? true :symlink? false :uid 1000 :mode 0700}}))]
+      (is (= (str raw "/aether-vfs") (first (:dirs plan))))
+      (is (nil? (home/ring-in-memory (assoc private-runtime :xdg-runtime-dir raw :canonical (constantly nil)
+                                            :stat {raw {:dir? true :symlink? false :uid 1000 :mode 0700}})))
+          "an unresolvable dir is not in memory"))))

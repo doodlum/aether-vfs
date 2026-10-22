@@ -1,7 +1,9 @@
 (ns aether.director.proton.env-test
   "vfs-proton/src/launch/env.rs's tests (env.rs:249-610): a Wine launch's
   environment, built from plain data."
-  (:require [aether.director.proton.env :as env]
+  (:require [aether.director.env :as henv]
+            [aether.director.proton.env :as env]
+            [aether.director.proton.steam :as steam]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]))
 
@@ -53,16 +55,16 @@
     (is (= "1=C:\\users\\steamuser\\Saves;2=C:\\x" ((launch-env l) "VFS_VIRTUAL_ROOTS"))))
   (is (= "1=C:\\a;2=C:\\b" ((launch-env (assoc (sample) :virtual-roots {2 "C:\\b" 1 "C:\\a"})) "VFS_VIRTUAL_ROOTS"))
       "a map goes in id order")
-  (is (nil? (env/encode-roots [])))
-  (is (= "1=C:\\a;2=C:\\b" (env/encode-roots [[1 "C:\\a"] [2 "C:\\b"]]))))
+  (is (= "2=C:\\b;1=C:\\a" ((launch-env (assoc (sample) :virtual-roots [[2 "C:\\b"] [1 "C:\\a"]])) "VFS_VIRTUAL_ROOTS"))
+      "pairs keep their order (henv/encode-roots, as Rust's)"))
 
 (deftest an-inherited-registry-flag-is-cleared-unless-the-launch-sets-it
-  (is (some #{"VFS_REGISTRY"} (env/stale (launch-env (sample)))))
-  (is (not (some #{"VFS_REGISTRY"} (env/stale (launch-env (assoc (sample) :registry? true)))))))
+  (is (some #{"VFS_REGISTRY"} (henv/stale (launch-env (sample)))))
+  (is (not (some #{"VFS_REGISTRY"} (henv/stale (launch-env (assoc (sample) :registry? true)))))))
 
 (deftest every-transport-name-the-launch-does-not-set-is-cleared
-  (let [e (launch-env (sample)) stale (set (env/stale e))]
-    (doseq [n (concat env/transport env/inject)]
+  (let [e (launch-env (sample)) stale (set (henv/stale e))]
+    (doseq [n (concat henv/transport henv/inject)]
       (is (not= (contains? e n) (contains? stale n)) (str n " must be exactly one of set or cleared")))
     (is (stale "VFS_FUSE_CFG") "VFS_FUSE_CFG was missing from the old list")))
 
@@ -149,14 +151,8 @@
   (is (= "/ge/probe-prefix" ((launch-env (assoc (sample) :extra-env {"WINEPREFIX" "/evil"})) "WINEPREFIX"))
       "launch-env never lets one through, though check-extra-env is what refuses it"))
 
-(deftest the-handshake-tables-are-disjoint-and-cover-the-handshake
-  (let [all (concat env/transport env/inject env/config)]
-    (is (= (count all) (count (set all))) "a name is in two tables")
-    (is (every? #(str/starts-with? % "VFS_") all))
-    (is (= 23 (count all)) "vfs-env/src/lib.rs:1121-1154 (handshake::TRANSPORT, INJECT, CONFIG)")))
-
 (defn- steam-sample []
-  (assoc (sample) :prefix "/ge/compat/pfx" :steam {:app-id 489830 :client "/ge/Steam"}))
+  (assoc (sample) :prefix "/ge/compat/pfx" :steam {:mode :helper :app-id 489830 :client "/ge/Steam"}))
 
 (deftest a-steam-launch-carries-the-helper-and-what-steams-launcher-sets
   (let [e (launch-env (steam-sample))]
@@ -173,7 +169,7 @@
       "absolutized"))
 
 (deftest with-the-helper-off-the-injector-is-only-asked-to-clear-the-stale-pid
-  (let [e (launch-env (assoc (sample) :steam :steam/off))]
+  (let [e (launch-env (assoc (sample) :steam {:mode :off :notes []}))]
     (is (= "off" (e "VFS_INJECT_STEAM_HELPER")))
     (is (= env/base-dll-overrides (e "WINEDLLOVERRIDES")))
     (doseq [n ["SteamAppId" "SteamGameId" "STEAM_COMPAT_CLIENT_INSTALL_PATH"]]
@@ -208,3 +204,13 @@
 
 (deftest the-dxvk-overrides-are-protons-own
   (is (= "d3d11=n;d3d10core=n;d3d9=n;dxgi=n;d3d8=n;d3d12=n;d3d12core=n" env/proton-graphics-overrides)))
+
+(deftest steam-sides-decision-is-what-the-env-is-built-from
+  (let [side (steam/steam-side {:prefix-init {:proton {:steam-client "/ge/Steam" :app-id 489830}}
+                                :state-dir "/home/u/.steam" :client-pid 7})
+        e    (launch-env (assoc (sample) :steam side))]
+    (is (= "489830" (e "SteamAppId")))
+    (is (= steam/helper-command (e "VFS_INJECT_STEAM_HELPER")))
+    (is (= "mscoree=d;mshtml=d;steam.exe=b" (e "WINEDLLOVERRIDES"))))
+  (is (= (launch-env (sample)) (launch-env (assoc (sample) :steam {:mode :untouched :notes []})))
+      "untouched is no Steam at all"))

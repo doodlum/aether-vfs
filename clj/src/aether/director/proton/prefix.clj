@@ -25,7 +25,7 @@
       ;; => the prefix dir
     (lock! prefix-dir)
       ;; prefix/mod.rs:126-154. An exclusive lock on <prefix>/.aether-vfs.lock,
-      ;; retried for 500 ms, then {:prefix/error :prefix/busy}. FileChannel
+      ;; retried for 500 ms, then {::error :busy}. FileChannel
       ;; locks are fcntl, not flock, and per JVM: keep an in-JVM registry too.
     (link! prefix-dir step)
       ;; prefix/links.rs:124-175, one link-plan step: mkdirs, create the
@@ -41,7 +41,8 @@
     (wineserver-wait runtime prefix-dir)
       ;; prefix/wineserver.rs:61-69. `wineserver -w`, unbounded: a Process that
       ;; ends when nothing runs in the prefix any more."
-  (:require [clojure.string :as str]))
+  (:require [aether.director.proton.layout :as layout :refer [join]]
+            [clojure.string :as str]))
 
 (set! *warn-on-reflection* true)
 
@@ -58,32 +59,18 @@
   "aether-proton-init.log")
 
 (defn- fail [kind msg data]
-  (throw (ex-info msg (assoc data :prefix/error kind))))
-
-(defn- join
-  "`base` and `parts` joined with /, `base`'s trailing slashes dropped."
-  [base & parts]
-  (str/join "/" (cons (str/replace base #"/+$" "") parts)))
-
-(defn- plain-component?
-  "One path component that cannot leave its parent: not empty, absolute, or
-  holding a separator or `..` (layout.rs:107-117)."
-  [^String s]
-  (not (or (str/blank? s) (str/includes? s "/") (str/includes? s "\\") (str/includes? s "..")
-           (re-find #"^[A-Za-z]:" s))))
+  (throw (ex-info msg (assoc data ::error kind))))
 
 (defn prefix-dir
-  "Where `session`'s prefix lives under `sessions` (the home's sessions/ dir)
-  for `init`, without creating anything: <session>/prefix for :wineboot,
-  <session>/compat/pfx for {:proton …} (prefix/init.rs:81-89). `session`
-  must be one plain component."
-  [sessions session init]
-  (when-not (plain-component? session)
-    (fail :prefix/bad-session (str "session id " (pr-str session) " must be one plain path component")
-          {:session session}))
-  (if (= :wineboot init)
-    (join sessions session "prefix")
-    (join sessions session "compat" "pfx")))
+  "Where `session`'s prefix lives under `home` for `init`, without creating
+  anything: <home>/sessions/<session>/prefix for :wineboot, …/compat/pfx for
+  {:proton …} (prefix/init.rs:81-89). `session` must be one plain component
+  (layout/try-session-dir; else ::layout/error :invalid-tag)."
+  [home session init]
+  (let [dir (layout/try-session-dir home session)]
+    (if (= :wineboot init)
+      (join dir "prefix")
+      (join dir "compat" "pfx"))))
 
 (defn initialised?
   "Whether `prefix` has been set up: drive_c/windows/system32 is a directory
@@ -133,7 +120,7 @@
 ;; --- path forms -------------------------------------------------------------
 
 (defn- bad-location [location why & [data]]
-  (fail :prefix/bad-location (str "bad root location " location ": " why) (assoc data :location location)))
+  (fail :bad-location (str "bad root location " location ": " why) (assoc data :location location)))
 
 (defn parse-location
   "A root location (C:\\…, either separator, either case of c) as the
@@ -155,7 +142,7 @@
   else, which has no C: form and must not be given one (prefix/mod.rs:164-177).
   Repeated separators and `.` are dropped; `..` is nil."
   [prefix host]
-  (let [drive-c (join prefix "drive_c")
+  (let [drive-c (str/replace (join prefix "drive_c") #"/+" "/")
         host    (str/replace host #"/+" "/")]
     (when (or (= host drive-c) (str/starts-with? host (str drive-c "/")))
       (let [comps (remove #{"" "."} (str/split (subs host (count drive-c)) #"/"))]
@@ -169,7 +156,7 @@
   the name the child opens, and normalizing would point it somewhere nobody
   asked for. Interior `.` and empty components are dropped, as Path does."
   [base rel]
-  (let [refuse (fn [what] (fail :prefix/bad-join (str rel " cannot be named under " base ": " what
+  (let [refuse (fn [what] (fail :bad-join (str rel " cannot be named under " base ": " what
                                                       " is not a plain path component")
                                 {:base base :rel rel}))
         parts  (str/split rel #"[/\\]")]
@@ -207,10 +194,10 @@
             :else                                (subs target 0 i)))
 
     (str/blank? requested)
-    (fail :prefix/bad-cwd "cwd is empty: leave it unset for the image's own directory" {:cwd requested})
+    (fail :bad-cwd "cwd is empty: leave it unset for the image's own directory" {:cwd requested})
 
     (some #{".."} (str/split requested #"[\\/]"))
-    (fail :prefix/bad-cwd (str "cwd " (pr-str requested) " contains '..'; name the directory directly")
+    (fail :bad-cwd (str "cwd " (pr-str requested) " contains '..'; name the directory directly")
           {:cwd requested})
 
     (windows-absolute? requested) requested
@@ -247,11 +234,13 @@
   "One root's step (prefix/links.rs:124-175) against the simulated `state`:
   [step state']."
   [prefix {:keys [entries links manifest]} {:keys [id location backing] :as root}]
+  (when (str/blank? backing)
+    (fail :no-backing (str "root " id " has no backing directory") {:root id :location location}))
   (let [comps     (try (parse-location location)
                        (catch clojure.lang.ExceptionInfo e
                          (throw (ex-info (str "root " id ": " (ex-message e)) (assoc (ex-data e) :root id)))))
         listed    (fn [entries dir] (get entries (resolve-links links dir) {}))
-        refuse    (fn [why] (fail :prefix/bad-location (str "root " id ": bad root location " location ": " why)
+        refuse    (fn [why] (fail :bad-location (str "root " id ": bad root location " location ": " why)
                                   {:location location :root id}))
         [parent mkdirs entries]
         (reduce (fn [[parent mkdirs entries] c]
@@ -293,7 +282,8 @@
   26-44), and only missing parents are created, in the declared spelling.
   `manifest` is the set of link paths link-manifest lists: only those are
   replaced. A real file or directory, or a symlink not listed, at a location
-  is refused ({:prefix/error :prefix/bad-location :root id})."
+  is refused ({::error :bad-location :root id}), as is a root with no
+  :backing ({::error :no-backing})."
   [prefix roots listing manifest]
   (let [depth #(count (remove str/blank? (str/split % #"[\\/]")))]
     (first (reduce (fn [[steps state] root]

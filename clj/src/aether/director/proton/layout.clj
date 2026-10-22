@@ -9,7 +9,10 @@
   paths, joined with /, and never java.nio.file.Path (a Linux path isn't
   absolute on Windows). Tags and session ids reach here from a GitHub release
   name or a caller, so the try- functions refuse one that could leave its
-  parent directory.")
+  parent directory.
+
+  join is the one way the Proton namespaces join a Linux path."
+  (:require [clojure.string :as str]))
 
 (set! *warn-on-reflection* true)
 
@@ -26,9 +29,10 @@
           (v "LOCALAPPDATA")  (str (v "LOCALAPPDATA") "\\aether-vfs"))))
 
 (defn join
-  "`base` and `parts` joined with /, without doubling a / that ends `base`."
+  "`base` and `parts` joined with /, each piece's trailing slashes dropped
+  first, so none is doubled (\"/\" joins as \"/x\")."
   [base & parts]
-  (reduce (fn [^String a p] (if (.endsWith a "/") (str a p) (str a "/" p))) (str base) parts))
+  (reduce (fn [a p] (str (str/replace a #"/+$" "") "/" p)) (str base) parts))
 
 (defn runtimes  "<home>/runtimes (layout.rs:60-62)."  [home] (join home "runtimes"))
 (defn downloads "<home>/downloads (layout.rs:65-67)." [home] (join home "downloads"))
@@ -41,11 +45,11 @@
   (join (runtimes home) tag))
 
 (defn valid-component?
-  "Whether `s` is one plain path component: not empty, no / or \\, no .., not
-  absolute (validate_component, layout.rs:107-117)."
+  "Whether `s` is one plain path component: not blank, no / or \\, no .., not
+  absolute and not drive-lettered (validate_component, layout.rs:107-117)."
   [s]
-  (and (string? s) (seq s)
-       (not (re-find #"[/\\]|\.\." s))))
+  (boolean (and (string? s) (not (str/blank? s))
+                (not (re-find #"[/\\]|\.\.|^[A-Za-z]:" s)))))
 
 (defn- check [s]
   (when-not (valid-component? s)
