@@ -1,7 +1,8 @@
 (ns aether.director.ring
-  "The director's ring server: a named shared section holding the control ring
-  and bulk arena (aether.director.proto), served by worker threads over one
-  provider per root (aether.director.provider).
+  "The director's ring server: shared memory (a named section or a file,
+  aether.director.ring.backing) holding the control ring and bulk arena
+  (aether.director.proto), served by worker threads over one provider per
+  root (aether.director.provider).
 
   A worker scans the slots for SUBMITTED, takes one with a CAS to PROCESSING,
   reads the request in place, writes the reply over it, and completes it with
@@ -10,12 +11,15 @@
 
   Waking is an aether.director.Waker: EventWaker matches vfs-win's
   EventNotifier (a worker that served a request in the last `spin-us` spins;
-  otherwise it waits on the server event for 1 ms)."
+  otherwise it waits on the server event for 1 ms); a file ring's ParkWaker
+  spins likewise, then parks, as vfs-ipc's AdaptiveNotifier."
   (:require [aether.director.path :as path]
+            [aether.director.platform :as platform]
             [aether.director.proto :as p]
             [aether.director.provider :as prov]
-            [aether.director.registry :as registry])
-  (:import (aether.director EventWaker Guard Native Native$Section Waker)
+            [aether.director.registry :as registry]
+            [aether.director.ring.backing :as backing])
+  (:import (aether.director Guard Native Waker)
            (aether.director.provider Stat)
            (java.io ByteArrayOutputStream)
            (java.lang.foreign Arena MemorySegment ValueLayout)
@@ -529,10 +533,16 @@
       {:requests (aget sent 0) :ms (/ (- (System/nanoTime) t0) 1e6)})))
 
 (defn start
-  "Creates the section `name` (e.g. \"Local\\\\vfs_ring_…\") and its events,
-  and serves `provider` as root 0 on `workers` platform threads. Returns a
-  server map; the shim needs :name and :map-bytes (VFS_RING_SECTION /
-  VFS_RING_BYTES).
+  "Serves `provider` as root 0 on `workers` platform threads, over a ring in a
+  backing of `transport` (aether.director.ring.backing):
+    :section  the named section `name` (e.g. \"Local\\vfs_ring_…\") and its
+              events; the default on Windows
+    :file     the file `path`, which the shim opens as `shim-path` (default:
+              `path`); the default elsewhere. `park-us` [floor mid cap] sets
+              its workers' idle parks (ParkWaker)
+  `platform` overrides aether.director.platform/current for the default.
+  Returns a server map, which carries what the shim's env needs
+  (aether.director.env/transport-env).
 
   First runs `warm-up` rounds of synthetic requests (see warm-up!; 0 skips
   it), so the handlers are compiled before the first real request.
@@ -541,19 +551,16 @@
   reg_gen into the header; without one they're NOT_SUPPORTED. `roots`
   serves more roots: {root-id provider}, ids below 16. `trace` counts requests
   (see trace-top)."
-  [provider {:keys [name workers spin-us warm-up stage-exec trace roots registry]
-             :or {workers 16 spin-us 400 warm-up 3000}}]
-  (let [warmed  (when (pos? (long warm-up)) (warm-up! provider {:rounds warm-up}))
+  [provider {:keys [transport workers warm-up stage-exec trace roots registry]
+             :or {workers 16 warm-up 3000} :as opts}]
+  (let [transport (or transport (if (= :platform/windows (platform/current opts)) :section :file))
+        warmed  (when (pos? (long warm-up)) (warm-up! provider {:rounds warm-up}))
         g       (p/geometry)
-        section (Native/createSection name (:map-bytes g))
-        seg     (.view section)
+        {:keys [^MemorySegment seg waker close server]} (backing/open-backing transport g opts)
         _       (init-header! seg g workers)
-        srv     (Native/createEvent (str name "_srv"))
-        cli     (Native/createEvent (str name "_cli"))
         ring    (Ring. seg (:stride g) (:cap g) (:arena-offset g) (:bank-size g)
                        (roots-array (assoc roots 0 provider)) (ConcurrentHashMap.) (AtomicLong.)
-                       (EventWaker. srv cli (* 1000 (long spin-us)))
-                       (AtomicBoolean.) (AtomicLong.) stage-exec registry
+                       waker (AtomicBoolean.) (AtomicLong.) stage-exec registry
                        (when trace (ConcurrentHashMap.)))
         _       (when registry
                   (registry/publish-to! registry #(Native/fetchMaxLong seg p/rh-reg-gen (long %))))
@@ -561,17 +568,16 @@
                        (doto (Thread. ^Runnable #(worker ring) (str "ring-worker-" i))
                          (.setDaemon true)
                          (.start))))]
-    (merge g {:transport :section :name name :ring ring :section section :threads threads :warm-up warmed
-              :registry? (some? registry)
-              :server-event (str name "_srv") :client-event (str name "_cli")})))
+    (merge g server {:ring ring :threads threads :warm-up warmed :close-backing close
+                     :registry? (some? registry)})))
 
-(defn stop [{:keys [^Ring ring ^Native$Section section threads]}]
+(defn stop [{:keys [^Ring ring threads close-backing]}]
   (.set ^AtomicBoolean (.-stop ring) true)
   (.wakeAll ^Waker (.-waker ring))
   (doseq [^Thread t threads] (.join t 1000))
   (doseq [^Open o (.values ^ConcurrentHashMap (.-handles ring))] (prov/close! (.-handle o)))
   (.close ^Waker (.-waker ring))
-  (.close section))
+  (close-backing))
 
 (defn trace-top
   "The `n` most frequent traced requests: [[\"op outcome path\" count] …]."
