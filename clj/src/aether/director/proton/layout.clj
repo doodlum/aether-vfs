@@ -27,9 +27,8 @@
 
 (defn join
   "`base` and `parts` joined with /, without doubling a / that ends `base`."
-  [^String base & parts]
-  (apply str (if (and (> (count base) 1) (.endsWith base "/")) (subs base 0 (dec (count base))) base)
-         (mapcat (fn [p] ["/" p]) parts)))
+  [base & parts]
+  (reduce (fn [^String a p] (if (.endsWith a "/") (str a p) (str a "/" p))) (str base) parts))
 
 (defn runtimes  "<home>/runtimes (layout.rs:60-62)."  [home] (join home "runtimes"))
 (defn downloads "<home>/downloads (layout.rs:65-67)." [home] (join home "downloads"))
