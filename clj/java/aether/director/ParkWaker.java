@@ -17,6 +17,10 @@ import java.util.concurrent.locks.LockSupport;
  * (VFS_RING_SPIN_US, default 400 us), then park, longer the longer the ring
  * has been quiet: 100 us, 500 us once quiet past 5 ms, 2 ms once quiet past
  * 50 ms (notifier.rs:99-109). The three park lengths are configurable.
+ *
+ * On Windows, parkNanos has about 15.6 ms granularity (the default timer
+ * resolution rounds a short park up), so an idle file ring there answers its
+ * first request after a quiet spell in up to ~16 ms. Linux honours 100 us.
  */
 public final class ParkWaker implements Waker {
     public static final long DEFAULT_SPIN_NANOS = 400_000L;

@@ -55,7 +55,9 @@
       "--also"        (recur more (update opts :also conj b))
       "--trace"       (recur (cons b more) (assoc opts :trace true))
       "--env"         (let [[k v] (split-kv b)] (recur more (assoc-in opts [:env k] v)))
-      "--transport"   (recur more (assoc opts :transport (keyword b)))
+      "--transport"   (if (#{"section" "file"} b)
+                        (recur more (assoc opts :transport (keyword b)))
+                        (throw (ex-info (str "--transport is section or file, not " (pr-str b)) {:transport b})))
       (assoc opts :exe a :args (vec (rest args))))))
 
 (defn- content

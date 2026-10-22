@@ -53,22 +53,12 @@
   itself and its events, a file its path as the shim opens it."
   ^String [server ^String root]
   (let [{:keys [cap map-bytes arena-offset arena-len]} server
-        geometry (str "
-payload_cap=" cap "
-ring_bytes=" map-bytes
-                      "
-arena_offset=" arena-offset "
-arena_len=" arena-len)]
+        geometry (str "\npayload_cap=" cap "\nring_bytes=" map-bytes
+                      "\narena_offset=" arena-offset "\narena_len=" arena-len)]
     (case (:transport server)
-      :section (str "section=" (:name server) "
-root=" root geometry
-                    "
-server_ev=" (:server-event server) "
-client_ev=" (:client-event server) "
-")
-      :file    (str "ring_path=" (:ring-path server) "
-root=" root geometry "
-"))))
+      :section (str "section=" (:name server) "\nroot=" root geometry
+                    "\nserver_ev=" (:server-event server) "\nclient_ev=" (:client-event server) "\n")
+      :file    (str "ring_path=" (:ring-path server) "\nroot=" root geometry "\n"))))
 
 (defn session-env
   "The shim's env for `server`: the transport's (aether.director.env/transport-env),

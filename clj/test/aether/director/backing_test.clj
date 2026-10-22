@@ -73,6 +73,8 @@
     (try
       (is (= (:map-bytes g) (.length f)) "a fresh file, not the longer stale one grown into")
       (is (instance? ParkWaker (:waker b)))
+      (is (instance? ParkWaker (:warm-waker b)) "the warm-up profiles the real waker's class")
+      (is (not (identical? (:waker b) (:warm-waker b))))
       (is (= {:transport :file :ring-path (.getCanonicalPath f) :host-path (.getCanonicalPath f)}
              (:server b)))
       (finally ((:close b))))
@@ -125,3 +127,20 @@
       (finally (ring/stop srv)))
     (testing "stopped: the mapping is released, so the file can go"
       (is (.delete f)))))
+
+(deftest the-section-backing-warms-up-through-an-event-waker-that-wakes-nothing
+  (if-not (= :platform/windows (aether.director.platform/current))
+    (println "SKIP section backing: Windows-only")
+    (let [b (backing/open-backing :section (p/geometry) {:name (str "Local\\vfs_backing_test_" (System/nanoTime))})]
+      (try
+        (is (instance? aether.director.EventWaker (:waker b)))
+        (let [^aether.director.EventWaker w (:warm-waker b)]
+          (is (instance? aether.director.EventWaker w))
+          (is (= [0 0] [(.serverEvent w) (.clientEvent w)]))
+          (.completed w))                                   ; SetEvent(NULL): fails, harmlessly
+        (finally (.close ^aether.director.Waker (:waker b)) ((:close b)))))))
+
+(deftest a-failed-start-releases-its-backing
+  (let [f (io/file (temp-dir) "state" "ring.bin")]
+    (is (thrown? Throwable (ring/start (reify aether.director.provider.Provider) {:transport :file :path f :warm-up 1})))
+    (is (.delete f) "unmapped: the file can go")))

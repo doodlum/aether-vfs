@@ -9,15 +9,15 @@
               shim supports VFS_RING_PATH too): ParkWaker, since no event
               could wake across that boundary
 
-  A backing is {:seg MemorySegment :waker Waker :close (fn []) :server {…}},
-  :server being what the server map carries for the shim's env
-  (aether.director.env/transport-env) and fuse.cfg."
+  A backing is {:seg MemorySegment :waker Waker :warm-waker Waker :close
+  (fn []) :server {…}}: :warm-waker is of :waker's class but wakes nothing
+  (for ring/warm-up!), and :server is what the server map carries for the
+  shim's env (aether.director.env/transport-env) and fuse.cfg."
   (:import (aether.director EventWaker Native ParkWaker)
-           (java.io File IOException)
+           (java.io File IOException RandomAccessFile)
            (java.lang.foreign Arena MemorySegment)
-           (java.nio ByteBuffer)
-           (java.nio.channels FileChannel FileChannel$MapMode)
-           (java.nio.file Files OpenOption StandardOpenOption)))
+           (java.nio.channels FileChannel$MapMode)
+           (java.nio.file Files)))
 
 (set! *warn-on-reflection* true)
 
@@ -28,10 +28,16 @@
 (defmethod open-backing :section
   [_ {:keys [map-bytes]} {:keys [name spin-us] :or {spin-us 400}}]
   (let [section (Native/createSection name map-bytes)
-        srv     (Native/createEvent (str name "_srv"))
-        cli     (Native/createEvent (str name "_cli"))]
+        [srv cli] (try
+                    (let [srv (Native/createEvent (str name "_srv"))]
+                      (try [srv (Native/createEvent (str name "_cli"))]
+                           (catch Throwable t (Native/closeHandle srv) (throw t))))
+                    (catch Throwable t (.close section) (throw t)))
+        spin-ns (* 1000 (long spin-us))]
     {:seg    (.view section)
-     :waker  (EventWaker. srv cli (* 1000 (long spin-us)))
+     :waker  (EventWaker. srv cli spin-ns)
+     ;; SetEvent(NULL) fails at once, as the warm-up's did before wakers
+     :warm-waker (EventWaker. 0 0 spin-ns)
      :close  #(.close section)
      :server {:transport :section :name name :section section
               :server-event (str name "_srv") :client-event (str name "_cli")}}))
@@ -41,18 +47,15 @@
   Grow-only: a longer file is never truncated, since shortening a file
   another process has mapped faults that process (SIGBUS on Linux), as
   vfs-unix's FileMapping::create (rust/crates/vfs-unix/src/mapping.rs:30-64).
-  The file is grown before it is mapped: a mapping past the end of a file
-  faults on first touch. Returns {:seg :close}."
+  The file is grown before it is mapped, by setLength (set_len there): a
+  mapping past the end of a file faults on first touch. Returns {:seg :close}."
   [^File f ^long size]
   (let [arena (Arena/ofShared)]
     (try
-      (with-open [ch (FileChannel/open (.toPath f) (into-array OpenOption [StandardOpenOption/READ
-                                                                            StandardOpenOption/WRITE
-                                                                            StandardOpenOption/CREATE]))]
-        (when (< (.size ch) size)
-          (.write ch (ByteBuffer/wrap (byte-array 1)) (dec size)))
+      (with-open [raf (RandomAccessFile. f "rw")]
+        (when (< (.length raf) size) (.setLength raf size))
         ;; the mapping holds the file; the channel can close
-        {:seg   (.map ch FileChannel$MapMode/READ_WRITE 0 size arena)
+        {:seg   (.map (.getChannel raf) FileChannel$MapMode/READ_WRITE 0 size arena)
          :close #(.close arena)})
       (catch Throwable t (.close arena) (throw t)))))
 
@@ -66,9 +69,13 @@
         ;; such a reader on the old one (vfs-embed/src/session/proton/mod.rs:320-327).
         ;; Best effort, as there: Windows refuses to delete a file still mapped.
         _    (try (Files/deleteIfExists (.toPath f)) (catch IOException _))
-        {:keys [seg close]} (map-file f map-bytes)
-        [floor mid cap] park-us]
-    {:seg    seg
-     :waker  (ParkWaker. (* 1000 (long spin-us)) (* 1000 (long floor)) (* 1000 (long mid)) (* 1000 (long cap)))
-     :close  close
-     :server {:transport :file :ring-path (or shim-path (.getPath f)) :host-path (.getPath f)}}))
+        {:keys [seg close]} (map-file f map-bytes)]
+    (try
+      (let [[floor mid cap] park-us
+            waker #(ParkWaker. (* 1000 (long spin-us)) (* 1000 (long floor)) (* 1000 (long mid)) (* 1000 (long cap)))]
+        {:seg    seg
+         :waker  (waker)
+         :warm-waker (waker)
+         :close  close
+         :server {:transport :file :ring-path (or shim-path (.getPath f)) :host-path (.getPath f)}})
+      (catch Throwable t (close) (throw t)))))

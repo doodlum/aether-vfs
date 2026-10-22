@@ -1,0 +1,5 @@
+# Clojure and EDN sources stay LF on every checkout, core.autocrlf=true
+# included: a multi-line string literal must not pick up a carriage return.
+*.clj text eol=lf
+*.cljc text eol=lf
+*.edn text eol=lf

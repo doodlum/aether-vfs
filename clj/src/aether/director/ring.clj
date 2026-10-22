@@ -490,8 +490,10 @@
   "Runs `rounds` rounds of synthetic requests (9 per round; 3 when root 0 has
   no files) through the server's code on a private ring over `provider`.
   Returns {:requests :ms}; throws if a reply is wrong. Read-only: nothing is
-  written to the provider."
-  [provider {:keys [rounds] :or {rounds 3000}}]
+  written to the provider. `waker` should be of the class the real ring
+  uses (a backing's :warm-waker), so the JIT profiles serve-slot's call
+  against it; it must wake nothing real."
+  [provider {:keys [rounds waker] :or {rounds 3000 waker Waker/NONE}}]
   (with-open [arena (Arena/ofConfined)]
     (let [g      (p/geometry)
           seg    (.allocate arena (long (:map-bytes g)) 64)
@@ -499,7 +501,7 @@
           _      (init-header! seg g 1)
           r      (Ring. seg stride (:cap g) (:arena-offset g) (:bank-size g)
                         (roots-array {0 provider}) (ConcurrentHashMap.) (AtomicLong.)
-                        Waker/NONE (AtomicBoolean.) (AtomicLong.) nil nil nil)
+                        waker (AtomicBoolean.) (AtomicLong.) nil nil nil)
           {:keys [files dirs]} (prov/sample provider 64)
           sent   (long-array 1)                ; requests so far: the next one's slot
           call   (fn [op flags ^bytes payload]
@@ -535,7 +537,7 @@
 (defn start
   "Serves `provider` as root 0 on `workers` platform threads, over a ring in a
   backing of `transport` (aether.director.ring.backing):
-    :section  the named section `name` (e.g. \"Local\\vfs_ring_…\") and its
+    :section  the named section `name` (e.g. \"Local\\\\vfs_ring_…\") and its
               events; the default on Windows
     :file     the file `path`, which the shim opens as `shim-path` (default:
               `path`); the default elsewhere. `park-us` [floor mid cap] sets
@@ -554,22 +556,27 @@
   [provider {:keys [transport workers warm-up stage-exec trace roots registry]
              :or {workers 16 warm-up 3000} :as opts}]
   (let [transport (or transport (if (= :platform/windows (platform/current opts)) :section :file))
-        warmed  (when (pos? (long warm-up)) (warm-up! provider {:rounds warm-up}))
-        g       (p/geometry)
-        {:keys [^MemorySegment seg waker close server]} (backing/open-backing transport g opts)
-        _       (init-header! seg g workers)
-        ring    (Ring. seg (:stride g) (:cap g) (:arena-offset g) (:bank-size g)
-                       (roots-array (assoc roots 0 provider)) (ConcurrentHashMap.) (AtomicLong.)
-                       waker (AtomicBoolean.) (AtomicLong.) stage-exec registry
-                       (when trace (ConcurrentHashMap.)))
-        _       (when registry
-                  (registry/publish-to! registry #(Native/fetchMaxLong seg p/rh-reg-gen (long %))))
-        threads (vec (for [i (range workers)]
-                       (doto (Thread. ^Runnable #(worker ring) (str "ring-worker-" i))
-                         (.setDaemon true)
-                         (.start))))]
-    (merge g server {:ring ring :threads threads :warm-up warmed :close-backing close
-                     :registry? (some? registry)})))
+        g         (p/geometry)
+        {:keys [^MemorySegment seg ^Waker waker warm-waker close server]} (backing/open-backing transport g opts)]
+    (try
+      (let [warmed  (when (pos? (long warm-up)) (warm-up! provider {:rounds warm-up :waker warm-waker}))
+            _       (init-header! seg g workers)
+            ring    (Ring. seg (:stride g) (:cap g) (:arena-offset g) (:bank-size g)
+                           (roots-array (assoc roots 0 provider)) (ConcurrentHashMap.) (AtomicLong.)
+                           waker (AtomicBoolean.) (AtomicLong.) stage-exec registry
+                           (when trace (ConcurrentHashMap.)))
+            _       (when registry
+                      (registry/publish-to! registry #(Native/fetchMaxLong seg p/rh-reg-gen (long %))))
+            threads (vec (for [i (range workers)]
+                           (doto (Thread. ^Runnable #(worker ring) (str "ring-worker-" i))
+                             (.setDaemon true)
+                             (.start))))]
+        (merge g server {:ring ring :threads threads :warm-up warmed :close-backing close
+                         :registry? (some? registry)}))
+      (catch Throwable t
+        (.close waker)
+        (close)
+        (throw t)))))
 
 (defn stop [{:keys [^Ring ring threads close-backing]}]
   (.set ^AtomicBoolean (.-stop ring) true)
