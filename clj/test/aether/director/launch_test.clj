@@ -18,6 +18,10 @@
    :client-event "Local\\vfs_ring_clj_42_cli" :map-bytes 67174400 :cap 1048576
    :arena-offset 33555504 :arena-len 33554432})
 
+(def ^:private win
+  "Every test here is of the Windows launch, whichever OS runs it."
+  {:platform :platform/windows})
+
 (defn- legacy-session-env [server root-s fuse-path roots]
   (let [{section :name
          :keys [cap map-bytes arena-offset arena-len server-event client-event registry?]} server]
@@ -75,7 +79,7 @@
              :env {"FOO" "bar" "VFS_REGISTRY" "1" "Path" "C:\\mine"}}]]]
     (testing what
       (let [dir     (temp-dir)
-            s       (launch/session server dir sopts)
+            s       (launch/session server dir (assoc sopts :platform :platform/windows))
             fuse    (str (io/file (:state s) "fuse.cfg"))]
         (is (= (legacy-session-env server (:root s) fuse (:roots sopts)) (:env s)) "the session's env")
         (is (= (legacy-fuse-cfg server (:root s)) (slurp fuse)) "fuse.cfg")
@@ -86,7 +90,7 @@
 
 (deftest the-only-name-a-section-launch-now-also-clears-is-an-inherited-root-backings
   (let [dir   (temp-dir)
-        s     (launch/session section-server dir {})
+        s     (launch/session section-server dir win)
         inh   (assoc inherited "VFS_ROOT_BACKINGS" "0=C:\\old")
         delta (launch/launch-env s {} "C:\\n" "C:\\W")
         before (into {} (legacy-launch-env! (windows-env inh) s {} "C:\\n" "C:\\W"))
@@ -98,7 +102,7 @@
   (let [dir    (temp-dir)
         server (-> section-server (dissoc :name :server-event :client-event)
                    (assoc :transport :file :ring-path "C:\\r\\state\\ring.bin"))
-        s      (launch/session server dir {})
+        s      (launch/session server dir win)
         ;; looked up as Windows does, without case
         ^Map child (launch/apply-env! (windows-env inherited) (launch/launch-env s {} "C:\\n" "C:\\W"))]
     (is (= "C:\\r\\state\\ring.bin" (.get child "VFS_RING_PATH")) "replaces the inherited vfs_ring_path")
@@ -110,7 +114,85 @@
            (slurp (io/file (:state s) "fuse.cfg"))))))
 
 (deftest a-launch-can-remove-inherited-names-in-any-spelling
-  (let [s     (launch/session section-server (temp-dir) {})
+  (let [s     (launch/session section-server (temp-dir) win)
         child (into {} (launch/apply-env! (windows-env inherited)
                                           (launch/launch-env s {:remove-env ["STEAMAPPID"]} "C:\\n" "C:\\W")))]
     (is (not (contains? child "SteamAppId")))))
+
+;; --- the platform-dispatching launch --------------------------------------------
+
+(defn- legacy-command
+  "launch's argv and directory as of 247269de, verbatim but for its inputs:
+  the natives must exist, and every path is canonical."
+  [session {:keys [natives exe args]}]
+  (let [canonical #(.getCanonicalPath (io/file %))
+        native (fn [n] (let [f (io/file natives n)]
+                         (when-not (.isFile f) (throw (ex-info (str n " not found in " natives) {:file f})))
+                         (canonical f)))]
+    {:argv (vec (concat [(native "vfs-injector.exe") (canonical exe)
+                         (native "vfs_shim_dll.dll")
+                         (:shim-config session) (:ready session)]
+                        (when (seq args) (cons "--" args))))
+     :dir  (:root session)}))
+
+(defn- natives-dir []
+  (let [d (temp-dir)]
+    (doseq [n ["vfs-injector.exe" "vfs_shim_dll.dll" "game.exe"]] (spit (io/file d n) ""))
+    d))
+
+(deftest the-windows-command-is-the-pre-dispatch-launchs
+  (let [nat (natives-dir)
+        s   (launch/session section-server (temp-dir) win)]
+    (doseq [[what opts] [["no args" {:natives nat :exe (io/file nat "game.exe")}]
+                         ["args, cwd, env, a staged image"
+                          {:natives nat :exe (io/file nat "game.exe") :args ["-a" "b c"] :cwd "bin"
+                           :env {"FOO" "bar"} :launch-image "C:\\s\\stage\\game.exe" :remove-env ["SteamAppId"]}]]]
+      (testing what
+        (let [cmd (launch/windows-command s opts "C:\\Windows")]
+          (is (= (legacy-command s opts) (select-keys cmd [:argv :dir])) "argv and working directory")
+          (is (= (into {} (legacy-launch-env! (windows-env (apply dissoc inherited (:remove-env opts))) s opts
+                                              (.getCanonicalPath nat) "C:\\Windows"))
+                 (into {} (launch/apply-env! (windows-env inherited) (:env cmd))))
+              "the child's environment"))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"vfs-injector.exe not found"
+                          (launch/windows-command s {:natives (temp-dir) :exe "x.exe"} "")))))
+
+(deftest session-and-start-dispatch-on-the-platform
+  (is (= #{:platform/windows :platform/linux} (set (keys (dissoc (methods launch/session) :default)))))
+  (is (= #{:platform/windows :platform/linux} (set (keys (dissoc (methods launch/start!) :default)))))
+  (testing "a Wine session refuses a ring the shim couldn't open by name"
+    (doseq [server [section-server
+                    (assoc section-server :transport :file :ring-path "/home/me/s/state/ring.bin")]]
+      (is (= :ring-not-wine
+             (:aether.director.proton.launch/error
+              (try (launch/session server (temp-dir) {:platform :platform/linux}) nil
+                   (catch clojure.lang.ExceptionInfo e (ex-data e)))))))))
+
+(deftest a-wine-session-names-root-0-by-its-c-location
+  (let [dir    (temp-dir)
+        server (-> section-server (dissoc :name :server-event :client-event)
+                   (assoc :transport :file :ring-path "C:\\vfs-session\\state\\ring.bin" :host-path "/x/ring.bin"))
+        s      (launch/session server dir {:platform :platform/linux :roots {1 "C:\\Saves"}})]
+    (is (= "C:\\vfs-session\\root" (:root-location s)))
+    (is (= {1 "C:\\Saves"} (:roots s)))
+    (is (= (vec (launch/shim-config "C:\\vfs-session\\root")) (vec (Files/readAllBytes (.toPath (io/file (:shim-config s))))))
+        "shim.cfg carries the C: location the shim sees")
+    (is (str/starts-with? (slurp (io/file (:state s) "fuse.cfg")) "ring_path=C:\\vfs-session\\state\\ring.bin\nroot=C:\\vfs-session\\root\n"))
+    (is (= 67174400 (get-in s [:server :map-bytes])))
+    (is (nil? (:env s)) "the plan builds the child's env, not the session")))
+
+(deftest a-linux-start-names-the-first-effect-not-built-yet
+  (let [home   (temp-dir)
+        rt     (io/file home "runtimes" "GE-Proton11-6-x86_64")
+        _      (io/make-parents (io/file rt "version"))
+        _      (spit (io/file rt "version") "1700000000 GE-Proton11-6\n")
+        server (-> section-server (dissoc :name :server-event :client-event)
+                   (assoc :transport :file :ring-path "C:\\vfs-session\\state\\ring.bin"
+                          :host-path (str (io/file home "ring.bin"))))
+        s      (launch/session server (temp-dir) {:platform :platform/linux})
+        e      (try (launch/start! s {:platform :platform/linux :natives "/n" :target "C:\\Games\\g.exe"
+                                      :proton {:home (str home) :steam-state-dir (str home "/no-steam")}})
+                    nil
+                    (catch clojure.lang.ExceptionInfo e (assoc (ex-data e) :message (ex-message e))))]
+    (is (= [:prefix/ensure! 7] [(:aether/unimplemented e) (:aether/task e)]) (:message e))
+    (is (str/includes? (:message e) "task 7"))))

@@ -20,7 +20,10 @@
             [aether.director.provider.compose :as compose]
             [aether.director.provider.disk :as disk]
             [aether.director.provider.tree :as tree]
+            [aether.director.platform :as platform]
             [aether.director.provider.zip :as zip]
+            [aether.director.proton.launch :as plaunch]
+            [aether.director.proton.prefix :as prefix]
             [aether.director.registry :as registry]
             [aether.director.ring :as ring]
             [aether.director.stage :as stage]
@@ -81,26 +84,43 @@
     :env {k v}  :registry dir  :trace bool
     :transport :section|:file the ring's backing (ring/start); a file ring is
                               <session>/state/ring.bin
+    :platform                 :platform/windows|:platform/linux, overriding
+                              this process's (aether.director.platform)
+    :proton {…}               a Linux launch's runtime, prefix and Steam
+                              options (launch/resolve-proton); `roots`' paths
+                              are then C: locations
+    :on-launch (fn [launch])  called with the started launch/Launch, so a
+                              host can poll it or launch/stop! it while this waits
     :log (fn [& xs])          progress lines"
-  [root roots {:keys [session stage fallback also registry trace transport log] :or {log (fn [& _])} :as opts}]
-  (let [stage-dir (io/file session "stage")
+  [root roots {:keys [session stage fallback also registry trace transport log on-launch]
+               :or {log (fn [& _])} :as opts}]
+  (let [platform  (platform/current opts)
+        linux?    (= :platform/linux platform)
+        stage-dir (io/file session "stage")
         ;; STAGE_EXEC: a child EXE that only the VFS holds, staged on demand
         on-demand (fn [vpath] (:exe (stage/stage root vpath {:dir stage-dir :fallback fallback})))
         reg    (when registry (registry/registry (doto (io/file registry) (.mkdirs))))
         server (ring/start root {:name (str "Local\\vfs_ring_clj_" (.pid (ProcessHandle/current)))
                                  :transport transport
+                                 :platform platform
                                  :path (io/file session "state" "ring.bin")
+                                 ;; under Wine the shim opens the ring through the session's link
+                                 :shim-path (when linux? (prefix/join-wine plaunch/wine-session "state/ring.bin"))
                                  :stage-exec on-demand
                                  :trace trace
                                  :registry reg
                                  :roots (into {} (for [[id {:keys [provider]}] roots] [id provider]))})
         _      (log "serving; warm-up" (:warm-up server))
-        s      (launch/session server session {:roots (into {} (for [[id {:keys [path]}] roots] [id path]))})
+        s      (launch/session server session {:platform platform
+                                                :roots (into {} (for [[id {:keys [path]}] roots] [id path]))})
         staged (when stage
                  (stage/stage root stage {:dir stage-dir :fallback fallback :also also}))
         _      (when staged (log "staged" (:staged staged)))]
     (try
-      (let [code (launch/launch s (assoc opts :exe (or (:exe staged) (:exe opts)) :launch-image (:exe staged)))]
+      (let [l    (launch/start! s (assoc opts :platform platform
+                                         :exe (or (:exe staged) (:exe opts)) :launch-image (:exe staged)))
+            _    (when on-launch (on-launch l))
+            code (launch/await-exit l)]
         (log "exit" code (ring/stats server))
         (doseq [[k n] (ring/trace-top server 25)] (log "trace" n k))
         code)

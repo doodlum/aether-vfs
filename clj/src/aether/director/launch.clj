@@ -18,14 +18,32 @@
   shim, waits for the shim's ready file, and exits with the target's code.
   The target inherits the injector's environment, and the injector inherits
   ours, so the child's environment is built explicitly here, never by
-  changing this process's own."
+  changing this process's own.
+
+  session and start! dispatch on the platform (aether.director.platform:
+  opts' :platform, else this process's). start! returns a Launch, which a
+  host waits on, polls or stops; launch is start! then await-exit (wait is Object.wait, so not a protocol method name).
+
+    :platform/windows  the injector runs directly, with host paths and the
+                       section or file ring's env (today's launch, unchanged)
+    :platform/linux    the injector runs under GE-Proton's wine, in a prefix
+                       the session is linked into (aether.director.proton.*);
+                       the pure composition is proton.launch/plan, and every
+                       effect not built yet throws {:aether/unimplemented …}"
   (:require [aether.director.env :as env]
+            [aether.director.platform :as platform]
+            [aether.director.proton.launch :as plaunch]
+            [aether.director.proton.layout :as layout]
+            [aether.director.proton.prefix :as prefix]
+            [aether.director.proton.runtime :as runtime]
+            [aether.director.proton.steam :as steam]
             [clojure.java.io :as io]
             [clojure.string :as str])
   (:import (java.io ByteArrayOutputStream File)
            (java.lang ProcessBuilder$Redirect)
            (java.nio ByteBuffer ByteOrder)
            (java.nio.charset StandardCharsets)
+           (java.security MessageDigest)
            (java.util List Map)))
 
 (set! *warn-on-reflection* true)
@@ -72,12 +90,17 @@
                   env/virtual-roots (or (env/encode-roots roots) "")})
     (:registry? server) (assoc env/registry "1")))
 
-(defn session
+(defmulti session
   "Creates the session's directories under `dir`: root/ (the managed root,
-  empty), overlay/ and state/, and writes shim.cfg and fuse.cfg for `server`
-  (from ring/start). Returns the session map launch takes. `roots` declares
-  the roots beyond root 0 to the shim: {id path-the-program-uses}. When the
-  server serves a registry, the shim is told to install its registry hooks."
+  empty) and state/, and writes shim.cfg and fuse.cfg for `server` (from
+  ring/start). Returns the session map start! takes. `roots` declares the
+  roots beyond root 0 to the shim: {id path-the-program-uses}. When the
+  server serves a registry, the shim is told to install its registry hooks.
+  Dispatches on (platform/current opts)."
+  {:arglists '([server dir & [{:keys [roots platform]}]])}
+  (fn [_server _dir & [opts]] (platform/current opts)))
+
+(defmethod session :platform/windows
   [server dir & [{:keys [roots]}]]
   (let [[root state] (for [d ["root" "state"]] (doto (io/file dir d) (.mkdirs)))
         root-s  (canonical root)
@@ -120,27 +143,153 @@
   ^Map [^Map m delta]
   (env/apply! m delta))
 
+;; --- a started launch -------------------------------------------------------------
+
+(defprotocol Launch
+  "A started program, as start! returns it: stateful, so a host can poll and
+  stop it while another thread waits."
+  (await-exit [l] "Blocks until the program has ended; its exit code (the injector's own failures are 3).")
+  (alive? [l] "Whether it is still running.")
+  (stop! [l] "Stops it and everything it started. Idempotent."))
+
+(defmulti start!
+  "Starts `opts`' program under `session` and returns its Launch, without
+  waiting. Dispatches on (platform/current opts)."
+  {:arglists '([session opts])}
+  (fn [_session opts] (platform/current opts)))
+
 (defn launch
-  "Runs `exe` (a real file) with `args` under `session`, via the injector at
-  `natives` (a directory holding vfs-injector.exe and vfs_shim_dll.dll), with
-  the managed root as its working directory. `env` adds variables for the
-  target; `launch-image` (a staged EXE) makes that EXE's folder an alias of
-  the root. `remove-env` names inherited variables the target must not see
-  (matched without case). Waits, and returns the exit code (the injector's
-  own failures are 3, explained in <ready>.injector-error); output goes to
-  ours."
-  [session {:keys [natives exe args] :as opts}]
+  "Runs a program under `session` (start!, see the platform's method for
+  `opts`), awaits its exit, and returns its exit code."
+  [session opts]
+  (await-exit (start! session opts)))
+
+;; --- Windows ----------------------------------------------------------------------
+
+(defrecord WindowsLaunch [^Process process]
+  Launch
+  (await-exit [_] (.waitFor process))
+  (alive? [_] (.isAlive process))
+  (stop! [_]
+    ;; the target is the injector's child: kill it before the injector
+    (run! #(.destroyForcibly ^ProcessHandle %) (.toList (.descendants process)))
+    (.destroyForcibly process)
+    nil))
+
+(defn windows-command
+  "What the Windows start! spawns for `opts` under `session`: {:argv
+  :dir :env}, :env being launch-env's delta. `host-path` is this process's
+  PATH. Throws for a native missing from `natives`."
+  [session {:keys [natives exe args] :as opts} host-path]
   (let [native (fn [n] (let [f (io/file natives n)]
                          (when-not (.isFile f) (throw (ex-info (str n " not found in " natives) {:file f})))
-                         (canonical f)))
-        cmd    (concat [(native "vfs-injector.exe") (canonical exe)
-                        (native "vfs_shim_dll.dll")
-                        (:shim-config session) (:ready session)]
-                       (when (seq args) (cons "--" args)))
-        pb     (doto (ProcessBuilder. ^List (vec cmd))
-                 (.directory (io/file (:root session)))
-                 (.redirectOutput ProcessBuilder$Redirect/INHERIT)
-                 (.redirectError ProcessBuilder$Redirect/INHERIT))]
+                         (canonical f)))]
+    {:argv (vec (concat [(native "vfs-injector.exe") (canonical exe)
+                         (native "vfs_shim_dll.dll")
+                         (:shim-config session) (:ready session)]
+                        (when (seq args) (cons "--" args))))
+     :dir  (:root session)
+     :env  (launch-env session opts (canonical natives) host-path)}))
+
+(defmethod start! :platform/windows
+  ;; Runs `exe` (a real file) with `args` under `session`, via the injector at
+  ;; `natives` (a directory holding vfs-injector.exe and vfs_shim_dll.dll), with
+  ;; the managed root as its working directory. `env` adds variables for the
+  ;; target; `launch-image` (a staged EXE) makes that EXE's folder an alias of
+  ;; the root. `remove-env` names inherited variables the target must not see
+  ;; (matched without case). Output goes to ours.
+  [session opts]
+  (let [{:keys [argv dir env]} (windows-command session opts (System/getenv "PATH"))
+        pb (doto (ProcessBuilder. ^List argv)
+             (.directory (io/file dir))
+             (.redirectOutput ProcessBuilder$Redirect/INHERIT)
+             (.redirectError ProcessBuilder$Redirect/INHERIT))]
     (io/delete-file (:ready session) true)
-    (apply-env! (.environment pb) (launch-env session opts (canonical natives) (System/getenv "PATH")))
-    (.waitFor (.start pb))))
+    (apply-env! (.environment pb) env)
+    (->WindowsLaunch (.start pb))))
+
+;; --- Linux ------------------------------------------------------------------------
+
+(defmethod session :platform/linux
+  ;; As the Windows method, for a launch under Wine: shim.cfg names root 0 by
+  ;; its C: location (:root-location, default proton.launch/default-root-location,
+  ;; inside the session's link), and `roots` are {id C:-location}. `server`
+  ;; must be a file ring named in C: form (ring/start :shim-path); its geometry
+  ;; is kept for proton.launch/plan. No env: the plan builds the child's.
+  [server dir & [{:keys [roots root-location]}]]
+  (let [ring-path (:ring-path server)]
+    (when-not (and (= :file (:transport server)) ring-path (prefix/windows-absolute? ring-path))
+      (throw (ex-info (str "a Wine launch needs a file ring named in C: form (ring/start :shim-path), not "
+                           (pr-str (or ring-path (:transport server))))
+                      {::plaunch/error :ring-not-wine :server (select-keys server [:transport :ring-path])}))))
+  (let [[root state] (for [d ["root" "state"]] (doto (io/file dir d) (.mkdirs)))
+        root0 (or root-location plaunch/default-root-location)
+        shim  (io/file state "shim.cfg")
+        fuse  (io/file state "fuse.cfg")]
+    (io/copy (shim-config root0) shim)
+    (spit fuse (fuse-cfg server root0))
+    {:dir (canonical dir) :root (canonical root) :state (canonical state)
+     :shim-config (canonical shim) :ready (str (canonical state) "/ready.flag")
+     :root-location root0 :roots (or roots {})
+     :server (select-keys server [:transport :ring-path :host-path :map-bytes :cap :arena-offset :arena-len
+                                  :registry?])}))
+
+(defn- unimplemented
+  "Throws for an effect the Linux launch needs that isn't built yet: spec
+  §5.1's `task`, so the gap is explicit."
+  [what task msg]
+  (throw (ex-info (str msg " is not implemented yet (docs/linux-port-research.md §5.1, task " task ")")
+                  {:aether/unimplemented what :aether/task task})))
+
+(defn- session-id
+  "The anonymous prefix's name for a session: its state dir, hashed (as
+  wine_session_id, session/proton/mod.rs:374-379; only stable for itself)."
+  [^String state]
+  (let [h (.digest (MessageDigest/getInstance "SHA-256") (.getBytes state StandardCharsets/UTF_8))]
+    (apply str "session-" (for [i (range 8)] (format "%02x" (bit-and (aget h i) 0xff))))))
+
+(defn resolve-proton
+  "The runtime, prefix and Steam decision for a Linux launch, from `opts`'
+  :proton {:home :runtime :prefix-name :prefix-init :helper? :steam-state-dir}
+  (home: layout/home of `env`; runtime: the newest installed; prefix name:
+  the session's own; prefix-init: :wineboot) and the launch's :env. Reads
+  the runtime's version file and the Steam client's pid file, nothing else."
+  [session {:keys [proton] :as opts} env]
+  (let [{:keys [home runtime prefix-name prefix-init helper? steam-state-dir]
+         :or {prefix-init :wineboot helper? true}} proton
+        home    (or home (layout/home env)
+                    (throw (ex-info "no aether-vfs home: set VFS_HOME, XDG_DATA_HOME or HOME" {})))
+        runtime (or runtime (runtime/newest home)
+                    (throw (ex-info (str "no GE-Proton runtime under " (layout/runtimes home)
+                                         ": install one (spec task 13's CLI)") {:home home})))
+        _       (runtime/verify-ge runtime)
+        state   (or steam-state-dir (steam/state-dir (get env "HOME")))]
+    {:home    home
+     :runtime runtime
+     :prefix  (prefix/prefix-dir home (or prefix-name (session-id (:state session))) prefix-init)
+     :prefix-init prefix-init
+     :steam   (steam/steam-side {:prefix-init prefix-init :helper? helper? :env (:env opts) :state-dir state
+                                 :client-pid (when state (steam/running-client state))})}))
+
+(defrecord LinuxLaunch [plan]
+  Launch
+  (await-exit [_] (unimplemented :launch/await-exit 11 "waiting on wine, then wineserver -w"))
+  (alive? [_] (unimplemented :launch/alive? 11 "a Wine launch's liveness (wine alive or wineserver -w)"))
+  (stop! [_] (unimplemented :launch/stop! 7 "stopping a Wine launch (wineserver -k)")))
+
+(defmethod start! :platform/linux
+  ;; `opts`: as proton.launch/plan's, plus :proton (resolve-proton). Composes
+  ;; the plan, then runs its effects in order; each one not built yet throws
+  ;; {:aether/unimplemented what :aether/task n}.
+  [session opts]
+  (let [env  (into {} (System/getenv))
+        p    (resolve-proton session opts env)
+        plan (plaunch/plan session opts p {:env env :cwd (System/getProperty "user.dir")})]
+    (unimplemented :prefix/ensure! 7 (str "setting up the prefix " (:prefix p) " (wineboot or proton run)"))
+    (unimplemented :prefix/lock! 7 "the prefix lock")
+    (unimplemented :prefix/link! 7 (str "linking the session at " plaunch/wine-session " and the roots"))
+    (plaunch/check-geometry (assoc (:geometry plan) :ring-host-path (:ring-host-path plan))
+                            (let [f (io/file (:ring-host-path plan))] (when (.isFile f) (.length f))))
+    (run! #(io/delete-file % true) (:reports plan))
+    (unimplemented :launch/spawn! 11 "spawning wine in its own process group (setsid)")
+    (->LinuxLaunch plan)))

@@ -20,7 +20,12 @@
     :ring-bytes :arena-offset :arena-len                   the live geometry
     :ring-host-path                                        the ring file, for the length check
 
-  The spawn comes later:
+  plan composes those pieces into everything one launch spawns, from a
+  session (aether.director.launch/session's Linux method), the caller's
+  options and the resolved runtime, prefix and Steam decision.
+
+  The spawn comes later (aether.director.launch's Linux start! names each
+  missing effect):
 
     (spawn! l env)
       ;; launch/mod.rs:350-404. check-geometry (with the ring file's length),
@@ -30,7 +35,10 @@
       ;; and stderr appended to one log file, the notes first; retried on
       ;; ETXTBSY (error=26). Its Launch's await-exit is finish over the wine
       ;; exit code and the injector-error report, then wineserver -w."
-  (:require [aether.director.proton.layout :as layout]
+  (:require [aether.director.env :as henv]
+            [aether.director.proton.env :as penv]
+            [aether.director.proton.layout :as layout]
+            [aether.director.proton.prefix :as prefix]
             [aether.director.proton.steam :as steam]
             [clojure.string :as str]))
 
@@ -153,3 +161,110 @@
     :else
     {::error :injector-exit :code code
      :error (str "vfs-injector exited " code " without running the target (2 = bad argv, 3 = injection failed)")}))
+
+;; --- the launch, composed --------------------------------------------------------
+
+(def wine-session
+  "Where a session's directory is linked in every prefix, so its state/,
+  stage/ and root/ have C: names (vfs-embed session/proton/mod.rs:388-420;
+  one link for the whole session, spec §3.3)."
+  "C:\\vfs-session")
+
+(def default-root-location
+  "Root 0's location when the host names none: the session's own root/,
+  through its link (DEFAULT_ROOT0_LOCATION, session/proton/mod.rs:1037)."
+  "C:\\vfs-session\\root")
+
+(defn- fail [kind msg data]
+  (throw (ex-info msg (assoc data ::error kind))))
+
+(defn- under-dir
+  "`host` relative to `dir` (\"\" for dir itself), or nil when it is not under it."
+  [dir ^String host]
+  (let [dir (str/replace dir #"/+$" "")]
+    (cond (= host dir)                       ""
+          (str/starts-with? host (str dir "/")) (subs host (inc (count dir))))))
+
+(defn wine-path
+  "The name a Wine process opens host path `host` by: through the session's
+  link when it is under `session-dir`, else Z:, which Wine maps to /. A
+  relative host path has neither ({::error :not-absolute})."
+  [session-dir ^String host]
+  (let [host (str/replace host #"/+" "/")]
+    (if-let [rel (under-dir session-dir host)]
+      (if (= "" rel) wine-session (prefix/join-wine wine-session rel))
+      (if (str/starts-with? host "/")
+        (str "Z:" (str/replace host "/" "\\"))
+        (fail :not-absolute (str host " is not an absolute host path, so Wine has no name for it") {:path host})))))
+
+(defn- under-session?
+  "Whether C: `location` is inside the session's link (ASCII case-insensitively, as Wine)."
+  [^String location]
+  (let [l (str/replace location "/" "\\")]
+    (or (.equalsIgnoreCase l wine-session)
+        (and (> (count l) (count wine-session))
+             (.equalsIgnoreCase (subs l 0 (inc (count wine-session))) (str wine-session "\\"))))))
+
+(defn plan
+  "Everything a Linux launch spawns, as data; nothing is touched.
+
+    session  launch/session's Linux map: :dir :root :state :shim-config
+             :ready, :root-location (root 0, C:), :roots {id C:-location},
+             :server (the ring: :transport :file, :ring-path in C: form,
+             :host-path, :map-bytes :cap :arena-offset :arena-len :registry?)
+    opts     :natives (host dir of vfs-injector.exe and vfs_shim_dll.dll),
+             :target (C:) or :exe / :launch-image (host paths), :args,
+             :env, :remove-env, :cwd, :ready-timeout-secs
+    proton   :runtime :prefix (host dirs), :steam (steam/steam-side's
+             decision), and for link-plan :listing and :manifest
+    host     {:env :cwd}, as proton.env/launch-env takes it
+
+  => {:program :argv :env [[k v] …] :remove [name …]   the spawn, for env/apply!
+      :session-link {:link :target}  :links [link-plan step …]
+      :ring-host-path :geometry  :reports  :notes :steam-mode :prefix :runtime}
+
+  The ring must be a file named in C: form (ring/start's :shim-path), or it
+  is refused ({::error :ring-not-wine}); a reserved name in :env is refused
+  by check-extra-env. A staged :launch-image is also sent as
+  VFS_LAUNCH_IMAGE, in its C: form, as the Windows launch sends its host form."
+  [{:keys [dir root shim-config ready root-location roots server]}
+   {:keys [natives target exe launch-image args env remove-env cwd ready-timeout-secs]}
+   {:keys [runtime steam listing manifest] prefix-dir :prefix}
+   host]
+  (let [{:keys [transport ring-path host-path map-bytes cap arena-offset arena-len registry?]} server
+        _       (when-not (and (= :file transport) ring-path (prefix/windows-absolute? ring-path))
+                  (fail :ring-not-wine (str "a Wine launch needs a file ring named in C: form (ring/start :shim-path), "
+                                            "not " (pr-str (or ring-path transport)))
+                        {:transport transport :ring-path ring-path}))
+        _       (penv/check-extra-env env)
+        root0   (or root-location default-root-location)
+        target  (or target (wine-path dir (str (or launch-image exe))))
+        image   (when launch-image (wine-path dir (str launch-image)))
+        extra   (vec (sort roots))
+        linked  (for [[id loc backing] (cons [0 root0 root]
+                                             (for [[id loc] extra] [id loc (layout/join dir "roots" (str id))]))
+                      :when (not (under-session? loc))]
+                  {:id id :location loc :backing backing})
+        child   (cond-> (penv/launch-env {:runtime runtime :prefix prefix-dir :ring-path ring-path
+                                          :ring-bytes map-bytes :arena-offset arena-offset :arena-len arena-len
+                                          :payload-cap cap :virtual-dir root0 :virtual-roots extra
+                                          :registry? registry? :cwd (prefix/wine-cwd cwd root0 target)
+                                          :ready-timeout-secs ready-timeout-secs :steam steam :extra-env env}
+                                         host)
+                  image (assoc henv/launch-image image))
+        [program argv] (command-line {:runtime runtime :injector (layout/join natives "vfs-injector.exe")
+                                      :target target :shim-dll (layout/join natives "vfs_shim_dll.dll")
+                                      :config-file shim-config :ready-file ready :args args})]
+    {:program      program
+     :argv         argv
+     :env          (vec child)
+     :remove       (into (henv/stale child) (remove #(contains? child %)) remove-env)
+     :session-link {:link (layout/join prefix-dir "drive_c" "vfs-session") :target dir}
+     :links        (prefix/link-plan prefix-dir linked (or listing {}) (or manifest #{}))
+     :ring-host-path host-path
+     :geometry     {:ring-bytes map-bytes :arena-offset arena-offset :arena-len arena-len}
+     :reports      (stale-reports ready)
+     :notes        (vec (:notes steam))
+     :steam-mode   (or (:mode steam) :untouched)
+     :prefix       prefix-dir
+     :runtime      runtime}))

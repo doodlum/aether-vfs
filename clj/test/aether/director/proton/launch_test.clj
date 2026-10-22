@@ -105,3 +105,100 @@
     (let [r (launch/finish sample nil nil)]
       (is (= :signalled (::launch/error r)))
       (is (str/includes? (:error r) "/ge/GE-Proton11-6-x86_64/files/bin/wine")))))
+
+
+;; --- the Linux launch, composed (spec task 12) --------------------------------
+
+(def ^:private session
+  ;; what launch/session's Linux method returns, Linux-shaped
+  {:dir "/home/me/s" :root "/home/me/s/root" :state "/home/me/s/state"
+   :shim-config "/home/me/s/state/shim.cfg" :ready "/home/me/s/state/ready.flag"
+   :root-location "C:\\vfs-session\\root"
+   :roots {2 "C:\\users\\steamuser\\Documents\\My Games\\Skyrim" 1 "C:\\Saves"}
+   :server {:transport :file :ring-path "C:\\vfs-session\\state\\ring.bin" :host-path "/home/me/s/state/ring.bin"
+            :map-bytes 67174400 :cap 1048576 :arena-offset 33555504 :arena-len 33554432 :registry? true}})
+
+(def ^:private proton
+  {:runtime "/data/aev/runtimes/GE-Proton11-6-x86_64" :prefix "/data/aev/sessions/cairn-7/compat/pfx"
+   :steam {:mode :helper :app-id 489830 :client "/home/me/.local/share/Steam" :notes []}})
+
+(def ^:private host {:env {"PATH" "/usr/bin" "VFS_RING_SECTION" "Local\\old"} :cwd "/home/me"})
+
+(def ^:private opts
+  {:natives "/opt/cairn/natives" :exe "/home/me/s/stage/SkyrimSE.exe" :launch-image "/home/me/s/stage/SkyrimSE.exe"
+   :args ["-forcesteamloader"] :env {"WINEDEBUG" "+loaddll"} :remove-env ["SteamUser"]})
+
+(deftest wine-names-the-session-through-its-link-and-anything-else-through-z
+  (is (= "C:\\vfs-session\\stage\\a\\b.exe" (launch/wine-path "/home/me/s" "/home/me/s/stage/a/b.exe")))
+  (is (= "C:\\vfs-session" (launch/wine-path "/home/me/s/" "/home/me/s")))
+  (is (= "Z:\\opt\\game\\g.exe" (launch/wine-path "/home/me/s" "/opt/game/g.exe")))
+  (is (= "Z:\\home\\me\\s2\\x.exe" (launch/wine-path "/home/me/s" "/home/me/s2/x.exe")) "a sibling spelled alike")
+  (is (= :not-absolute (::launch/error (refusal #(launch/wine-path "/home/me/s" "rel/x.exe"))))))
+
+(deftest the-linux-plan-spawns-wine-with-the-injector-contract
+  (let [{:keys [program argv]} (launch/plan session opts proton host)]
+    (is (= "/data/aev/runtimes/GE-Proton11-6-x86_64/files/bin/wine" program))
+    (is (= ["/opt/cairn/natives/vfs-injector.exe" "C:\\vfs-session\\stage\\SkyrimSE.exe"
+            "/opt/cairn/natives/vfs_shim_dll.dll" "/home/me/s/state/shim.cfg" "/home/me/s/state/ready.flag"
+            "--" "-forcesteamloader"]
+           argv)
+        "the target in C: form, the injector, DLL, config and ready as host paths")))
+
+(deftest the-linux-plan-env-is-proton-envs-with-the-live-geometry
+  (let [{:keys [env remove]} (launch/plan session opts proton host)
+        e (into {} env)]
+    (is (= {"WINEPREFIX" "/data/aev/sessions/cairn-7/compat/pfx"
+            "PROTONPATH" "/data/aev/runtimes/GE-Proton11-6-x86_64"
+            "VFS_RING_PATH" "C:\\vfs-session\\state\\ring.bin"
+            "VFS_RING_BYTES" "67174400" "VFS_RING_PAYLOAD_CAP" "1048576"
+            "VFS_ARENA_OFFSET" "33555504" "VFS_ARENA_LEN" "33554432"
+            "VFS_VIRTUAL_DIR" "C:\\vfs-session\\root"
+            "VFS_VIRTUAL_ROOTS" "1=C:\\Saves;2=C:\\users\\steamuser\\Documents\\My Games\\Skyrim"
+            "VFS_REGISTRY" "1"
+            "VFS_INJECT_CWD" "C:\\vfs-session\\stage"
+            "VFS_INJECT_STEAM_HELPER" "C:\\windows\\system32\\steam.exe C:\\windows\\system32\\rundll32.exe"
+            "SteamAppId" "489830" "SteamGameId" "489830"
+            "STEAM_COMPAT_CLIENT_INSTALL_PATH" "/home/me/.local/share/Steam"
+            "WINEDLLOVERRIDES" "mscoree=d;mshtml=d;steam.exe=b"
+            "WINEDEBUG" "+loaddll"
+            "VFS_LAUNCH_IMAGE" "C:\\vfs-session\\stage\\SkyrimSE.exe"}
+           (dissoc e "LD_LIBRARY_PATH" "WINEDLLPATH" "ORIG_LD_LIBRARY_PATH")))
+    (is (str/starts-with? (e "LD_LIBRARY_PATH") "/data/aev/runtimes/GE-Proton11-6-x86_64/files/lib/"))
+    (is (some #{"VFS_RING_SECTION"} remove) "an inherited section name is cleared")
+    (is (some #{"SteamUser"} remove) "and the caller's removals")
+    (is (not-any? (set (keys e)) remove) "nothing set is removed")))
+
+(deftest the-linux-plan-links-the-session-and-the-roots-outside-it
+  (let [{:keys [session-link links]} (launch/plan session opts proton host)]
+    (is (= {:link "/data/aev/sessions/cairn-7/compat/pfx/drive_c/vfs-session" :target "/home/me/s"} session-link))
+    (is (= [[1 "C:\\Saves" "/home/me/s/roots/1" "/data/aev/sessions/cairn-7/compat/pfx/drive_c/Saves"]
+            [2 "C:\\users\\steamuser\\Documents\\My Games\\Skyrim" "/home/me/s/roots/2"
+             "/data/aev/sessions/cairn-7/compat/pfx/drive_c/users/steamuser/Documents/My Games/Skyrim"]]
+           (mapv (juxt :id :location :backing :link) links))
+        "root 0 lives inside the linked session dir; the others get their backing linked in, shallowest first"))
+  (testing "a root 0 placed elsewhere is linked too, backed by the session's root dir"
+    (let [{:keys [links]} (launch/plan (assoc session :root-location "C:\\Games\\Skyrim" :roots {}) opts proton host)]
+      (is (= [[0 "/home/me/s/root"]] (mapv (juxt :id :backing) links))))))
+
+(deftest the-linux-plan-carries-what-the-spawn-checks-and-cleans
+  (let [p (launch/plan session opts proton host)]
+    (is (= "/home/me/s/state/ring.bin" (:ring-host-path p)))
+    (is (= {:ring-bytes 67174400 :arena-offset 33555504 :arena-len 33554432} (:geometry p)))
+    (is (= ["/home/me/s/state/ready.flag.injector-error" "/home/me/s/state/ready.flag.steam-helper"] (:reports p)))
+    (is (= [] (:notes p)))
+    (is (= :helper (:steam-mode p)))))
+
+(deftest the-linux-plan-refuses-what-a-wine-launch-cannot-carry
+  (is (= :reserved-env (:aether.director.proton.env/error
+                        (refusal #(launch/plan session (assoc opts :env {"WINEPREFIX" "/x"}) proton host)))))
+  (is (= :ring-not-wine (::launch/error
+                         (refusal #(launch/plan (assoc-in session [:server :ring-path] "/home/me/s/state/ring.bin")
+                                                opts proton host))))
+      "a ring named by its host path: ring/start was not given :shim-path")
+  (is (= :ring-not-wine (::launch/error (refusal #(launch/plan (assoc-in session [:server :transport] :section)
+                                                               opts proton host)))))
+  (testing "a C: target is taken as given; cwd is wine-cwd's"
+    (let [e (into {} (:env (launch/plan session (-> opts (dissoc :launch-image) (assoc :target "C:\\Games\\g.exe" :cwd "bin"))
+                                        proton host)))]
+      (is (= "C:\\vfs-session\\root\\bin" (e "VFS_INJECT_CWD")))
+      (is (not (contains? e "VFS_LAUNCH_IMAGE"))))))
