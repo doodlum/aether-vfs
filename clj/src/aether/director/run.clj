@@ -10,6 +10,7 @@
                    [--registry <dir>]                      ; virtualize the registry: overlay.reg in <dir>
                    [--stage <vpath> [--fallback <dir>]... [--also <vpath>]...]
                    [--env K=V]...
+                   [--transport section|file]                ; the ring: a named section (default) or state/ring.bin
                    [<exe> [args...]]
 
   The program sees <session>/root as a folder holding the content. With
@@ -54,6 +55,7 @@
       "--also"        (recur more (update opts :also conj b))
       "--trace"       (recur (cons b more) (assoc opts :trace true))
       "--env"         (let [[k v] (split-kv b)] (recur more (assoc-in opts [:env k] v)))
+      "--transport"   (recur more (assoc opts :transport (keyword b)))
       (assoc opts :exe a :args (vec (rest args))))))
 
 (defn- content
@@ -75,13 +77,17 @@
     :exe path :args [arg]     a real program instead (or the staged one's args)
     :cwd vpath                the program's working directory in root 0 (default: its root)
     :env {k v}  :registry dir  :trace bool
+    :transport :section|:file the ring's backing (ring/start); a file ring is
+                              <session>/state/ring.bin
     :log (fn [& xs])          progress lines"
-  [root roots {:keys [session stage fallback also registry trace log] :or {log (fn [& _])} :as opts}]
+  [root roots {:keys [session stage fallback also registry trace transport log] :or {log (fn [& _])} :as opts}]
   (let [stage-dir (io/file session "stage")
         ;; STAGE_EXEC: a child EXE that only the VFS holds, staged on demand
         on-demand (fn [vpath] (:exe (stage/stage root vpath {:dir stage-dir :fallback fallback})))
         reg    (when registry (registry/registry (doto (io/file registry) (.mkdirs))))
         server (ring/start root {:name (str "Local\\vfs_ring_clj_" (.pid (ProcessHandle/current)))
+                                 :transport transport
+                                 :path (io/file session "state" "ring.bin")
                                  :stage-exec on-demand
                                  :trace trace
                                  :registry reg
