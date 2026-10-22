@@ -42,18 +42,19 @@ jobs:
       TEMP: C:\vfstmp
     steps:
       - uses: actions/checkout@v4
+      # `TMP`/`TEMP` above only name the directory; nothing creates it, and code
+      # that writes straight into `temp_dir()` without a `create_dir_all` first
+      # would fail on a path that does not exist. So it comes first: the
+      # toolchain action's own bash writes a temp file there.
+      - name: Create an 8.3-free TMP
+        run: New-Item -ItemType Directory -Force -Path C:\vfstmp | Out-Null
+        shell: pwsh
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
-      # `TMP`/`TEMP` above only name the directory; nothing creates it, and code
-      # that writes straight into `temp_dir()` without a `create_dir_all` first
-      # would fail on a path that does not exist.
-      - name: Create an 8.3-free TMP
-        run: New-Item -ItemType Directory -Force -Path C:\vfstmp | Out-Null
-        shell: pwsh
       # The gate this project actually enforces by hand, made automatic. It was
       # absent while `cargo clippy --all-targets -- -D warnings` was a standing
       # requirement in every task brief — i.e. the standard was upheld only by
@@ -99,6 +100,87 @@ jobs:
       - name: Rust tests (full engine — includes Windows-only crates)
         run: cargo test --no-fail-fast
         working-directory: rust
+
+  # The Clojure director (clj/) on Windows, where all of it runs: the section
+  # ring, named events, and the file-ring end-to-end test, in which a real
+  # program reads through the shim over a ring held in a file (the Linux
+  # transport, minus Wine). That test needs rust/'s release natives; with
+  # VFS_TEST_REQUIRE_ALL set, a missing native fails it instead of skipping.
+  clj-windows:
+    runs-on: windows-latest
+    # The same 8.3-free TMP as rust-windows, for the same reason.
+    env:
+      TMP: C:\vfstmp
+      TEMP: C:\vfstmp
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create an 8.3-free TMP
+        run: New-Item -ItemType Directory -Force -Path C:\vfstmp | Out-Null
+        shell: pwsh
+      # clj/deps.edn's :build alias compiles java/ with --release 26.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 26
+      - uses: DeLaGuardo/setup-clojure@13.2
+        with:
+          cli: latest
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.gitlibs
+          key: clj-windows-${{ hashFiles('clj/deps.edn') }}
+          restore-keys: clj-windows-
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      # What the file-ring end-to-end test launches (file_ring_test.clj): the
+      # injector, the shim DLL and the fixture that reads through it.
+      - name: Build the release natives
+        run: cargo build --release -p vfs-inject -p vfs-shim-dll -p vfs-fixture-read
+        working-directory: rust
+      # The Clojure CLI on Windows is a PowerShell module.
+      - name: Compile java/
+        run: clojure -T:build javac
+        working-directory: clj
+        shell: pwsh
+      - name: Clojure tests (every test runs; a skip for a missing prerequisite fails)
+        run: clojure -M:test
+        working-directory: clj
+        shell: pwsh
+        env:
+          VFS_TEST_REQUIRE_ALL: "1"
+
+  # The Clojure director on Linux: every pure test (the Proton namespaces are
+  # pure but for their file reads) plus the Linux-only ones (symlinks, POSIX
+  # modes). The Windows-only tests (sections, events, the injector) skip and
+  # say so; nothing here needs the natives, so no prerequisite is required.
+  clj-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 26
+      - uses: DeLaGuardo/setup-clojure@13.2
+        with:
+          cli: latest
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.gitlibs
+          key: clj-linux-${{ hashFiles('clj/deps.edn') }}
+          restore-keys: clj-linux-
+      - name: Compile java/
+        run: clojure -T:build javac
+        working-directory: clj
+      - name: Clojure tests
+        run: clojure -M:test
+        working-directory: clj
 
   rust-linux-portable:
     runs-on: ubuntu-latest
