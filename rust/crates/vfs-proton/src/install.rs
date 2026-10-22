@@ -188,7 +188,20 @@ fn hex_lower(bytes: &[u8]) -> String {
 /// path is not enough on its own, because a symlink pointing outside plus a
 /// later member written *through* it lands outside the tree while every
 /// member path looks innocent.
+///
+/// The lexical rules cannot see a link whose target climbs *through another
+/// link*: `GE/b -> ..` then `GE/a -> b/..` both resolve inside the tree
+/// lexically, yet `GE/a` is really the root's parent. So, against the real
+/// filesystem as it stands when each member is written:
+///
+/// * a member's nearest existing ancestor must canonicalize inside `into`;
+/// * a hard link's source must canonicalize inside `into`;
+/// * a non-directory already at a member's path (a link an earlier member
+///   made) is removed first, so the member replaces it rather than being
+///   written through it, as GNU tar does.
 pub fn extract_tar_gz(archive: &Path, into: &Path) -> Result<PathBuf, InstallError> {
+    fs::create_dir_all(into)?;
+    let root = fs::canonicalize(into)?;
     let file = fs::File::open(archive)?;
     let decoder = flate2::read::GzDecoder::new(BufReader::with_capacity(CHUNK, file));
     let mut tar = tar::Archive::new(decoder);
@@ -245,6 +258,7 @@ pub fn extract_tar_gz(archive: &Path, into: &Path) -> Result<PathBuf, InstallErr
         }
 
         let dst = into.join(&rel);
+        contained(&root, &dst, &raw)?;
 
         if kind.is_dir() {
             fs::create_dir_all(&dst)?;
@@ -274,10 +288,13 @@ pub fn extract_tar_gz(archive: &Path, into: &Path) -> Result<PathBuf, InstallErr
                 ))
             })?;
             create_parent(&dst)?;
+            replace(&dst)?;
             if kind.is_symlink() {
                 symlink(&target, &dst)?;
             } else {
-                fs::hard_link(into.join(&resolved), &dst)?;
+                let src = into.join(&resolved);
+                within(&root, &src, &raw)?;
+                fs::hard_link(src, &dst)?;
             }
             continue;
         }
@@ -289,6 +306,7 @@ pub fn extract_tar_gz(archive: &Path, into: &Path) -> Result<PathBuf, InstallErr
         }
 
         create_parent(&dst)?;
+        replace(&dst)?;
         let mode = entry.header().mode().unwrap_or(0o644);
         let mut out = BufWriter::with_capacity(CHUNK, fs::File::create(&dst)?);
         io::copy(&mut entry, &mut out)?;
@@ -352,6 +370,49 @@ fn resolve_lexically(anchor: &Path, target: &Path) -> Option<PathBuf> {
         }
     }
     Some(stack.into_iter().collect())
+}
+
+/// Refuses `dst` unless its nearest existing ancestor really resolves inside
+/// `root` (canonical): links already on disk are followed, which the lexical
+/// link checks cannot do.
+fn contained(root: &Path, dst: &Path, raw: &Path) -> Result<(), InstallError> {
+    let mut at = dst.parent();
+    while let Some(dir) = at {
+        if fs::symlink_metadata(dir).is_ok() {
+            return match fs::canonicalize(dir) {
+                Ok(real) if real.starts_with(root) => Ok(()),
+                _ => Err(InstallError::Traversal(format!(
+                    "member {} would be written outside the archive tree",
+                    raw.display()
+                ))),
+            };
+        }
+        at = dir.parent();
+    }
+    Err(InstallError::Traversal(format!(
+        "member {} has no ancestor inside the archive tree",
+        raw.display()
+    )))
+}
+
+/// Refuses `src` (a hard link's source) unless it really resolves inside `root`.
+fn within(root: &Path, src: &Path, raw: &Path) -> Result<(), InstallError> {
+    match fs::canonicalize(src) {
+        Ok(real) if real.starts_with(root) => Ok(()),
+        _ => Err(InstallError::Traversal(format!(
+            "link {} reaches outside the archive tree",
+            raw.display()
+        ))),
+    }
+}
+
+/// Removes a non-directory at `dst` (never following a link), so a member
+/// replaces what an earlier member left there instead of writing through it.
+fn replace(dst: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(dst) {
+        Ok(m) if !m.is_dir() => fs::remove_file(dst),
+        _ => Ok(()),
+    }
 }
 
 fn create_parent(dst: &Path) -> io::Result<()> {
@@ -792,6 +853,112 @@ mod tests {
             Err(InstallError::Io(_)) if cfg!(windows) => {}
             other => panic!("an inside-the-tree symlink must not be refused: {other:?}"),
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A gzipped tar of `members`: (path, entry type, link target, data).
+    #[cfg(unix)]
+    fn write_archive(archive: &Path, members: &[(&str, tar::EntryType, &str, &[u8])]) {
+        let f = std::fs::File::create(archive).unwrap();
+        let enc = flate2::write::GzEncoder::new(f, flate2::Compression::fast());
+        let mut b = tar::Builder::new(enc);
+        for (path, kind, link, data) in members {
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(*kind);
+            h.set_path(path).unwrap();
+            if !link.is_empty() {
+                h.set_link_name(link).unwrap();
+            }
+            h.set_mode(0o755);
+            h.set_size(data.len() as u64);
+            h.set_cksum();
+            b.append(&h, *data).unwrap();
+        }
+        b.into_inner().unwrap().finish().unwrap();
+    }
+
+    #[cfg(unix)]
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = crate::test_tmp::dir().join(format!("vfs-proton-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("into")).unwrap();
+        dir
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn extract_refuses_to_write_beneath_a_link_that_leaves_the_tree() {
+        // GE/b -> .. is the root, and lexically GE/a -> b/.. is GE; really it
+        // is the root's parent. Every link passes the lexical check, so only
+        // resolving the member's real parent catches GE/a/escaped.
+        use tar::EntryType::{Directory, Regular, Symlink};
+        let dir = scratch("chain");
+        let archive = dir.join("chain.tar.gz");
+        write_archive(
+            &archive,
+            &[
+                ("GE/", Directory, "", b""),
+                ("GE/b", Symlink, "..", b""),
+                ("GE/a", Symlink, "b/..", b""),
+                ("GE/a/escaped", Regular, "", b"pwn"),
+            ],
+        );
+        assert!(
+            matches!(
+                extract_tar_gz(&archive, &dir.join("into")),
+                Err(InstallError::Traversal(_))
+            ),
+            "a member beneath a link chain that leaves the tree must be refused"
+        );
+        assert!(!dir.join("escaped").exists(), "nothing was written outside");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn extract_replaces_a_link_rather_than_writing_through_it() {
+        use tar::EntryType::Regular;
+        let dir = scratch("over");
+        let outside = dir.join("outside.txt");
+        std::fs::write(&outside, "keep").unwrap();
+        let into = dir.join("into");
+        std::fs::create_dir_all(into.join("GE")).unwrap();
+        std::os::unix::fs::symlink(&outside, into.join("GE/f")).unwrap();
+        let archive = dir.join("over.tar.gz");
+        write_archive(&archive, &[("GE/f", Regular, "", b"new")]);
+        extract_tar_gz(&archive, &into).unwrap();
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep");
+        assert_eq!(std::fs::read_to_string(into.join("GE/f")).unwrap(), "new");
+        assert!(!std::fs::symlink_metadata(into.join("GE/f"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_hard_link_source_must_really_be_inside_the_tree() {
+        // GE/sub/up -> ../.. is the root, and lexically GE/sub/up/../secret is
+        // GE/sub/secret; really it is the root's sibling.
+        use tar::EntryType::{Directory, Link, Symlink};
+        let dir = scratch("hl");
+        std::fs::write(dir.join("secret"), "s").unwrap();
+        let archive = dir.join("hl.tar.gz");
+        write_archive(
+            &archive,
+            &[
+                ("GE/", Directory, "", b""),
+                ("GE/sub/", Directory, "", b""),
+                ("GE/sub/up", Symlink, "../..", b""),
+                ("GE/h", Link, "GE/sub/up/../secret", b""),
+            ],
+        );
+        assert!(matches!(
+            extract_tar_gz(&archive, &dir.join("into")),
+            Err(InstallError::Traversal(_))
+        ));
+        assert!(!dir.join("into/GE/h").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
