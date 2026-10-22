@@ -672,6 +672,21 @@
                         rs)))
                   [] (range n)))))))
 
+(defn stored-bytes-in
+  "In a txn: the bytes of file `id` whose blocks are stored (0 for no such
+  file): the block lengths of its non-zero slots, without reading their rows.
+  A slot is non-zero only while it holds a reference to its block's row, so
+  this equals cached-ranges' total, except for a block healed (its record
+  found bad, its row dropped) and not yet fetched again, which still counts."
+  ^long [store txn ^bytes id]
+  (if-let [len (file-len store txn id)]
+    (let [bs (.-block-size ^Store store) len (long len) n (blocks-in len bs) ids (read-slots store txn id 0 n)]
+      (loop [b 0 acc 0]
+        (if (< b n)
+          (recur (inc b) (if (pos? (aget ids b)) (+ acc (block-len len bs b)) acc))
+          acc)))
+    0))
+
 (defn content-digests-in
   "In a txn: for each file id, [len digest] (32 bytes) or nil: BLAKE3 in
   derive-key mode over the length and each slot's block hash (or absence),

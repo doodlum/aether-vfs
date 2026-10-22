@@ -170,6 +170,19 @@
   [s source ^String source-key & [opts]]
   (cached/cached (select-keys s [:store :ram :opens]) source source-key opts))
 
+(defn stored-bytes
+  "For each [source-key vpath size mtime] of `items` (the cache files of
+  `cached` sources, :root as its option, default 0), the bytes of its cache
+  file that are stored (0 when there's none), in one snapshot: a vector, in
+  their order. See store/stored-bytes-in."
+  [{:keys [store]} items & [{:keys [root] :or {root 0}}]]
+  (store/read* store
+               (fn [txn]
+                 (mapv (fn [[source-key vp size mtime]]
+                         (store/stored-bytes-in store txn
+                                                (cat/cache-file-id (cat/cache-key source-key root (path/fold vp) size mtime))))
+                       items))))
+
 (defn cache-usage
   "{:files n :bytes logical bytes} of the cache files."
   [{:keys [store]}]

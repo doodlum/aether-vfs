@@ -1,11 +1,13 @@
 (ns aether.director.storage-test
   "Storage: layers (beyond the conformance suite), freezing into live files,
   and the pull-through cache with eviction."
-  (:require [aether.director.proto :as p]
+  (:require [aether.director.path :as path]
+            [aether.director.proto :as p]
             [aether.director.provider :as prov]
             [aether.director.provider.compose :as compose]
             [aether.director.provider.tree :as tree]
             [aether.director.storage :as storage]
+            [aether.director.storage.catalog :as cat]
             [aether.director.store :as store]
             [clojure.test :refer [deftest is testing]])
   (:import (aether.director.provider Stat)
@@ -239,6 +241,85 @@
       (storage/clear-cache! s)
       (is (= 0 (:files (storage/cache-usage s))))
       (is (empty? (:problems (store/verify (:store s))))))))
+
+;; --- stored bytes ------------------------------------------------------------------------------
+
+(defn- item [c sk vp] (let [^Stat st (prov/stat c (path/fold vp))] [sk vp (.-size st) (.-mtime st)]))
+
+(defn- ranges-total
+  "The bytes cached-ranges reports for item [sk vp size mtime] (root 0)."
+  [s [sk vp size mtime]]
+  (reduce + 0 (map (fn [[a b]] (- (long b) (long a)))
+                   (store/cached-ranges (:store s) (cat/cache-file-id (cat/cache-key sk 0 (path/fold vp) size mtime))))))
+
+(defn- read-at [c vp pos n]
+  (let [h (prov/open c vp p/open-read)]
+    (try (prov/read-into h (MemorySegment/ofArray (byte-array n)) 0 pos n) (finally (prov/close! h)))))
+
+(deftest stored-bytes
+  (with-storage [s (tmp)]
+    (let [files {"depot/Empty.bin" (byte-array 0)
+                 "depot/untouched.bin" (noise 1 (* 3 bs))
+                 "depot/part.bin" (noise 2 (* 20 bs))
+                 "depot/full.bin" (noise 3 (+ (* 10 bs) 1234))
+                 "depot/tail.bin" (noise 4 (+ (* 5 bs) 7))}
+          c     (storage/cached s (source files) "steam:test" {:unit-bytes bs})
+          items (mapv #(item c "steam:test" %) (sort (keys files)))
+          check (fn [why]
+                  (testing why
+                    (is (= (mapv #(ranges-total s %) items) (storage/stored-bytes s items)))))]
+      (check "nothing cached")
+      (read-at c "depot/part.bin" 10 1) (read-at c "depot/part.bin" (* 7 bs) (* 3 bs))
+      (read-all c "depot/full.bin")
+      (read-at c "depot/tail.bin" (* 5 bs) 7)
+      (read-all c "depot/empty.bin")
+      (check "empty, partly and fully cached, short last blocks")
+      (is (= {"depot/Empty.bin" 0 "depot/untouched.bin" 0 "depot/part.bin" (* 4 bs)
+              "depot/full.bin" (+ (* 10 bs) 1234) "depot/tail.bin" 7}
+             (zipmap (map second items) (storage/stored-bytes s items))))
+      (testing "the key is Cached's: folded vpath, source key, size, mtime and root"
+        (let [[sk vp size mtime] (item c "steam:test" "depot/full.bin")]
+          (is (= [(+ (* 10 bs) 1234) 0 0 0 0]
+                 (storage/stored-bytes s [[sk (.toUpperCase ^String vp) size mtime] ["steam:other" vp size mtime]
+                                          [sk vp (inc size) mtime] [sk vp size (inc mtime)] [sk "depot/none" size mtime]])))
+          (is (= [0] (storage/stored-bytes s [[sk vp size mtime]] {:root 1})))
+          (let [c1 (storage/cached s (source files) "steam:test" {:root 1 :unit-bytes bs})]
+            (read-all c1 "depot/full.bin")
+            (is (= [size] (storage/stored-bytes s [[sk vp size mtime]] {:root 1})))))))))
+
+(deftest stored-bytes-during-a-fill
+  (with-storage [s (tmp)]
+    (let [files (into {} (for [i (range 40)] [(str "f" i) (noise (+ 100 i) (+ (* 8 bs) (* 100 i)))]))
+          c     (storage/cached s (source files) "src" {:unit-bytes bs})
+          items (mapv #(item c "src" %) (sort (keys files)))
+          sizes (mapv #(nth % 2) items)
+          pool  (Executors/newFixedThreadPool 4)
+          fill  (vec (for [part (partition-all 10 (sort (keys files)))]
+                       (.submit pool ^Callable #(doseq [vp part, b (range 9)] (read-at c vp (* b bs) 1)))))
+          seen  (loop [prev (vec (repeat (count items) 0)) n 0]
+                  (let [now (storage/stored-bytes s items)]
+                    (is (every? true? (map <= prev now sizes)) "never shrinks, never past the size")
+                    (if (every? #(.isDone ^Future %) fill) n (recur now (inc n)))))]
+      (doseq [^Future f fill] (.get f))
+      (.shutdown pool)
+      (is (pos? seen))
+      (is (= sizes (storage/stored-bytes s items)))
+      (is (= (mapv #(ranges-total s %) items) (storage/stored-bytes s items))))))
+
+(deftest stored-bytes-is-fast
+  (with-storage [s (tmp) {:map-size (* 1024 1024 1024)}]
+    (let [n     50000
+          items (vec (for [i (range n)] ["src" (str "dir" (quot i 1000) "/file" i ".dat") (+ 100 (rem i 3000)) 1700000000]))
+          st    (:store s)]
+      (doseq [part (partition-all 5000 (map-indexed vector items))]
+        (store/put-files! st (vec (for [[i [sk vp size mtime]] part :when (even? i)]
+                                    [(cat/cache-file-id (cat/cache-key sk 0 (path/fold vp) size mtime)) (noise i size)]))))
+      (let [time  (fn [] (let [t0 (System/nanoTime) r (storage/stored-bytes s items)] [r (/ (- (System/nanoTime) t0) 1e6)]))
+            [r ms] (time)
+            [_ ms2] (time)]
+        (println (format "stored-bytes: %d files in one call, %.1f ms (again: %.1f ms)" n ms ms2))
+        (is (= (vec (map-indexed (fn [i [_ _ size]] (if (even? i) size 0)) items)) r))
+        (is (< ms 1000.0))))))
 
 (deftest the-whole-stack
   ;; a writable layer over a cached, read-only source: the game's content
