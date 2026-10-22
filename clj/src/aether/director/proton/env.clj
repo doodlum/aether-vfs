@@ -49,8 +49,18 @@
   ["VFS_STATE_DIR" "VFS_HOME" "VFS_LAUNCH_IMAGE" "VFS_DISCOVERY_PATH" "VFS_SHIM_CONFIG" "VFS_SHIM_READY"
    "VFS_CHILD_REFUSED_LOG" "VFS_FORCE_INJECTION"])
 
+(defn- ascii-lower
+  "`s` with only A-Z lower-cased, as Rust's to_ascii_lowercase: Wine compares
+  names ASCII case-insensitively, and the locale's rules would fold more (the
+  Kelvin sign to k)."
+  ^String [^String s]
+  (let [cs (.toCharArray s)]
+    (dotimes [i (alength cs)]
+      (let [c (aget cs i)] (when (<= (int \A) (int c) (int \Z)) (aset cs i (char (+ (int c) 32))))))
+    (String. cs)))
+
 (def ^:private reserved-folded
-  (into #{} (map str/lower-case) (concat ["WINEPREFIX" "PROTONPATH"] transport inject config)))
+  (into #{} (map ascii-lower) (concat ["WINEPREFIX" "PROTONPATH"] transport inject config)))
 
 (def base-dll-overrides
   "WINEDLLOVERRIDES every launch carries: Mono's and Gecko's install prompts
@@ -94,7 +104,7 @@
   case-insensitive, because Wine's environment is: vfs_virtual_dir reaches
   the shim as VFS_VIRTUAL_DIR (is_reserved_env, env.rs:191-196)."
   [name]
-  (contains? reserved-folded (str/lower-case name)))
+  (contains? reserved-folded (ascii-lower name)))
 
 (defn check-extra-env
   "nil, or an ex-info (::error :reserved-env, :name) for the first reserved
@@ -112,7 +122,7 @@
   exactly one is left (merge_dll_overrides, env.rs:213-238)."
   [base extra]
   (let [put     (fn [[order m] name entry]
-                  (let [k (str/lower-case name)]
+                  (let [k (ascii-lower name)]
                     [(if (contains? m k) order (conj order k)) (assoc m k entry)]))
         entries (for [src [base extra]
                       e (map str/trim (str/split (str src) #";"))
@@ -129,7 +139,7 @@
   (vfs-embed/src/session/stage.rs:114-122). A host merges this into its
   extra-env's WINEDLLOVERRIDES."
   [dlls]
-  (str/join ";" (for [d dlls] (str (str/replace (str/lower-case d) #"\.dll$" "") "=n,b"))))
+  (str/join ";" (for [d dlls] (str (str/replace (ascii-lower d) #"\.dll$" "") "=n,b"))))
 
 (defn encode-roots
   "VFS_VIRTUAL_ROOTS's id=location;id=location, or nil for no roots (the
@@ -159,7 +169,8 @@
 
 (defn launch-env
   "The child's environment for `launch` on `host` (see the ns doc), as a sorted
-  map (launch_env, env.rs:54-168):
+  map (launch_env, env.rs:54-168). With no host :cwd, relative paths are made
+  absolute against this process's (absolute, launch/mod.rs:506-514).
 
   - WINEPREFIX; PROTONPATH, absolute, because a relative one silently means
     stock UMU-Proton; runtime-lib-env, with extra-env's LD_LIBRARY_PATH and
@@ -184,6 +195,7 @@
            virtual-roots registry? cwd ready-timeout-secs steam extra-env]}
    {host-env :env host-cwd :cwd}]
   (let [host-env  (or host-env {})
+        host-cwd  (or host-cwd (System/getProperty "user.dir"))
         rt        (absolute runtime host-cwd)
         helper?   (map? steam)
         overrides (cond-> base-dll-overrides helper? (merge-dll-overrides steam-helper-override))

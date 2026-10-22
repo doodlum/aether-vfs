@@ -148,8 +148,9 @@
   "A numeric header field: octal, or GNU base-256 when the top bit is set."
   ^long [^bytes h ^long off ^long len]
   (if (bit-test (aget h off) 7)
-    (reduce (fn [^long acc ^long i] (+ (* acc 256) (bit-and 0xff (aget h i))))
-            (bit-and 0x7f (aget h off)) (range (inc off) (+ off len)))
+    (try (reduce (fn [^long acc ^long i] (Math/addExact (Math/multiplyExact acc 256) (bit-and 0xff (aget h i))))
+                 (bit-and 0x7f (aget h off)) (range (inc off) (+ off len)))
+         (catch ArithmeticException _ (fail :archive "bad archive: a base-256 size past 2^63")))
     (octal h off len)))
 
 (defn- check-sum [^bytes h]
@@ -246,7 +247,10 @@
                   (let [nm    (cstr h 0 100)
                         pre   (when ustar? (cstr h 345 155))
                         name  (or (pax "path") long-name (if (seq pre) (str pre "/" nm) nm))
-                        size  (or (some-> (pax "size") parse-long) size)
+                        size  (if-let [s (pax "size")]
+                                (let [n (parse-long s)]
+                                  (if (and n (not (neg? n))) n (fail :archive (str "bad archive: bad pax size " (pr-str s)))))
+                                size)
                         data  (bounded in size)]
                     (f {:name name
                         :link (or (pax "linkpath") long-link (cstr h 157 100))
@@ -267,6 +271,12 @@
   (GZIPInputStream. (BufferedInputStream. in chunk-size) 65536))
 
 (def ^:private nofollow (into-array LinkOption [LinkOption/NOFOLLOW_LINKS]))
+
+(defn- within!
+  "Refuses `f` unless it really resolves inside `root` (canonical)."
+  [^File root ^File f raw]
+  (when-not (.startsWith (.toPath (.getCanonicalFile f)) (.toPath root))
+    (fail :traversal (str "member " raw " reaches outside the archive tree") {:member raw})))
 
 (defn- contained!
   "Refuses to write `dst` when its nearest existing ancestor really resolves
@@ -335,7 +345,9 @@
                   (replace! dst)
                   (if (= :symlink kind)
                     (Files/createSymbolicLink (.toPath dst) (.toPath (io/file link)) (make-array FileAttribute 0))
-                    (Files/createLink (.toPath dst) (.toPath (io/file root resolved)))))
+                    (let [src (io/file root resolved)]
+                      (within! root src name)
+                      (Files/createLink (.toPath dst) (.toPath src)))))
                 :file     (do (.mkdirs (.getParentFile dst))
                               (replace! dst)
                               (with-open [out (BufferedOutputStream. (FileOutputStream. dst) chunk-size)]

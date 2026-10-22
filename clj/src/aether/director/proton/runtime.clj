@@ -94,9 +94,11 @@
   "[tag dir] for every verified runtime under <home>/runtimes, newest first.
   The dir is the one found, never re-joined from the tag (the two needn't
   agree); a directory that fails verify-ge is skipped, and a symlinked one is
-  followed (installed_dirs, runtime.rs:190-211)."
+  followed. No runtimes dir is none; one that can't be read is an IOException (installed_dirs, runtime.rs:190-211)."
   [home]
-  (let [names (.list (io/file (layout/runtimes home)))]
+  (let [d     (io/file (layout/runtimes home))
+        names (when (.exists d)
+                (or (.list d) (throw (java.io.IOException. (str "can't read " d)))))]
     (->> (for [n (sort names)
                :let [dir (layout/join (layout/runtimes home) n)]
                :when (.isDirectory (io/file dir))

@@ -3,6 +3,7 @@
   (:require [aether.director.proton.layout :as layout]
             [aether.director.proton.runtime :as rt]
             [clojure.java.io :as io]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is testing]])
   (:import (java.nio.file Files)
            (java.nio.file.attribute FileAttribute)))
@@ -111,6 +112,12 @@
     (is (= (layout/runtime-dir home "b") (rt/newest home))
         "the directory found, not one re-joined from the tag")))
 
+(deftest an-unreadable-runtimes-dir-is-an-error-not-empty
+  ;; read_dir's error is returned, as in runtime.rs:190-196; a missing dir is empty
+  (let [home (temp-dir)]
+    (spit (io/file (layout/runtimes home)) "a file, not a directory")
+    (is (thrown? java.io.IOException (rt/installed-dirs home)))))
+
 (defn- symlink! [link target]
   (try (Files/createSymbolicLink (.toPath (io/file link)) (.toPath (io/file target)) (make-array FileAttribute 0)) true
        (catch Exception _ false)))
@@ -122,6 +129,6 @@
     (write! real "version" "1 GE-Proton11-7\n")
     (.mkdirs (io/file (layout/runtimes home)))
     (if-not (and (symlink! link real) (symlink! (layout/runtime-dir home "dangling") (str base "/gone")))
-      (is true "skipped: this host can't create symlinks")
+      (is (str/starts-with? (System/getProperty "os.name") "Windows") "only Windows may skip: it needs Developer Mode for a symlink")
       (is (= [["GE-Proton11-7" link]] (rt/installed-dirs home))
           "listed at the link (never canonicalized); the dangling link is skipped"))))

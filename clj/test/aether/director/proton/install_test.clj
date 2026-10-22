@@ -243,13 +243,41 @@
         top (extract (tar-gz-file dir "b256.tar.gz" {:name "GE/x" :data "abc" :size-bytes size}) into)]
     (is (= "abc" (slurp (io/file top "x"))))))
 
+(deftest bad-sizes-are-archive-errors
+  (let [dir (temp-dir) into (str dir "/into") kind #(::install/error (error-of %))
+        huge (doto (byte-array 12 (unchecked-byte 0xff)) (aset-byte 0 (unchecked-byte 0x80)))
+        pax  (fn [v] (let [rec (str " size=" v "\n") n (+ (count rec) 2)] (str n rec)))]
+    (is (= :archive (kind #(extract (tar-gz-file dir "big.tar.gz" {:name "GE/x" :data "" :size-bytes huge}) into)))
+        "a base-256 size past a long")
+    (doseq [v ["-5" "x"]]
+      (is (= :archive (kind #(extract (tar-gz-file dir "neg.tar.gz" {:name "p" :type \x :data (pax v)}
+                                                   {:name "GE/x" :data "abc"})
+                                      into)))
+          (str "a PAX size of " v)))))
+
+(deftest a-hard-link-source-must-really-be-inside-the-tree
+  ;; GE/sub/up -> ../.. is lexically the root, so GE/sub/up/../secret is
+  ;; GE/secret; really it is the root's sibling
+  (let [dir (temp-dir) into (str dir "/into")]
+    (spit (io/file dir "secret") "s")
+    (let [got (try (error-of #(extract (tar-gz-file dir "hl.tar.gz"
+                                                    {:name "GE/" :type \5}
+                                                    {:name "GE/sub/" :type \5}
+                                                    {:name "GE/sub/up" :type \2 :link "../.."}
+                                                    {:name "GE/h" :type \1 :link "GE/sub/up/../secret"})
+                                       into))
+                   (catch java.io.IOException e e))]
+      (if (instance? java.io.IOException got)
+        (is (str/starts-with? (System/getProperty "os.name") "Windows") (str got))
+        (is (= :traversal (::install/error got)))))))
+
 (deftest extract-replaces-a-link-rather-than-writing-through-it
   (let [dir (temp-dir) into (str dir "/into") outside (io/file dir "outside.txt")]
     (spit outside "keep")
     (.mkdirs (io/file into "GE"))
     (if-not (try (Files/createSymbolicLink (.toPath (io/file into "GE/f")) (.toPath outside) (make-array FileAttribute 0))
                  (catch Exception _ nil))
-      (is true "skipped: this host can't create symlinks")
+      (is (str/starts-with? (System/getProperty "os.name") "Windows") "only Windows may skip: it needs Developer Mode for a symlink")
       (do (extract (tar-gz-file dir "over.tar.gz" {:name "GE/f" :data "new"}) into)
           (is (= "keep" (slurp outside)))
           (is (= "new" (slurp (io/file into "GE/f"))))))))

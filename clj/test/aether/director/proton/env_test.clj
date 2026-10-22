@@ -89,6 +89,9 @@
     (is (= "/home/me/runtimes/GE-Proton11-6-x86_64" (e "PROTONPATH")))
     (is (str/starts-with? (e "LD_LIBRARY_PATH") "/home/me/runtimes/GE-Proton11-6-x86_64/files/lib/"))
     (is (= "/runtimes/x" (env/absolute "runtimes/x" "/")))
+    (is (= (str (System/getProperty "user.dir") "/runtimes/x")
+           ((launch-env (assoc l :runtime "runtimes/x") {:env {}}) "PROTONPATH"))
+        "with no host cwd, this process's, as launch/mod.rs:506-514")
     (is (= "/a/b" (env/absolute "/a/b" "/home/me")))))
 
 (deftest the-ring-is-named-by-its-wine-path-and-no-section-is-offered
@@ -119,7 +122,9 @@
   (is (= "mscoree=d;MSHTML=n;dxgi=n;d3d11=n"
          (env/merge-dll-overrides env/base-dll-overrides "MSHTML=n;dxgi,d3d11=n; ;"))
       "the caller's entry replaces ours in place; a group splits per DLL")
-  (is (= "a=d;winemenubuilder" (env/merge-dll-overrides "a=d" "winemenubuilder"))))
+  (is (= "a=d;winemenubuilder" (env/merge-dll-overrides "a=d" "winemenubuilder")))
+  (is (= "k=d;K=n" (env/merge-dll-overrides "k=d" "K=n"))
+      "ASCII case folding only, as eq_ignore_ascii_case"))
 
 (deftest extra-env-reaches-the-child-env-with-overrides-merged
   (let [e (launch-env (assoc (sample) :extra-env {"WINEDLLOVERRIDES" "d3dx9_42=n,b"
@@ -133,7 +138,8 @@
   (doseq [n ["WINEPREFIX" "protonpath" "VFS_VIRTUAL_DIR" "vfs_virtual_dir" "VFS_REGISTRY"
              "VFS_INJECT_STEAM_HELPER" "VFS_FORCE_INJECTION" "VFS_SHIM_READY"]]
     (is (env/reserved? n) n))
-  (doseq [n ["WINEDLLOVERRIDES" "WINEDEBUG" "SteamAppId" "VFS_BENCH" "LD_LIBRARY_PATH"]]
+  (doseq [n ["WINEDLLOVERRIDES" "WINEDEBUG" "SteamAppId" "VFS_BENCH" "LD_LIBRARY_PATH"
+             "VFS_ROOT_BACKINGS"]]
     (is (not (env/reserved? n)) n))
   (is (nil? (env/check-extra-env {"WINEDEBUG" "-all"})))
   (let [e (try (env/check-extra-env {"WINEDEBUG" "" "vfs_ring_path" "x"}) nil
