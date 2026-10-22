@@ -4,12 +4,14 @@
   in a file (VFS_RING_PATH, ParkWaker): the Linux transport, minus Wine.
 
   Needs Windows and the release natives (cd rust; cargo build --release -p
-  vfs-inject -p vfs-shim-dll -p vfs-fixture-read); skips itself otherwise."
+  vfs-inject -p vfs-shim-dll -p vfs-fixture-read), found in $VFS_NATIVES or
+  <repo>/rust/target/release; skips itself otherwise, and fails without the
+  natives under VFS_TEST_REQUIRE_ALL=1."
   (:require [aether.director.fixture :as fixture]
             [aether.director.launch :as launch]
-            [aether.director.platform :as platform]
             [aether.director.provider.tree :as tree]
             [aether.director.ring :as ring]
+            [aether.director.test-support :as ts]
             [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]])
@@ -17,16 +19,16 @@
            (java.nio.file Files)
            (java.nio.file.attribute FileAttribute)))
 
-(def natives (io/file "../rust/target/release"))
+(def natives (ts/natives))
 
-(defn skip-reason
-  "Why the end-to-end tests can't run here, or nil."
+(defn requirements
+  "What the end-to-end tests need: Windows, then the three natives."
   []
-  (cond
-    (not= :platform/windows (platform/current)) "not Windows"
-    :else (some (fn [n] (when-not (.isFile (io/file natives n))
-                          (str (io/file natives n) " not built (cargo build --release -p vfs-inject -p vfs-shim-dll -p vfs-fixture-read)")))
-                ["vfs-injector.exe" "vfs_shim_dll.dll" "vfs-fixture-read.exe"])))
+  [(ts/windows)
+   (some (fn [n] (ts/prerequisite (.isFile (io/file natives n))
+                                  (str (io/file natives n) " not built (cd rust; cargo build --release -p vfs-inject "
+                                       "-p vfs-shim-dll -p vfs-fixture-read), or set VFS_NATIVES")))
+         ["vfs-injector.exe" "vfs_shim_dll.dll" "vfs-fixture-read.exe"])])
 
 (defn- temp-dir ^File [] (.toFile (Files/createTempDirectory "aether-file-ring" (make-array FileAttribute 0))))
 
@@ -65,8 +67,7 @@
              {"VFS_FIXTURE_OPS" (str script) "VFS_FIXTURE_OPS_OUT" (str (io/file state "ops.out"))}))))
 
 (deftest a-program-reads-through-the-vfs-over-a-file-ring
-  (if-let [why (skip-reason)]
-    (println "SKIP file-ring end-to-end:" why)
+  (ts/requires (requirements)
     (let [{:keys [exit served ring-file transport]} (run-fixture :file read-env)]
       (is (= :file transport))
       (is (= 0 exit) "the fixture read big.bin's 70000 bytes through the shim")
@@ -74,8 +75,7 @@
       (is (.isFile (io/file ring-file)) "a ring file in the session's state"))))
 
 (deftest the-ops-phase-reads-through-a-file-ring-too
-  (if-let [why (skip-reason)]
-    (println "SKIP file-ring end-to-end:" why)
+  (ts/requires (requirements)
     (let [{:keys [exit served]} (run-fixture :file (ops-env 50))]
       (is (= 0 exit))
       (is (> (long served) 50)))))

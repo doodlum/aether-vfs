@@ -3,6 +3,7 @@
   (rust/crates/vfs-env/src/lib.rs:1115-1240, vfs-proton launch/mod.rs:753-788,
   launch/env.rs:314-339)."
   (:require [aether.director.env :as env]
+            [aether.director.test-support :as ts]
             [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]])
@@ -24,9 +25,8 @@
     (mapv consts (re-seq #"[A-Z0-9_]+" body))))
 
 (deftest the-tables-match-vfs-env
-  (let [f (io/file "../rust/crates/vfs-env/src/lib.rs")]
-    (if-not (.isFile f)
-      (println "SKIP vfs-env table check:" (str f) "not found")
+  (let [f (io/file (ts/repo-root) "rust" "crates" "vfs-env" "src" "lib.rs")]
+    (ts/requires [(ts/prerequisite (.isFile f) (str f " not found: the Rust workspace is part of the checkout"))]
       (let [src (slurp f)]
         (is (= (rust-table src "TRANSPORT") env/transport))
         (is (= (rust-table src "INJECT") env/inject))

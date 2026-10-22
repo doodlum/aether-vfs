@@ -2,6 +2,7 @@
   "vfs-proton/src/runtime.rs's tests, over fixture runtimes/ dirs in a temp dir."
   (:require [aether.director.proton.layout :as layout]
             [aether.director.proton.runtime :as rt]
+            [aether.director.test-support :as ts]
             [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]])
@@ -119,8 +120,7 @@
     (is (thrown? java.io.IOException (rt/installed-dirs home)))))
 
 (defn- symlink! [link target]
-  (try (Files/createSymbolicLink (.toPath (io/file link)) (.toPath (io/file target)) (make-array FileAttribute 0)) true
-       (catch Exception _ false)))
+  (Files/createSymbolicLink (.toPath (io/file link)) (.toPath (io/file target)) (make-array FileAttribute 0)))
 
 (deftest a-symlinked-runtime-directory-is-listed-under-its-link
   ;; runtime.rs's #[cfg(unix)] test; on Windows a symlink needs Developer Mode
@@ -128,7 +128,8 @@
         link (layout/runtime-dir home "GE-Proton11-7-x86_64")]
     (write! real "version" "1 GE-Proton11-7\n")
     (.mkdirs (io/file (layout/runtimes home)))
-    (if-not (and (symlink! link real) (symlink! (layout/runtime-dir home "dangling") (str base "/gone")))
-      (is (str/starts-with? (System/getProperty "os.name") "Windows") "only Windows may skip: it needs Developer Mode for a symlink")
+    (ts/requires [(ts/linux)]
+      (symlink! link real)
+      (symlink! (layout/runtime-dir home "dangling") (str base "/gone"))
       (is (= [["GE-Proton11-7" link]] (rt/installed-dirs home))
           "listed at the link (never canonicalized); the dangling link is skipped"))))

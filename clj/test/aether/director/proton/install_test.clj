@@ -4,6 +4,7 @@
   tarballs these tests build byte by byte."
   (:require [aether.director.proton.install :as install]
             [aether.director.proton.layout :as layout]
+            [aether.director.test-support :as ts]
             [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]])
@@ -172,12 +173,11 @@
         archive (tar-gz-file dir "sym.tar.gz" ge-version
                              {:name "GE-Proton11-6-x86_64/files/lib/alias" :type \2 :link "../../version"})]
     (.mkdirs (io/file into))
-    (try (let [top (extract archive into)]
-           (is (= "GE-Proton11-6-x86_64" (.getName (io/file top))))
-           (is (= "../../version" (str (Files/readSymbolicLink (.toPath (io/file top "files/lib/alias")))))))
-         (catch java.io.IOException e
-           ;; creating a symlink needs privilege on Windows; a traversal refusal is what must never happen
-           (is (str/starts-with? (System/getProperty "os.name") "Windows") (str e))))))
+    ;; creating a symlink needs privilege on Windows
+    (ts/requires [(ts/linux)]
+      (let [top (extract archive into)]
+        (is (= "GE-Proton11-6-x86_64" (.getName (io/file top))))
+        (is (= "../../version" (str (Files/readSymbolicLink (.toPath (io/file top "files/lib/alias"))))))))))
 
 (deftest extract-makes-hard-links-and-directories
   (let [dir (temp-dir) into (str dir "/into")
@@ -260,44 +260,36 @@
   ;; GE/secret; really it is the root's sibling
   (let [dir (temp-dir) into (str dir "/into")]
     (spit (io/file dir "secret") "s")
-    (let [got (try (error-of #(extract (tar-gz-file dir "hl.tar.gz"
-                                                    {:name "GE/" :type \5}
-                                                    {:name "GE/sub/" :type \5}
-                                                    {:name "GE/sub/up" :type \2 :link "../.."}
-                                                    {:name "GE/h" :type \1 :link "GE/sub/up/../secret"})
-                                       into))
-                   (catch java.io.IOException e e))]
-      (if (instance? java.io.IOException got)
-        (is (str/starts-with? (System/getProperty "os.name") "Windows") (str got))
-        (is (= :traversal (::install/error got)))))))
+    (ts/requires [(ts/linux)]
+      (is (= :traversal (::install/error (error-of #(extract (tar-gz-file dir "hl.tar.gz"
+                                                                          {:name "GE/" :type \5}
+                                                                          {:name "GE/sub/" :type \5}
+                                                                          {:name "GE/sub/up" :type \2 :link "../.."}
+                                                                          {:name "GE/h" :type \1 :link "GE/sub/up/../secret"})
+                                                             into))))))))
 
 (deftest extract-replaces-a-link-rather-than-writing-through-it
   (let [dir (temp-dir) into (str dir "/into") outside (io/file dir "outside.txt")]
     (spit outside "keep")
     (.mkdirs (io/file into "GE"))
-    (if-not (try (Files/createSymbolicLink (.toPath (io/file into "GE/f")) (.toPath outside) (make-array FileAttribute 0))
-                 (catch Exception _ nil))
-      (is (str/starts-with? (System/getProperty "os.name") "Windows") "only Windows may skip: it needs Developer Mode for a symlink")
-      (do (extract (tar-gz-file dir "over.tar.gz" {:name "GE/f" :data "new"}) into)
-          (is (= "keep" (slurp outside)))
-          (is (= "new" (slurp (io/file into "GE/f"))))))))
+    (ts/requires [(ts/linux)]
+      (Files/createSymbolicLink (.toPath (io/file into "GE/f")) (.toPath outside) (make-array FileAttribute 0))
+      (extract (tar-gz-file dir "over.tar.gz" {:name "GE/f" :data "new"}) into)
+      (is (= "keep" (slurp outside)))
+      (is (= "new" (slurp (io/file into "GE/f")))))))
 
 (deftest extract-refuses-to-write-beneath-a-link-that-leaves-the-tree
   ;; GE/b -> .. is the root, and lexically GE/a -> b/.. is GE; really it is
   ;; the root's parent: the real-path check catches what the lexical one can't
-  (let [dir (temp-dir) into (str dir "/into")
-        got (try (error-of #(extract (tar-gz-file dir "chain.tar.gz"
-                                                  {:name "GE/" :type \5}
-                                                  {:name "GE/b" :type \2 :link ".."}
-                                                  {:name "GE/a" :type \2 :link "b/.."}
-                                                  {:name "GE/a/escaped" :data "pwn"})
-                                     into))
-                 (catch java.io.IOException e e))]
-    (if (instance? java.io.IOException got)
-      ;; creating a symlink needs privilege on Windows
-      (is (str/starts-with? (System/getProperty "os.name") "Windows") (str got))
-      (is (= :traversal (::install/error got))))
-    (is (not (.exists (io/file dir "escaped"))))))
+  (let [dir (temp-dir) into (str dir "/into")]
+    (ts/requires [(ts/linux)]
+      (is (= :traversal (::install/error (error-of #(extract (tar-gz-file dir "chain.tar.gz"
+                                                                          {:name "GE/" :type \5}
+                                                                          {:name "GE/b" :type \2 :link ".."}
+                                                                          {:name "GE/a" :type \2 :link "b/.."}
+                                                                          {:name "GE/a/escaped" :data "pwn"})
+                                                             into)))))
+      (is (not (.exists (io/file dir "escaped")))))))
 
 ;; --- the gate, the plan, the rename -------------------------------------------------------
 

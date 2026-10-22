@@ -7,6 +7,7 @@
             [aether.director.ring :as ring]
             [aether.director.ring.backing :as backing]
             [clojure.java.io :as io]
+            [aether.director.test-support :as ts]
             [clojure.test :refer [deftest is testing]])
   (:import (aether.director Native ParkWaker)
            (java.io File)
@@ -129,8 +130,7 @@
       (is (.delete f)))))
 
 (deftest the-section-backing-warms-up-through-an-event-waker-that-wakes-nothing
-  (if-not (= :platform/windows (aether.director.platform/current))
-    (println "SKIP section backing: Windows-only")
+  (ts/requires [(ts/windows)]
     (let [b (backing/open-backing :section (p/geometry) {:name (str "Local\\vfs_backing_test_" (System/nanoTime))})]
       (try
         (is (instance? aether.director.EventWaker (:waker b)))

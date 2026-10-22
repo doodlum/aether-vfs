@@ -6,6 +6,7 @@
             [aether.director.registry :as registry]
             [aether.director.ring :as ring]
             [aether.director.provider.tree :as tree]
+            [aether.director.test-support :as ts]
             [clojure.test :refer [deftest is testing]])
   (:import (java.lang.foreign Arena MemorySegment ValueLayout)
            (java.nio.file Files)))
@@ -45,27 +46,28 @@
   (.get (.view ^aether.director.Native$Section section) ValueLayout/JAVA_LONG_UNALIGNED (long p/rh-reg-gen)))
 
 (deftest registry-ops-over-the-ring
-  (let [v   @vectors
-        dir (.toFile (Files/createTempDirectory "aether-ring-reg" (make-array java.nio.file.attribute.FileAttribute 0)))
-        reg (registry/registry dir)
-        t   (tree/build [])
-        srv (ring/start t {:name (str "Local\\vfs_ring_clj_test_" (System/nanoTime)) :workers 2 :warm-up 0 :registry reg})
-        bare (ring/start t {:name (str "Local\\vfs_ring_clj_test_" (System/nanoTime)) :workers 1 :warm-up 0})]
-    (try
-      (is (:registry? srv))
-      (is (= 1 (reg-gen srv)) "reg_gen is published when the ring starts")
-      (testing "a write is served, bumps reg_gen, and is seen by a lookup"
-        (is (= [0 (vec (registry/encode-version-reply 1))] (call srv 17 (unhex (v "reg-set-value")))))
-        (is (= 2 (reg-gen srv)))
-        (is (= [0 (vec (registry/encode-lookup-reply 1 :present false))] (call srv 15 (unhex (v "reg-path")))))
-        (is (= 2 (reg-gen srv)) "reads don't bump it"))
-      (testing "refusals"
-        (is (= p/bad-request (first (call srv 15 (byte-array [1 2 3])))) "doesn't decode")
-        (is (= -10 (first (call srv 19 (unhex (v "reg-create-key-volatile"))))) "EXISTS")
-        (is (= 2 (reg-gen srv))))
-      (testing "without a registry, the ops aren't supported and reg_gen stays 0"
-        (is (= p/not-supported (first (call bare 15 (unhex (v "reg-path"))))))
-        (is (= 0 (reg-gen bare)))
-        (is (not (:registry? bare))))
-      (finally
-        (ring/stop srv) (ring/stop bare) (registry/close! reg)))))
+  (ts/requires [(ts/windows)]
+    (let [v   @vectors
+          dir (.toFile (Files/createTempDirectory "aether-ring-reg" (make-array java.nio.file.attribute.FileAttribute 0)))
+          reg (registry/registry dir)
+          t   (tree/build [])
+          srv (ring/start t {:name (str "Local\\vfs_ring_clj_test_" (System/nanoTime)) :workers 2 :warm-up 0 :registry reg})
+          bare (ring/start t {:name (str "Local\\vfs_ring_clj_test_" (System/nanoTime)) :workers 1 :warm-up 0})]
+      (try
+        (is (:registry? srv))
+        (is (= 1 (reg-gen srv)) "reg_gen is published when the ring starts")
+        (testing "a write is served, bumps reg_gen, and is seen by a lookup"
+          (is (= [0 (vec (registry/encode-version-reply 1))] (call srv 17 (unhex (v "reg-set-value")))))
+          (is (= 2 (reg-gen srv)))
+          (is (= [0 (vec (registry/encode-lookup-reply 1 :present false))] (call srv 15 (unhex (v "reg-path")))))
+          (is (= 2 (reg-gen srv)) "reads don't bump it"))
+        (testing "refusals"
+          (is (= p/bad-request (first (call srv 15 (byte-array [1 2 3])))) "doesn't decode")
+          (is (= -10 (first (call srv 19 (unhex (v "reg-create-key-volatile"))))) "EXISTS")
+          (is (= 2 (reg-gen srv))))
+        (testing "without a registry, the ops aren't supported and reg_gen stays 0"
+          (is (= p/not-supported (first (call bare 15 (unhex (v "reg-path"))))))
+          (is (= 0 (reg-gen bare)))
+          (is (not (:registry? bare))))
+        (finally
+          (ring/stop srv) (ring/stop bare) (registry/close! reg))))))

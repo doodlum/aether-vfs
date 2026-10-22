@@ -2,10 +2,9 @@
   "The platform value, and the ring's two wakers: EventWaker (named events, the
   Windows section transport) and ParkWaker (no events: spin, then park)."
   (:require [aether.director.platform :as platform]
+            [aether.director.test-support :as ts]
             [clojure.test :refer [deftest is testing]])
   (:import (aether.director EventWaker Native ParkWaker Waker)))
-
-(def windows? (= :platform/windows (platform/current)))
 
 (deftest the-platform-comes-from-the-os-name-unless-overridden
   (is (= :platform/windows (platform/of-os-name "Windows 11")))
@@ -52,8 +51,7 @@
       (.close w))))
 
 (deftest event-waker-is-the-section-transport-s-wake
-  (if-not windows?
-    (println "SKIP event-waker test: named events are Windows-only")
+  (ts/requires [(ts/windows)]
     (let [n   (str "Local\\vfs_waker_test_" (System/nanoTime))
           srv (Native/createEvent (str n "_srv"))
           cli (Native/createEvent (str n "_cli"))
