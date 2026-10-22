@@ -256,8 +256,8 @@
           (str "a PAX size of " v)))))
 
 (deftest a-hard-link-source-must-really-be-inside-the-tree
-  ;; GE/sub/up -> ../.. is lexically the root, so GE/sub/up/../secret is
-  ;; GE/secret; really it is the root's sibling
+  ;; GE/sub/up -> ../.. is the root, and lexically GE/sub/up/../secret is
+  ;; GE/sub/secret, which isn't there; really it is the root's sibling
   (let [dir (temp-dir) into (str dir "/into")]
     (spit (io/file dir "secret") "s")
     (ts/requires [(ts/linux)]
@@ -266,7 +266,8 @@
                                                                           {:name "GE/sub/" :type \5}
                                                                           {:name "GE/sub/up" :type \2 :link "../.."}
                                                                           {:name "GE/h" :type \1 :link "GE/sub/up/../secret"})
-                                                             into))))))))
+                                                             into)))))
+      (is (not (Files/exists (.toPath (io/file into "GE/h")) (make-array LinkOption 0)))))))
 
 (deftest extract-replaces-a-link-rather-than-writing-through-it
   (let [dir (temp-dir) into (str dir "/into") outside (io/file dir "outside.txt")]

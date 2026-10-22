@@ -273,10 +273,16 @@
 (def ^:private nofollow (into-array LinkOption [LinkOption/NOFOLLOW_LINKS]))
 
 (defn- within!
-  "Refuses `f` unless it really resolves inside `root` (canonical)."
+  "Refuses `f` (a hard link's source) unless it exists and really resolves
+  inside `root` (canonical), as fs::canonicalize does in within (install.rs).
+  Not getCanonicalFile, which resolves only the part of a path that exists: a
+  source missing below a link that leaves the tree would pass, and
+  createLink then fail as an I/O error, not a refusal."
   [^File root ^File f raw]
-  (when-not (.startsWith (.toPath (.getCanonicalFile f)) (.toPath root))
-    (fail :traversal (str "member " raw " reaches outside the archive tree") {:member raw})))
+  (let [real (try (.toRealPath (.toPath f) (make-array LinkOption 0))
+                  (catch java.io.IOException _ nil))]
+    (when-not (and real (.startsWith ^Path real (.toPath root)))
+      (fail :traversal (str "member " raw " reaches outside the archive tree") {:member raw}))))
 
 (defn- contained!
   "Refuses to write `dst` when its nearest existing ancestor really resolves
