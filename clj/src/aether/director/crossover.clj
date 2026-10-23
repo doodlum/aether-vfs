@@ -243,7 +243,7 @@
       (throw (ex-info (str n " not found in " natives) {:file (str (io/file (str natives) n))}))))
   (penv/check-extra-env (into {} (remove (fn [[k]] (= "WINEDLLOVERRIDES" k))) env))
   (let [natives (.getAbsolutePath (io/file (str natives)))
-        target  (plaunch/wine-path dir (str (or launch-image exe)))
+        target  (plaunch/wine-path dir (str (or exe launch-image)))
         ;; a host builds C: locations with its own path joins: Wine's separator only
         roots   (into {} (for [[id at] roots] [id (str/replace (str at) "/" "\\")]))
         child   (launch-env {:install install :server server :root0 root-location :roots roots

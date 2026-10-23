@@ -122,7 +122,13 @@
         _      (when staged (log "staged" (:staged staged)))]
     (try
       (let [l    (launch/start! s (assoc opts :platform platform
-                                         :exe (or (:exe staged) (:exe opts)) :launch-image (:exe staged)))
+                                         :exe (or (:exe staged) (:exe opts))
+                                         ;; the shim makes the launch image's folder a second
+                                         ;; spelling of root 0, so it must be the stage
+                                         ;; folder itself: an exe staged at
+                                         ;; stage/bin/x64/game.exe finds ../../archive there
+                                         :launch-image (when staged
+                                                         (str (io/file stage-dir (.getName (io/file (:exe staged))))))))
             _    (when on-launch (on-launch l))
             code (launch/await-exit l)]
         (log "exit" code (ring/stats server))

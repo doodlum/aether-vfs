@@ -305,7 +305,6 @@
             _      (wine/ensure! (:home p) (:runtime p) name init)
             root0  (:root-location session)
             locs   (cons root0 (vals (:roots session)))
-            opts   (update opts :cwd #(or % root0))
             plan   (plaunch/plan session opts
                                  (assoc p :listing (wine/listing (:prefix p) locs)
                                           :manifest (wine/read-manifest (:prefix p)))

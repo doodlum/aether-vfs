@@ -238,7 +238,7 @@
                         {:transport transport :ring-path ring-path}))
         _       (penv/check-extra-env env)
         root0   (or root-location default-root-location)
-        target  (or target (wine-path dir (str (or launch-image exe))))
+        target  (or target (wine-path dir (str (or exe launch-image))))
         image   (when launch-image (wine-path dir (str launch-image)))
         extra   (vec (sort roots))
         linked  (for [[id loc backing] (cons [0 root0 root]

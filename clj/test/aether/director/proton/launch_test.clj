@@ -144,6 +144,17 @@
            argv)
         "the target in C: form, the injector, DLL, config and ready as host paths")))
 
+(deftest a-nested-exe-is-the-target-and-runs-in-its-own-folder
+  ;; run/launch! names the launch image at the stage folder's top, whatever
+  ;; folder the exe is staged in: the shim aliases the image's folder to root 0
+  (let [nested (assoc opts :exe "/home/me/s/stage/bin/x64/game.exe" :launch-image "/home/me/s/stage/game.exe")
+        {:keys [argv env]} (launch/plan session nested proton host)
+        e (into {} env)]
+    (is (= "C:\\vfs-session\\stage\\bin\\x64\\game.exe" (second argv)) "the exe runs, not the image's name")
+    (is (= "C:\\vfs-session\\stage\\bin\\x64" (e "VFS_INJECT_CWD"))
+        "in its own folder, which exists on disk (root 0's spelling of it doesn't)")
+    (is (= "C:\\vfs-session\\stage\\game.exe" (e "VFS_LAUNCH_IMAGE")))))
+
 (deftest the-linux-plan-env-is-proton-envs-with-the-live-geometry
   (let [{:keys [env remove]} (launch/plan session opts proton host)
         e (into {} env)]
