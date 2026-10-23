@@ -48,8 +48,13 @@
     (when (and (<= 0 pid 0xffffffff) (= "steam" (some-> (comm-of pid) str/trim)))
       pid)))
 
-(defn- slurp-or-nil [f]
-  (let [f (io/file f)] (when (.isFile f) (slurp f))))
+(defn- slurp-or-nil
+  "`f`'s text, or nil when it isn't a file. Read whole, not through slurp's
+  stream: available() fails on procfs files (/proc/<pid>/comm) on recent JDKs."
+  [f]
+  (let [f (io/file f)]
+    (when (.isFile f)
+      (String. (java.nio.file.Files/readAllBytes (.toPath f)) java.nio.charset.StandardCharsets/UTF_8))))
 
 (defn running-client
   "The pid of the Steam client running out of `state-dir`, or nil: steam.pid

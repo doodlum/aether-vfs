@@ -37,6 +37,7 @@
             [aether.director.proton.prefix :as prefix]
             [aether.director.proton.runtime :as runtime]
             [aether.director.proton.steam :as steam]
+            [aether.director.proton.wine :as wine]
             [clojure.java.io :as io]
             [clojure.string :as str])
   (:import (java.io ByteArrayOutputStream File)
@@ -234,13 +235,6 @@
      :server (select-keys server [:transport :ring-path :host-path :map-bytes :cap :arena-offset :arena-len
                                   :registry?])}))
 
-(defn- unimplemented
-  "Throws for an effect the Linux launch needs that isn't built yet: spec
-  §5.1's `task`, so the gap is explicit."
-  [what task msg]
-  (throw (ex-info (str msg " is not implemented yet (docs/linux-port-research.md §5.1, task " task ")")
-                  {:aether/unimplemented what :aether/task task})))
-
 (defn- session-id
   "The anonymous prefix's name for a session: its state dir, hashed (as
   wine_session_id, session/proton/mod.rs:374-379; only stable for itself)."
@@ -271,25 +265,62 @@
      :steam   (steam/steam-side {:prefix-init prefix-init :helper? helper? :env (:env opts) :state-dir state
                                  :client-pid (when state (steam/running-client state))})}))
 
-(defrecord LinuxLaunch [plan]
+(defrecord LinuxLaunch [^Process process plan quiet requested ended cleanup]
+  ;; liveness is the prefix's, not wine's: a launcher that starts the game
+  ;; and exits (skse64_loader.exe -> SkyrimSE.exe) keeps the launch alive
+  ;; until wineserver -w returns (session/proton/handle.rs)
   Launch
-  (await-exit [_] (unimplemented :launch/await-exit 11 "waiting on wine, then wineserver -w"))
-  (alive? [_] (unimplemented :launch/alive? 11 "a Wine launch's liveness (wine alive or wineserver -w)"))
-  (stop! [_] (unimplemented :launch/stop! 7 "stopping a Wine launch (wineserver -k)")))
+  (await-exit [_]
+    (let [code (.waitFor process)]
+      (.waitFor ^Process (swap! quiet #(or % (wine/wineserver-wait (:runtime plan) (:prefix plan)))))
+      (when (compare-and-set! ended false true) (cleanup))
+      (if @requested
+        code
+        (let [report (let [f (io/file (plaunch/injector-error-path (get-in plan [:files :ready])))]
+                       (when (.isFile f) (slurp f)))
+              {:keys [exit error] :as r} (plaunch/finish plan code report)]
+          (if error (throw (ex-info error r)) exit)))))
+  (alive? [_]
+    (or (.isAlive process)
+        (and (not @ended)
+             (.isAlive ^Process (swap! quiet #(or % (wine/wineserver-wait (:runtime plan) (:prefix plan))))))))
+  (stop! [_]
+    (when-not @ended
+      (reset! requested true)
+      (wine/stop-wineserver! (:runtime plan) (:prefix plan)))
+    nil))
 
 (defmethod start! :platform/linux
-  ;; `opts`: as proton.launch/plan's, plus :proton (resolve-proton). Composes
-  ;; the plan, then runs its effects in order; each one not built yet throws
-  ;; {:aether/unimplemented what :aether/task n}.
+  ;; `opts`: as proton.launch/plan's, plus :proton (resolve-proton) and
+  ;; :log-file (wine's output; default ours). Sets the prefix up under its
+  ;; lock, links the session and the roots into it, and spawns wine; the
+  ;; Launch releases the lock and removes the root links when it ends.
   [session opts]
-  (let [env  (into {} (System/getenv))
-        p    (resolve-proton session opts env)
-        plan (plaunch/plan session opts p {:env env :cwd (System/getProperty "user.dir")})]
-    (unimplemented :prefix/ensure! 7 (str "setting up the prefix " (:prefix p) " (wineboot or proton run)"))
-    (unimplemented :prefix/lock! 7 "the prefix lock")
-    (unimplemented :prefix/link! 7 (str "linking the session at " plaunch/wine-session " and the roots"))
-    (plaunch/check-geometry (assoc (:geometry plan) :ring-host-path (:ring-host-path plan))
-                            (let [f (io/file (:ring-host-path plan))] (when (.isFile f) (.length f))))
-    (run! #(io/delete-file % true) (:reports plan))
-    (unimplemented :launch/spawn! 11 "spawning wine in its own process group (setsid)")
-    (->LinuxLaunch plan)))
+  (let [env     (into {} (System/getenv))
+        p       (resolve-proton session opts env)
+        release (wine/lock! (:prefix p))]
+    (try
+      (let [init   (:prefix-init p)
+            name   (get-in opts [:proton :prefix-name] (session-id (:state session)))
+            _      (wine/ensure! (:home p) (:runtime p) name init)
+            root0  (:root-location session)
+            locs   (cons root0 (vals (:roots session)))
+            opts   (update opts :cwd #(or % root0))
+            plan   (plaunch/plan session opts
+                                 (assoc p :listing (wine/listing (:prefix p) locs)
+                                          :manifest (wine/read-manifest (:prefix p)))
+                                 {:env env :cwd (System/getProperty "user.dir")})
+            plan   (assoc plan :files {:ready (:ready session)})]
+        (wine/link-session! (:session-link plan))
+        (doseq [step (:links plan)] (wine/link! (:prefix p) step))
+        (plaunch/check-geometry (assoc (:geometry plan) :ring-host-path (:ring-host-path plan))
+                                (let [f (io/file (:ring-host-path plan))] (when (.isFile f) (.length f))))
+        (run! #(io/delete-file % true) (:reports plan))
+        (io/delete-file (:ready session) true)
+        (let [proc (wine/spawn! plan (:log-file opts))]
+          (->LinuxLaunch proc plan (atom nil) (atom false) (atom false)
+                         (fn []
+                           (doseq [step (:links plan)]
+                             (try (wine/unlink! (:prefix p) step) (catch Exception _)))
+                           (release)))))
+      (catch Throwable t (release) (throw t)))))

@@ -181,7 +181,7 @@
     (is (= 67174400 (get-in s [:server :map-bytes])))
     (is (nil? (:env s)) "the plan builds the child's env, not the session")))
 
-(deftest a-linux-start-names-the-first-effect-not-built-yet
+(deftest a-linux-start-sets-the-prefix-up-first-and-lets-go-of-it-on-failure
   (let [home   (temp-dir)
         rt     (io/file home "runtimes" "GE-Proton11-6-x86_64")
         _      (io/make-parents (io/file rt "version"))
@@ -190,9 +190,12 @@
                    (assoc :transport :file :ring-path "C:\\vfs-session\\state\\ring.bin"
                           :host-path (str (io/file home "ring.bin"))))
         s      (launch/session server (temp-dir) {:platform :platform/linux})
-        e      (try (launch/start! s {:platform :platform/linux :natives "/n" :target "C:\\Games\\g.exe"
-                                      :proton {:home (str home) :steam-state-dir (str home "/no-steam")}})
-                    nil
-                    (catch clojure.lang.ExceptionInfo e (assoc (ex-data e) :message (ex-message e))))]
-    (is (= [:prefix/ensure! 7] [(:aether/unimplemented e) (:aether/task e)]) (:message e))
-    (is (str/includes? (:message e) "task 7"))))
+        start  #(try (launch/start! s {:platform :platform/linux :natives "/n" :target "C:\\Games\\g.exe"
+                                       :proton {:home (str home) :steam-state-dir (str home "/no-steam")}})
+                     nil
+                     (catch clojure.lang.ExceptionInfo e (assoc (ex-data e) :message (ex-message e))))
+        e      (start)]
+    (is (= :wineboot (:aether.director.proton.wine/error e)) (:message e))
+    (is (str/includes? (:message e) (str (io/file rt "files" "bin" "wine")))
+        "the runtime's own wine sets the prefix up, never a host wine")
+    (is (= (:message e) (:message (start))) "the failed launch let go of the prefix lock")))

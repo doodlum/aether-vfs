@@ -35,6 +35,12 @@
 
 (def defaults {:connect-timeout-ms 45000 :rpc-timeout-ms 30000 :cell-id 0})
 
+(def login-id
+  "The logon id of a logged-in session. Steam keeps one session per account
+  and logon id; the default derives from the local IP, as the desktop
+  client's does on the same machine."
+  0x41657468) ; "Aeth"
+
 (defn- consumer ^Consumer [f] (reify Consumer (accept [_ x] (f x))))
 
 (defn- await!
@@ -77,7 +83,12 @@
                          (.setUsername account)
                          (.setAccessToken refresh-token)
                          (.setShouldRememberPassword true)
-                         (.setClientOSType EOSType/Win11)))
+                         (.setClientOSType EOSType/Win11)
+                         ;; not the default, which derives from the local IP as
+                         ;; the desktop client's does: Steam would replace that
+                         ;; session with this one, and the game being served
+                         ;; couldn't reach Steam
+                         (.setLoginID (int login-id))))
           (.logOnAnonymous user)))
       (let [^LoggedOnCallback cb (await! logged-on connect-timeout-ms "logging on")
             r (.getResult cb)]
