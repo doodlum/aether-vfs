@@ -126,3 +126,8 @@ panic = "unwind"
 # Line tables only: Wine crash reports and core dumps symbolise, with no change
 # to the generated code.
 debug = "line-tables-only"
+
+# retour 0.3.1 always implements its hook traits for `extern "win64"`, which does not exist on
+# 32-bit targets; the vendored copy gates that one ABI on x86_64 so the shim builds for x86.
+[patch.crates-io]
+retour = { path = "vendor/retour" }

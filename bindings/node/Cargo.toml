@@ -1,0 +1,26 @@
+[package]
+name = "aether-vfs-node"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+publish = false
+description = "Node.js binding for aether-vfs sessions (napi-rs)"
+
+# Its own project, not a member of `rust/`: the core build, tests and CI do not change, and the
+# binding depends on nothing but `vfs-embed`'s public API (see the node-binding design spec).
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+napi = { version = "3", default-features = false, features = ["napi8"] }
+napi-derive = "3"
+vfs-embed = { path = "../../rust/crates/vfs-embed", default-features = false }
+
+[build-dependencies]
+napi-build = "2"
+
+# The same patch the core workspace applies, so a 32-bit build of the shim's hook crate links.
+[patch.crates-io]
+retour = { path = "../../rust/vendor/retour" }

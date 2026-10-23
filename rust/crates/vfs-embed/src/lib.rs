@@ -204,7 +204,7 @@ pub use vfs_provider::{assert_conformance, write_fixture_tree, FIXTURE_FILES};
 // advertises a supported surface.
 pub use vfs_compose::DiskProvider;
 pub use vfs_compose::{
-    stack_layers, InlineProvider, LayeredProvider, MemoryProvider, OverlayProvider,
+    stack_layers, InlineProvider, LayeredProvider, MapError, MapProvider, MemoryProvider, OverlayProvider,
     ReadOnlyProvider, Route, RouterProvider, SeekableProvider, SubdirProvider,
 };
 #[cfg(feature = "zip")]
