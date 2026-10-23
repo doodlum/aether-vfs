@@ -2,7 +2,8 @@
   "The launch env, built through aether.director.env, against the env the
   launch built before it did (`legacy-*` below are launch.clj's code as of
   09f89535, verbatim but for taking their inputs as arguments)."
-  (:require [aether.director.launch :as launch]
+  (:require [aether.director.crossover]   ; the macOS methods
+            [aether.director.launch :as launch]
             [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]])
@@ -158,8 +159,8 @@
                           (launch/windows-command s {:natives (temp-dir) :exe "x.exe"} "")))))
 
 (deftest session-and-start-dispatch-on-the-platform
-  (is (= #{:platform/windows :platform/linux} (set (keys (dissoc (methods launch/session) :default)))))
-  (is (= #{:platform/windows :platform/linux} (set (keys (dissoc (methods launch/start!) :default)))))
+  (is (= #{:platform/windows :platform/linux :platform/macos} (set (keys (dissoc (methods launch/session) :default)))))
+  (is (= #{:platform/windows :platform/linux :platform/macos} (set (keys (dissoc (methods launch/start!) :default)))))
   (testing "a Wine session refuses a ring the shim couldn't open by name"
     (doseq [server [section-server
                     (assoc section-server :transport :file :ring-path "/home/me/s/state/ring.bin")]]

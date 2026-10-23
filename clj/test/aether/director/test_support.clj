@@ -41,9 +41,10 @@
     {:skip/kind :os :why "Windows only (named sections, events, the injector)"}))
 
 (defn linux
-  "nil on Linux, else the reason a Linux-only test skips."
+  "nil on Linux (and macOS, which has the same POSIX behaviour), else the
+  reason a Linux-only test skips."
   []
-  (when-not (= :platform/linux (platform/current))
+  (when-not (#{:platform/linux :platform/macos} (platform/current))
     {:skip/kind :os :why "Linux only (symlinks without privilege, POSIX modes)"}))
 
 (defn prerequisite

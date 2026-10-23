@@ -16,7 +16,8 @@
   The program sees <session>/root as a folder holding the content. With
   --stage, the image is the content's own <vpath>, staged with its import
   closure; otherwise <exe> is a real file. Exits with the program's code."
-  (:require [aether.director.launch :as launch]
+  (:require [aether.director.crossover]   ; the macOS launch's methods
+            [aether.director.launch :as launch]
             [aether.director.provider.compose :as compose]
             [aether.director.provider.disk :as disk]
             [aether.director.provider.tree :as tree]
@@ -84,18 +85,21 @@
     :env {k v}  :registry dir  :trace bool
     :transport :section|:file the ring's backing (ring/start); a file ring is
                               <session>/state/ring.bin
-    :platform                 :platform/windows|:platform/linux, overriding
-                              this process's (aether.director.platform)
+    :platform                 :platform/windows|:platform/linux|:platform/macos,
+                              overriding this process's (aether.director.platform)
     :proton {…}               a Linux launch's runtime, prefix and Steam
                               options (launch/resolve-proton); `roots`' paths
                               are then C: locations
+    :crossover {…}            a macOS launch's CrossOver install and bottle
+                              (aether.director.crossover/resolve); `roots`'
+                              paths are then C: locations
     :on-launch (fn [launch])  called with the started launch/Launch, so a
                               host can poll it or launch/stop! it while this waits
     :log (fn [& xs])          progress lines"
   [root roots {:keys [session stage fallback also registry trace transport log on-launch]
                :or {log (fn [& _])} :as opts}]
   (let [platform  (platform/current opts)
-        linux?    (= :platform/linux platform)
+        wine?     (platform/wine? platform)
         stage-dir (io/file session "stage")
         ;; STAGE_EXEC: a child EXE that only the VFS holds, staged on demand
         on-demand (fn [vpath] (:exe (stage/stage root vpath {:dir stage-dir :fallback fallback})))
@@ -105,7 +109,7 @@
                                  :platform platform
                                  :path (io/file session "state" "ring.bin")
                                  ;; under Wine the shim opens the ring through the session's link
-                                 :shim-path (when linux? (prefix/join-wine plaunch/wine-session "state/ring.bin"))
+                                 :shim-path (when wine? (prefix/join-wine plaunch/wine-session "state/ring.bin"))
                                  :stage-exec on-demand
                                  :trace trace
                                  :registry reg

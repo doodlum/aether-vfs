@@ -10,7 +10,10 @@
   (is (= :platform/windows (platform/of-os-name "Windows 11")))
   (is (= :platform/windows (platform/of-os-name "windows server 2022")))
   (is (= :platform/linux (platform/of-os-name "Linux")))
-  (is (#{:platform/windows :platform/linux} (platform/current)))
+  (is (= :platform/macos (platform/of-os-name "Mac OS X")))
+  (is (#{:platform/windows :platform/linux :platform/macos} (platform/current)))
+  (is (platform/wine? :platform/macos))
+  (is (not (platform/wine? :platform/windows)))
   (is (= :platform/linux (platform/current {:platform :platform/linux})))
   (is (= (platform/current) (platform/current {}))))
 
