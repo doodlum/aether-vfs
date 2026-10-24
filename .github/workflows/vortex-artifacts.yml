@@ -15,6 +15,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          # The 32-bit shim and injector, for 32-bit games (Fallout 3, New Vegas, Oblivion).
+          targets: i686-pc-windows-msvc
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
@@ -22,6 +25,9 @@ jobs:
             bindings/node
       - name: Build the shim
         run: cargo build --release -p vfs-shim-dll
+        working-directory: rust
+      - name: Build the 32-bit shim and injector
+        run: cargo build --release --target i686-pc-windows-msvc -p vfs-shim-dll -p vfs-inject --bin vfs-injector --lib
         working-directory: rust
       - name: Build the Node binding
         run: cargo build --release
@@ -32,6 +38,10 @@ jobs:
           $out = New-Item -ItemType Directory -Force -Path dist
           Copy-Item bindings/node/target/release/aether_vfs_node.dll "$out/aether_vfs_node-win32-x64.node"
           Copy-Item rust/target/release/vfs_shim_dll.dll "$out/vfs_shim_dll-win32-x64.dll"
+          # Vortex installs these two as x86\vfs_shim_dll.dll and x86\vfs-injector.exe beside
+          # the 64-bit shim (vfs_embed::X86_ARTIFACTS_DIR).
+          Copy-Item rust/target/i686-pc-windows-msvc/release/vfs_shim_dll.dll "$out/vfs_shim_dll-win32-ia32.dll"
+          Copy-Item rust/target/i686-pc-windows-msvc/release/vfs-injector.exe "$out/vfs-injector-win32-ia32.exe"
           Get-ChildItem $out | ForEach-Object {
             "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
           } | Set-Content -Encoding ascii "$out/SHA256SUMS-win32-x64.txt"
