@@ -51,8 +51,32 @@ jobs:
           name: windows-x64
           path: dist/*
 
+  # Linux: the binding alone. Roots are FUSE mounts there (vfs-fuse), so there is no shim to ship;
+  # the user's machine needs fusermount3 (package fuse3), not libfuse headers.
+  linux-x64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bindings/node
+      - name: Build the Node binding
+        run: cargo build --release
+        working-directory: bindings/node
+      - name: Collect the artifacts
+        run: |
+          mkdir -p dist
+          cp bindings/node/target/release/libaether_vfs_node.so dist/aether_vfs_node-linux-x64.node
+          (cd dist && sha256sum aether_vfs_node-linux-x64.node > SHA256SUMS-linux-x64.txt)
+          cat dist/SHA256SUMS-linux-x64.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x64
+          path: dist/*
+
   publish:
-    needs: [windows-x64]
+    needs: [windows-x64, linux-x64]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4

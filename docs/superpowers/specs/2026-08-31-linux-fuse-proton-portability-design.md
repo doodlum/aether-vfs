@@ -8,6 +8,9 @@ at so the two increments cannot drift.
 
 **Status:** increment 1 (an OS-agnostic director) implemented; the FUSE half (increments 2-4) is
 superseded by `2026-09-01-wine-hosted-shim-design.md` (proposed 2026-08-31).
+**Update 2026-10-24:** increment 2 is implemented after all, as `vfs-fuse`
+(`rust/docs/architecture.md` §3.12): the Wine-hosted shim needs GE-Proton, and Vortex needs stock
+Steam Proton in the game's own prefix, which a mount at the game folder serves with no launch.
 
 ---
 

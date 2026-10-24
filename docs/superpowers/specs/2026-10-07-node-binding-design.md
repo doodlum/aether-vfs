@@ -169,3 +169,30 @@ and running under Wine locally is a smoke test, not a substitute.
   `.node` addon, `vfs_shim_dll.dll` and `vfs-injector.exe`; the addon finds them beside itself.
 - Releases are tagged and published from CI. Publishing needs the owner's go-ahead.
 - All packages are GPL-3.0-only.
+
+## 8. Addendum (2026-10-24): Linux mounts instead of launching
+
+Vortex wants stock Steam Proton in the game's own Steam prefix, Steam's own Play button and
+native Linux games, none of which a GE-Proton launch through the session gives. So on Linux the
+binding uses `vfs-fuse` (`rust/docs/architecture.md` §3.12) instead of the Proton launch path:
+
+- **`start()` mounts** each root with FUSE at its `location`; from then on every process sees the
+  composed folder. `close()` unmounts (lazily if a program still holds a file open). `mounted()`
+  lists the mounted root ids (always empty on Windows).
+- **`setRoot()` while mounted** takes effect at the next lookup and open by any process; files
+  already open keep their content.
+- **`launch()` is refused with `E_PLATFORM`**: start the program any way (Steam, the game's own
+  launcher); it sees the mount.
+- A `base` inside a `location` is read through a directory descriptor opened in the constructor,
+  before anything is mounted, so the real game folder stays readable underneath and is never
+  written. A mapped file's `source` or a `writeTo` inside a location, and nested locations, are
+  `E_CONFIG`. A location another live session has mounted is `E_STATE`; one left mounted by a host
+  that died is recovered (`fusermount3 -uz`) by the constructor.
+- `E_MOUNT`: no `/dev/fuse`, no `fusermount3` (package `fuse3`), or a location that cannot be made.
+- Build: `cargo build --release` in `bindings/node` on Linux produces
+  `target/release/libaether_vfs_node.so`; copy it to `aether_vfs_node.node`. It needs no libfuse
+  headers (`fuser` mounts through the setuid `fusermount3`). The Windows set
+  (`vfs_shim_dll.dll`, `vfs-injector.exe`) is not part of the Linux package.
+- Tests: `bindings/node/test/linux-mount.test.mjs` mounts over a temporary game folder and checks it
+  from a separate Node process (`fs-probe.mjs`), including a host killed with its mount live
+  (`crash-mount.mjs`).

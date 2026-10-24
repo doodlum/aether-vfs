@@ -169,6 +169,16 @@ pub mod proton {
 /// [`LaunchHandle::steam_helper_status`].
 #[cfg(unix)]
 pub use vfs_proton::HelperStatus;
+/// The Linux delivery that needs no launch: a root mounted with FUSE at its
+/// real location, which every process then sees — Steam's own Proton, a
+/// native game, the host. See `vfs-fuse`'s crate docs. Linux only.
+#[cfg(target_os = "linux")]
+pub mod fuse {
+    pub use vfs_fuse::{
+        errno_of, mount_state, recover_stale_mount, BaseDir, BaseDirProvider, FuseMount, MountOpts,
+        MountState, Unmounted, FS_NAME,
+    };
+}
 // `RootMounts` stays for the same reason `CacheStats` does below: it is
 // `RootSources::mounts()`'s return type and `Session::set_root_mounts`'s
 // argument type, so a host writing either signature needs the name. It has no
