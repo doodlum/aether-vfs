@@ -107,6 +107,7 @@ fn a_staged_copy_must_not_shadow_curated_content_at_the_same_path() {
                 also: &["helper.exe"],
                 fallback_dirs: &[],
                 shim: None,
+                shim_x86: None,
             },
         )
         .expect("stage");
@@ -565,6 +566,7 @@ fn session_staging_puts_a_game_root_proxy_dll_on_disk() {
                 also: &["SkyrimSE.exe"],
                 fallback_dirs: &[],
                 shim: None,
+                shim_x86: None,
             },
         )
         .expect("stage");

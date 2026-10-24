@@ -91,6 +91,11 @@
 //!   shipped DLL. Such a host must resolve it from its own module path and
 //!   set it; it is effectively mandatory outside this workspace's own
 //!   binaries.
+//! * **Ship the 32-bit artifacts beside it, to launch 32-bit games.** A
+//!   program that runs as a 32-bit process (Fallout 3, New Vegas, Oblivion)
+//!   gets the 32-bit shim from [`X86_ARTIFACTS_DIR`] beside the 64-bit one:
+//!   `x86\vfs_shim_dll.dll` and `x86\vfs-injector.exe`, both built for
+//!   `i686-pc-windows-msvc`. Without them such a launch is refused by name.
 //! * **Keep its threads away from `std::env` — Windows only.** There,
 //!   `CreateProcessW` inherits by null environment, so [`Session::serve`] and
 //!   [`Session::launch`] write process-global `VFS_*` variables under a lock.
@@ -124,6 +129,13 @@ pub use session::{
     compose_root, Activation, LaunchExit, LaunchOpts, RegistrySync, Session, StageOpts,
     STOPPED_EXIT_CODE,
 };
+
+/// The folder, beside the 64-bit `vfs_shim_dll.dll`, that holds the 32-bit
+/// artifacts a 32-bit (WOW64) program is launched with: `vfs_shim_dll.dll` and
+/// `vfs-injector.exe`, built for `i686-pc-windows-msvc`. Same file names as the
+/// 64-bit ones, so the import an activated program names does not change; the
+/// launch puts this folder first on the program's `PATH`.
+pub const X86_ARTIFACTS_DIR: &str = "x86";
 #[cfg(any(unix, windows))]
 pub use session::{LaunchHandle, LaunchStopper};
 /// How a Proton launch sets up its Wine prefix — see [`Session::set_prefix_init`].

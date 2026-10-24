@@ -208,9 +208,10 @@ pub struct StagedDir {
     staged: Vec<String>,
     /// The subset of `staged` that is in [`PROXY_DLL_NAMES`], in order.
     proxies: Vec<String>,
-    /// The shim DLL to import-activate staged EXEs with, when asked
-    /// ([`stage_launch_into_patched`]).
-    shim: Option<Vec<u8>>,
+    /// The shim DLLs to import-activate staged EXEs with, when asked
+    /// ([`stage_launch_into_patched_with`]): one per machine, each EXE getting
+    /// the one built for its own (see [`shim_for`]).
+    shims: Vec<Vec<u8>>,
     /// Staged EXEs rewritten to import the shim first.
     patched: Vec<String>,
     /// Staged EXEs the patch refused, with why: they are staged unchanged and
@@ -465,14 +466,45 @@ pub fn stage_launch_into_patched(
     fallback_dirs: &[PathBuf],
     shim: &[u8],
 ) -> Result<StagedDir, String> {
+    stage_launch_into_patched_with(source, exe_vpath, also, dir, fallback_dirs, &[shim])
+}
+
+/// [`stage_launch_into_patched`] with a shim per machine: each staged EXE is
+/// patched to import, and gets beside it, the one of `shims` built for its own
+/// machine (a 32-bit game the 32-bit shim). An EXE none of them fits is staged
+/// unchanged and recorded in [`StagedDir::unpatched`].
+pub fn stage_launch_into_patched_with(
+    source: &dyn ImageSource,
+    exe_vpath: &str,
+    also: &[&str],
+    dir: &Path,
+    fallback_dirs: &[PathBuf],
+    shims: &[&[u8]],
+) -> Result<StagedDir, String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
     let mut staged_dir = new_staged_dir(dir, exe_vpath, false)?;
-    staged_dir.shim = Some(shim.to_vec());
+    staged_dir.shims = shims.iter().map(|s| s.to_vec()).collect();
     stage_into(source, exe_vpath, &mut staged_dir, fallback_dirs)?;
     for extra in also {
         stage_into(source, extra, &mut staged_dir, fallback_dirs)?;
     }
     Ok(staged_dir)
+}
+
+/// The shim of `shims` to import-activate `exe` with: the one whose PE machine
+/// is the EXE's. A shim whose machine cannot be read (not a PE) fits any EXE,
+/// as the only shim there is. `Err` names the machine none of them fits.
+fn shim_for<'a>(shims: &'a [Vec<u8>], exe: &[u8]) -> Result<&'a [u8], String> {
+    let machine = vfs_pe::pe_machine(exe);
+    shims
+        .iter()
+        .find(|s| machine.is_some() && vfs_pe::pe_machine(s) == machine)
+        .or_else(|| shims.iter().find(|s| vfs_pe::pe_machine(s).is_none()))
+        .map(Vec::as_slice)
+        .ok_or_else(|| match machine {
+            Some(m) => format!("no shim for this EXE's machine ({m:#x})"),
+            None => "the EXE's machine cannot be read".to_string(),
+        })
 }
 
 /// The primary thread's stack a patched EXE asks for. The shim adds frames to
@@ -582,7 +614,7 @@ fn new_staged_dir(dir: &Path, exe_vpath: &str, owns_dir: bool) -> Result<StagedD
         exe: dir.join(safe_parent(exe_vpath)?).join(&exe_name),
         staged: Vec::new(),
         proxies: Vec::new(),
-        shim: None,
+        shims: Vec::new(),
         patched: Vec::new(),
         unpatched: Vec::new(),
         files: Vec::new(),
@@ -623,8 +655,14 @@ fn stage_into(
     // sits beside it. The import walk below reads the original bytes, so it
     // never goes looking for the shim in the VFS.
     let is_exe = exe_name.to_ascii_lowercase().ends_with(".exe");
-    match staged_dir.shim.clone().filter(|_| is_exe) {
-        Some(shim) => match patch_for_import_activation(&exe_bytes) {
+    let shim = (is_exe && !staged_dir.shims.is_empty())
+        .then(|| shim_for(&staged_dir.shims, &exe_bytes).map(<[u8]>::to_vec));
+    match shim {
+        Some(Err(why)) => {
+            write_staged(&exe_path, &exe_bytes, staged_dir)?;
+            staged_dir.unpatched.push((exe_name.clone(), why));
+        }
+        Some(Ok(shim)) => match patch_for_import_activation(&exe_bytes) {
             Ok(patched) => {
                 write_staged(&exe_path, &patched, staged_dir)?;
                 write_shim(&target_dir.join(vfs_pe::SHIM_IMPORT_DLL), &shim, staged_dir)?;
@@ -1052,6 +1090,52 @@ mod tests {
             !root.join(vfs_pe::SHIM_IMPORT_DLL).exists(),
             "no shim beside an exe that does not import it"
         );
+        drop(staged);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The first bytes of a PE whose COFF `Machine` is `machine`.
+    fn pe_of(machine: u16) -> Vec<u8> {
+        let mut b = vec![0u8; 0x100];
+        b[..2].copy_from_slice(b"MZ");
+        b[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        b[0x80..0x84].copy_from_slice(b"PE\0\0");
+        b[0x84..0x86].copy_from_slice(&machine.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn each_exe_gets_the_shim_built_for_its_machine() {
+        let (x64, x86) = (pe_of(vfs_pe::MACHINE_AMD64), pe_of(vfs_pe::MACHINE_I386));
+        let both = vec![x64.clone(), x86.clone()];
+        assert_eq!(shim_for(&both, &pe_of(vfs_pe::MACHINE_I386)).unwrap(), &x86[..]);
+        assert_eq!(shim_for(&both, &pe_of(vfs_pe::MACHINE_AMD64)).unwrap(), &x64[..]);
+        // Only the 64-bit shim: a 32-bit EXE is named, not given the wrong one.
+        let only64 = vec![x64.clone()];
+        let e = shim_for(&only64, &pe_of(vfs_pe::MACHINE_I386)).unwrap_err();
+        assert!(e.contains("0x14c"), "{e}");
+        // A shim that is not a PE (the tests' stand-in) fits anything.
+        assert_eq!(
+            shim_for(&[b"shim".to_vec()], &pe_of(vfs_pe::MACHINE_I386)).unwrap(),
+            b"shim"
+        );
+    }
+
+    #[test]
+    fn an_exe_no_shim_fits_is_staged_unchanged_and_named() {
+        let root = tmp_root("nofit");
+        let mut m = HashMap::new();
+        let exe = pe_of(vfs_pe::MACHINE_I386);
+        m.insert("game.exe".to_string(), exe.clone());
+        let shim64 = pe_of(vfs_pe::MACHINE_AMD64);
+        let staged =
+            stage_launch_into_patched_with(&Fake(m), "game.exe", &[], &root, &[], &[&shim64])
+                .expect("stage");
+        assert_eq!(std::fs::read(root.join("game.exe")).unwrap(), exe);
+        assert!(staged.patched().is_empty());
+        assert_eq!(staged.unpatched()[0].0, "game.exe");
+        assert!(staged.unpatched()[0].1.contains("machine"));
+        assert!(!root.join(vfs_pe::SHIM_IMPORT_DLL).exists());
         drop(staged);
         let _ = std::fs::remove_dir_all(&root);
     }

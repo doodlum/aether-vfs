@@ -51,6 +51,8 @@ vfs-protocol.workspace = true
 [target.'cfg(windows)'.dependencies]
 vfs-inject.workspace = true
 vfs-shim.workspace = true
+# A launch reads its program's headers to give a 32-bit one the 32-bit shim.
+vfs-pe.workspace = true
 
 # The Proton (Wine) delivery mechanism: the unix counterpart of the pair above.
 # GE-Proton discovery and verification, the per-session Wine prefix, and the

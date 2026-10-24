@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use vfs_compose::DiskProvider;
-use vfs_director::stage::{stage_launch_into, stage_launch_into_patched, ImageSource};
+use vfs_director::stage::{stage_launch_into, stage_launch_into_patched_with, ImageSource};
 use vfs_director::Director;
 use vfs_provider::{Provider, RootId};
 
@@ -74,13 +74,13 @@ impl Session {
         // Valley booting while Skyrim (EXE at the root, content found via
         // cwd) was unaffected.
         let staged = match opts.shim {
-            Some(shim) => stage_launch_into_patched(
+            Some(shim) => stage_launch_into_patched_with(
                 source,
                 opts.exe_vpath,
                 opts.also,
                 &self.virtual_root,
                 opts.fallback_dirs,
-                shim,
+                &std::iter::once(shim).chain(opts.shim_x86).collect::<Vec<_>>(),
             )?,
             None => stage_launch_into(
                 source,
@@ -152,6 +152,22 @@ impl Session {
         std::fs::read(&path)
             .map(Some)
             .map_err(|e| format!("launch: reading the shim {}: {e}", path.display()))
+    }
+
+    /// The 32-bit shim's bytes for staging a 32-bit EXE, when import activation
+    /// is on and the 32-bit artifacts are there ([`crate::X86_ARTIFACTS_DIR`]);
+    /// `None` otherwise, which stages a 32-bit EXE unpatched. Windows only:
+    /// the Proton path has no 32-bit launch yet.
+    pub(super) fn shim_x86_for_staging(&self, opts: &LaunchOpts) -> Option<Vec<u8>> {
+        if opts.activation != Activation::Import {
+            return None;
+        }
+        #[cfg(windows)]
+        return super::windows::locate_shim_x86(opts)
+            .ok()
+            .and_then(|p| std::fs::read(p).ok());
+        #[cfg(not(windows))]
+        None
     }
 
     /// Where `opts.image` points, staged if need be: the one resolver both
@@ -242,6 +258,7 @@ impl Session {
                 // launch the real file that produces.
                 let also: Vec<&str> = opts.stage_also.iter().map(String::as_str).collect();
                 let shim = self.shim_for_staging(opts)?;
+                let shim_x86 = self.shim_x86_for_staging(opts);
                 let host = self
                     .stage_launch(
                         &KernelSource(Arc::clone(&self.kernel)),
@@ -250,6 +267,7 @@ impl Session {
                             also: &also,
                             fallback_dirs: &opts.stage_fallback_dirs,
                             shim: shim.as_deref(),
+                            shim_x86: shim_x86.as_deref(),
                         },
                     )
                     .map_err(|e| format!("launch: staging {vpath:?}: {e}"))?;

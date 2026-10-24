@@ -92,6 +92,7 @@ fn staged_launch_artifacts_resolve_through_the_provider_graph() {
                 also: &also,
                 fallback_dirs: &[],
                 shim: None,
+                shim_x86: None,
             },
         )
         .expect("stage_launch");

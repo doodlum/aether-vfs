@@ -270,7 +270,15 @@ impl Session {
         ipc.write_thin_config(&thin, &root_s)?;
         let ready_path = self.fresh_ready_flag();
 
-        let dll = locate_shim(opts)?;
+        // A 32-bit program (a WOW64 guest) gets the 32-bit shim, from the `x86`
+        // folder beside the 64-bit one; the launch injects it through the 32-bit
+        // `vfs-injector.exe` there when it has to inject.
+        let x86 = image_runs_32bit(&target);
+        let dll = if x86 {
+            locate_shim_x86(opts)?
+        } else {
+            locate_shim(opts)?
+        };
         // Remote LoadLibrary resolves relative to the *child* cwd (managed root,
         // which is intentionally empty). Always use absolute DLL paths.
         // Strip the `\\?\` verbatim prefix — some LoadLibrary paths reject it.
@@ -313,7 +321,9 @@ impl Session {
         }
         env_set.extend(opts.env.iter().map(|(k, v)| (k.clone(), v.clone())));
         if let Some(shim_dir) = Path::new(&dll).parent() {
-            put_shim_on_path(&mut env_set, &shim_dir.to_string_lossy());
+            // First, even if already present further down: the 32-bit loader
+            // must meet the 32-bit shim before a 64-bit `vfs_shim_dll.dll`.
+            put_shim_on_path(&mut env_set, &shim_dir.to_string_lossy(), x86);
         }
         // `Activation::Inject`: the shim goes into the target and every child
         // by remote `LoadLibrary` on the suspended process, never by the
@@ -491,8 +501,11 @@ impl Session {
 ///
 /// The effective value is the last `PATH` the launch sets (names compare without case, and a
 /// later entry wins in `env_block::build`), else this process's own.
+///
+/// `move_first`: a `shim_dir` already on the path is moved to the front rather than left where
+/// it is. A 32-bit launch asks for it: a 64-bit `vfs_shim_dll.dll` met first would fail its load.
 #[cfg(windows)]
-fn put_shim_on_path(env_set: &mut Vec<(String, String)>, shim_dir: &str) {
+fn put_shim_on_path(env_set: &mut Vec<(String, String)>, shim_dir: &str, move_first: bool) {
     let current = env_set
         .iter()
         .rev()
@@ -501,12 +514,24 @@ fn put_shim_on_path(env_set: &mut Vec<(String, String)>, shim_dir: &str) {
         .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
     env_set.retain(|(name, _)| !name.eq_ignore_ascii_case("PATH"));
     let trimmed = |p: &str| p.trim_end_matches(['\\', '/']).to_ascii_lowercase();
-    let value = if current.split(';').any(|p| trimmed(p) == trimmed(shim_dir)) {
+    let present = current.split(';').any(|p| trimmed(p) == trimmed(shim_dir));
+    let value = if present && !move_first {
         current
-    } else if current.is_empty() {
-        shim_dir.to_string()
+    } else if !present {
+        if current.is_empty() {
+            shim_dir.to_string()
+        } else {
+            format!("{shim_dir};{current}")
+        }
     } else {
-        format!("{shim_dir};{current}")
+        let rest: Vec<&str> = current
+            .split(';')
+            .filter(|p| !p.is_empty() && trimmed(p) != trimmed(shim_dir))
+            .collect();
+        std::iter::once(shim_dir)
+            .chain(rest)
+            .collect::<Vec<_>>()
+            .join(";")
     };
     env_set.push(("PATH".to_string(), value));
 }
@@ -522,6 +547,44 @@ pub(super) fn locate_shim(opts: &LaunchOpts) -> Result<String, String> {
     vfs_inject::find_near(&exe, "vfs_shim_dll.dll")
         .map(|p| p.to_string_lossy().into_owned())
         .ok_or_else(|| "vfs_shim_dll.dll not found (set LaunchOpts.shim_dll)".to_string())
+}
+
+/// The folder, beside the 64-bit shim, that holds the 32-bit artifacts: the 32-bit
+/// `vfs_shim_dll.dll` and `vfs-injector.exe` (`crate::X86_ARTIFACTS_DIR`).
+#[cfg(windows)]
+pub(super) fn locate_shim_x86(opts: &LaunchOpts) -> Result<String, String> {
+    let shim64 = locate_shim(opts)?;
+    let dir = Path::new(&shim64)
+        .parent()
+        .map(|d| d.join(crate::X86_ARTIFACTS_DIR))
+        .unwrap_or_else(|| PathBuf::from(crate::X86_ARTIFACTS_DIR));
+    let dll = dir.join(vfs_pe::SHIM_IMPORT_DLL);
+    if dll.is_file() {
+        Ok(dll.to_string_lossy().into_owned())
+    } else {
+        Err(format!(
+            "launch: the program is 32-bit and there is no 32-bit shim at {} (build \
+             vfs-shim-dll and vfs-inject for i686-pc-windows-msvc and put vfs_shim_dll.dll and \
+             vfs-injector.exe in that folder)",
+            dll.display()
+        ))
+    }
+}
+
+/// Whether the program at `path` runs as a 32-bit process ([`vfs_pe::runs_as_32bit`]), read
+/// from its first MiB; unreadable reads as "no", which leaves the 64-bit launch as it was.
+#[cfg(windows)]
+pub(super) fn image_runs_32bit(path: &Path) -> bool {
+    use std::io::Read;
+    let mut head = Vec::new();
+    if std::fs::File::open(path)
+        .and_then(|f| f.take(1 << 20).read_to_end(&mut head))
+        .is_err()
+    {
+        return false;
+    }
+    vfs_pe::runs_as_32bit(&head)
+        .unwrap_or_else(|| vfs_pe::pe_machine(&head) == Some(vfs_pe::MACHINE_I386))
 }
 
 /// `vpath` (`/`-separated, relative) under `location`, in Windows spelling.
@@ -563,6 +626,7 @@ impl Session {
             .filter_map(|l| self.root_backing_dir(l.id).map(|b| (l.id, b)))
             .collect();
         let shim = self.shim_for_staging(opts)?;
+        let shim_x86 = self.shim_x86_for_staging(opts);
         let fallback = opts.stage_fallback_dirs.clone();
         let held = Arc::clone(&self.windows.exec_staged);
         held.lock()
@@ -587,13 +651,15 @@ impl Session {
             }
             let source = RootSource { kernel, root };
             let staged = match &shim {
-                Some(s) => vfs_director::stage::stage_launch_into_patched(
+                Some(s) => vfs_director::stage::stage_launch_into_patched_with(
                     &source,
                     vpath,
                     &[],
                     dir,
                     &fallback,
-                    s,
+                    &std::iter::once(s.as_slice())
+                        .chain(shim_x86.as_deref())
+                        .collect::<Vec<_>>(),
                 ),
                 None => vfs_director::stage::stage_launch_into(&source, vpath, &[], dir, &fallback),
             }
@@ -752,7 +818,7 @@ mod shim_path_tests {
             ("Path".to_string(), r"C:\Windows;C:\Tools".to_string()),
             ("OTHER".to_string(), "x".to_string()),
         ];
-        put_shim_on_path(&mut env, r"C:\Vortex\aether-vfs");
+        put_shim_on_path(&mut env, r"C:\Vortex\aether-vfs", false);
         assert_eq!(path_of(&env), [r"C:\Vortex\aether-vfs;C:\Windows;C:\Tools"]);
         assert!(env.iter().any(|(name, _)| name == "OTHER"));
     }
@@ -763,14 +829,29 @@ mod shim_path_tests {
             "PATH".to_string(),
             r"c:\vortex\AETHER-VFS\;C:\Windows".to_string(),
         )];
-        put_shim_on_path(&mut env, r"C:\Vortex\aether-vfs");
+        put_shim_on_path(&mut env, r"C:\Vortex\aether-vfs", false);
         assert_eq!(path_of(&env), [r"c:\vortex\AETHER-VFS\;C:\Windows"]);
+    }
+
+    /// The 32-bit shim's folder goes first even when it is already on the path behind the
+    /// 64-bit one, and appears once.
+    #[test]
+    fn the_32_bit_shim_directory_is_moved_to_the_front() {
+        let mut env = vec![(
+            "PATH".to_string(),
+            r"C:\Vortex\aether-vfs;C:\Windows;c:\vortex\aether-vfs\X86\".to_string(),
+        )];
+        put_shim_on_path(&mut env, r"C:\Vortex\aether-vfs\x86", true);
+        assert_eq!(
+            path_of(&env),
+            [r"C:\Vortex\aether-vfs\x86;C:\Vortex\aether-vfs;C:\Windows"]
+        );
     }
 
     #[test]
     fn without_a_path_from_the_launch_this_process_s_is_used() {
         let mut env = Vec::new();
-        put_shim_on_path(&mut env, r"C:\Vortex\aether-vfs");
+        put_shim_on_path(&mut env, r"C:\Vortex\aether-vfs", false);
         let path = path_of(&env)[0].to_string();
         assert!(path.starts_with(r"C:\Vortex\aether-vfs"));
         if let Ok(own) = std::env::var("PATH") {

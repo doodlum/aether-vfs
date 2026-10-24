@@ -197,4 +197,9 @@ pub struct StageOpts<'a> {
     /// The shim DLL's bytes, to import-activate each staged EXE with
     /// ([`Activation::Import`]); `None` stages them unchanged.
     pub shim: Option<&'a [u8]>,
+    /// The 32-bit shim's bytes, for a staged 32-bit EXE: each EXE is patched
+    /// for, and staged beside, the shim built for its own machine. Without it a
+    /// 32-bit EXE is staged unchanged (recorded as unpatched). Ignored when
+    /// `shim` is `None`.
+    pub shim_x86: Option<&'a [u8]>,
 }
