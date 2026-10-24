@@ -186,11 +186,15 @@ impl Catalog {
         };
         txn.commit().map_err(db_err)?;
         if durable {
-            let _ = self
-                .unflushed
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                    Some(n.saturating_sub(covered))
-                });
+            let mut n = self.unflushed.load(Ordering::Acquire);
+            while let Err(actual) = self.unflushed.compare_exchange_weak(
+                n,
+                n.saturating_sub(covered),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                n = actual;
+            }
         } else {
             self.unflushed.fetch_add(1, Ordering::AcqRel);
         }

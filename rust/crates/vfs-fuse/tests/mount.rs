@@ -36,7 +36,7 @@ fn fuse_available() -> bool {
 }
 
 fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("vfs-fuse-it-{name}-{}", std::process::id()));
+    let dir = vfs_testkit::scratch_path(&format!("vfs-fuse-it-{name}"));
     if mount_state(dir.join("Game")).ok() == Some(MountState::Stale) {
         let _ = recover_stale_mount(dir.join("Game"));
     }
@@ -360,7 +360,7 @@ fn a_busy_mount_unmounts_lazily_and_a_second_mount_is_refused() {
 #[test]
 #[ignore = "run by a_stale_mount_is_recovered"]
 fn stale_mount_child() {
-    let Some(game) = std::env::var_os("VFS_FUSE_CHILD_GAME") else {
+    let Some(game) = std::env::var_os("VFS_TEST_FUSE_CHILD_GAME") else {
         return;
     };
     let game = PathBuf::from(game);
@@ -373,7 +373,7 @@ fn stale_mount_child() {
         )
         .unwrap();
     let mount = FuseMount::mount(director, ROOT, &game, MountOpts::default()).unwrap();
-    std::fs::write(std::env::var_os("VFS_FUSE_CHILD_READY").unwrap(), b"").unwrap();
+    std::fs::write(std::env::var_os("VFS_TEST_FUSE_CHILD_READY").unwrap(), b"").unwrap();
     std::thread::sleep(Duration::from_secs(120));
     drop(mount);
 }
@@ -387,8 +387,8 @@ fn a_stale_mount_is_recovered() {
     let ready = f.dir.join("ready");
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args(["--ignored", "--exact", "stale_mount_child", "--nocapture"])
-        .env("VFS_FUSE_CHILD_GAME", &f.game)
-        .env("VFS_FUSE_CHILD_READY", &ready)
+        .env("VFS_TEST_FUSE_CHILD_GAME", &f.game)
+        .env("VFS_TEST_FUSE_CHILD_READY", &ready)
         .spawn()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);

@@ -28,6 +28,7 @@ tracing.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 vfs-compose.workspace = true
+vfs-testkit.workspace = true
 
 [lints]
 workspace = true

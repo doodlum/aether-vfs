@@ -42,18 +42,19 @@ jobs:
       TEMP: C:\vfstmp
     steps:
       - uses: actions/checkout@v4
+      # `TMP`/`TEMP` above only name the directory; nothing creates it, and code
+      # that writes straight into `temp_dir()` without a `create_dir_all` first
+      # would fail on a path that does not exist. First of all: the toolchain
+      # action's own bash `mktemp` fails without it.
+      - name: Create an 8.3-free TMP
+        run: New-Item -ItemType Directory -Force -Path C:\vfstmp | Out-Null
+        shell: pwsh
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
-      # `TMP`/`TEMP` above only name the directory; nothing creates it, and code
-      # that writes straight into `temp_dir()` without a `create_dir_all` first
-      # would fail on a path that does not exist.
-      - name: Create an 8.3-free TMP
-        run: New-Item -ItemType Directory -Force -Path C:\vfstmp | Out-Null
-        shell: pwsh
       # The gate this project actually enforces by hand, made automatic. It was
       # absent while `cargo clippy --all-targets -- -D warnings` was a standing
       # requirement in every task brief — i.e. the standard was upheld only by

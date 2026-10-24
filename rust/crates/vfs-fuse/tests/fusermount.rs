@@ -34,7 +34,7 @@ fn mounts_through_the_helpers_descriptor_and_unmounts() {
     };
     std::env::set_var("FUSERMOUNT_PATH", &helper);
 
-    let dir = std::env::temp_dir().join(format!("vfs-fuse-commfd-{}", std::process::id()));
+    let dir = vfs_testkit::scratch_path("vfs-fuse-commfd");
     let _ = std::fs::remove_dir_all(&dir);
     let game = dir.join("Game");
     let staging = dir.join("staging");

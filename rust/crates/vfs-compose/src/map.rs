@@ -168,7 +168,11 @@ fn split(path: &str) -> Option<Vec<&str>> {
     if parts.is_empty() || parts.iter().any(|p| *p == "." || *p == "..") {
         return None;
     }
-    if path.starts_with(['/', '\\']) || Path::new(path).is_absolute() {
+    // A drive prefix (`C:`) is absolute on Windows only; the map refuses it everywhere, so a
+    // Windows path is not taken for a relative one on Linux.
+    let drive =
+        path.len() >= 2 && path.as_bytes()[0].is_ascii_alphabetic() && path.as_bytes()[1] == b':';
+    if drive || path.starts_with(['/', '\\']) || Path::new(path).is_absolute() {
         return None;
     }
     Some(parts)

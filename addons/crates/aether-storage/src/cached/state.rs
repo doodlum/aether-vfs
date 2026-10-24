@@ -402,9 +402,12 @@ impl Storage {
 
 /// Subtracts from the cache total without wrapping.
 pub(crate) fn sub_logical(total: &AtomicU64, n: u64) {
-    let _ = total.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-        Some(v.saturating_sub(n))
-    });
+    let mut v = total.load(Ordering::Relaxed);
+    while let Err(actual) =
+        total.compare_exchange_weak(v, v.saturating_sub(n), Ordering::Relaxed, Ordering::Relaxed)
+    {
+        v = actual;
+    }
 }
 
 pub(super) fn release_count(counts: &mut HashMap<[u8; 17], usize>, id: &[u8; 17]) {

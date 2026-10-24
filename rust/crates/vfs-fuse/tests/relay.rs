@@ -28,7 +28,7 @@ fn mounts_and_unmounts_through_the_relay() {
     }
     std::env::set_var("FUSERMOUNT_PATH", env!("CARGO_BIN_EXE_fusermount-relay"));
 
-    let dir = std::env::temp_dir().join(format!("vfs-fuse-relay-{}", std::process::id()));
+    let dir = vfs_testkit::scratch_path("vfs-fuse-relay");
     let _ = std::fs::remove_dir_all(&dir);
     let game = dir.join("Game");
     let staging = dir.join("staging");
