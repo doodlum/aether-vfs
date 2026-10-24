@@ -15,6 +15,34 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const artifacts = path.resolve(here, '../../../rust/target', profile);
 const fixture = path.join(artifacts, 'vfs-fixture-read.exe');
 
+test('a command shell reads a virtual script and preserves its quoted paths', { skip: process.platform !== 'win32' }, async () => {
+  const root = scratch('shell');
+  const game = path.join(root, 'Game & Mods');
+  fs.mkdirSync(game);
+  const script = path.join(root, 'script.cmd');
+  const input = path.join(root, 'mod.txt');
+  const output = path.join(root, 'output & result.txt');
+  fs.writeFileSync(script, '@echo off\r\ntype "%~1" > "%~2"\r\n');
+  fs.writeFileSync(input, 'virtual shell bytes');
+  const virtualScript = path.join(game, 'virtual script.cmd');
+  const virtualInput = path.join(game, 'Data', 'mod file.txt');
+  const session = new Session({ stateDir: path.join(root, 'state'), artifactsDir: artifacts,
+    roots: [{ location: game, base: game, files: [
+      { path: 'virtual script.cmd', source: script }, { path: 'Data/mod file.txt', source: input },
+    ] }],
+  });
+  try {
+    session.start();
+    const launch = await session.launch({ image: process.env.comspec,
+      args: ['/d', '/s', '/c', `""${virtualScript}" "${virtualInput}" "${output}""`],
+      cwd: game, windowsVerbatimArguments: true,
+    });
+    assert.deepEqual(await launch.wait(), { kind: 'exited', code: 0 });
+    assert.equal(fs.readFileSync(output, 'utf8').trim(), 'virtual shell bytes');
+    assert.deepEqual(snapshot(game), {});
+  } finally { session.close(); }
+});
+
 function scratch(name) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), `aether-node-${name}-`));
   return dir;
@@ -30,6 +58,67 @@ function snapshot(dir) {
   }
   return out;
 }
+
+test('launch cwd preserves explicit directories and the existing root default', { skip: process.platform !== 'win32' }, async () => {
+  const root = scratch('cwd');
+  const game = path.join(root, 'Game');
+  const bin = path.join(game, 'bin');
+  const custom = path.join(game, 'Custom Folder');
+  const external = path.join(root, 'Outside');
+  const second = path.join(root, 'Other Root');
+  for (const dir of [bin, custom, external, second]) fs.mkdirSync(dir, { recursive: true });
+  const image = path.join(bin, 'game.exe');
+  fs.copyFileSync(fixture, image);
+  const source = path.join(root, 'mod.txt');
+  fs.writeFileSync(source, 'mmmmmmm');
+  fs.writeFileSync(path.join(external, 'relative.txt'), 'mmmmmmm');
+  const before = snapshot(game);
+  const session = new Session({
+    stateDir: path.join(root, 'state'), artifactsDir: artifacts,
+    roots: [{ location: game, base: game, files: [
+      { path: 'relative.txt', source },
+      { path: 'bin/relative.txt', source },
+      { path: 'Custom Folder/relative.txt', source },
+      { path: 'Virtual Only/relative.txt', source },
+      { path: 'Staged/game.exe', source: fixture },
+      { path: 'Staged/relative.txt', source },
+    ] }, { location: second, base: second, files: [{ path: 'Data/relative.txt', source }] }],
+  });
+  try {
+    session.start();
+    const cases = [[custom, custom], ['Custom Folder', custom], [external, external], ['Virtual Only', path.join(game, 'Virtual Only')], [path.join(second, 'Data'), path.join(second, 'Data')], [bin, bin], [undefined, game]];
+    for (const [cwd, expected] of cases) {
+      const report = path.join(root, 'probe.txt');
+      const launch = await session.launch({ image, cwd, env: {
+        VFS_FIXTURE_PROBE_OUT: report,
+        VFS_FIXTURE_PATH: 'relative.txt',
+        VFS_FIXTURE_EXPECT: '7',
+        VFS_FIXTURE_FILL: String('m'.charCodeAt(0)),
+      } });
+      assert.deepEqual(await launch.wait(), { kind: 'exited', code: 0 }, `cwd ${cwd}`);
+      const observed = /^cwd (.*)$/m.exec(fs.readFileSync(report, 'utf8'))?.[1].trim();
+      assert.equal(path.normalize(observed).toLowerCase(), expected.toLowerCase());
+    }
+    for (const cwd of [undefined, custom, path.join(game, 'Staged')]) {
+      const report = path.join(root, 'staged-probe.txt');
+      const launch = await session.launch({ image: path.join(game, 'Staged/game.exe'), cwd, env: {
+        VFS_FIXTURE_PROBE_OUT: report,
+        VFS_FIXTURE_PATH: 'relative.txt', VFS_FIXTURE_EXPECT: '7',
+        VFS_FIXTURE_FILL: String('m'.charCodeAt(0)),
+      } });
+      assert.deepEqual(await launch.wait(), { kind: 'exited', code: 0 }, `staged cwd ${cwd}`);
+      const observed = /^cwd (.*)$/m.exec(fs.readFileSync(report, 'utf8'))?.[1].trim();
+      assert.equal(path.normalize(observed).toLowerCase(), (cwd ?? game).toLowerCase());
+    }
+    for (const cwd of [path.join(root, 'Missing Outside'), path.join(game, 'Missing Inside'), source]) {
+      await assert.rejects(session.launch({ image, cwd }), /working directory.*does not exist/);
+    }
+    assert.deepEqual(snapshot(game), before);
+    assert.deepEqual(snapshot(second), {});
+  } finally {
+    session.close();
+  }
+});
 
 test('a mapped mod file, the real game file under it and copy-on-write writes', { skip: process.platform !== 'win32' }, async () => {
   const root = scratch('smoke');
@@ -167,6 +256,15 @@ test('a 32-bit program sees the mapped mod file and the game file, and writes co
     assert.deepEqual(results, ['ok mmmmmmm', 'ok bbbbb', 'ok', 'ok']);
     assert.equal(fs.readFileSync(path.join(overwrite, 'base.txt'), 'utf8'), 'from a 32-bit game');
     assert.equal(fs.readFileSync(path.join(overwrite, 'Data', 'written.txt'), 'utf8'), 'new');
+    const report = path.join(root, 'cwd-probe.txt');
+    const relative = await session.launch({ image: inGame, cwd: 'Data', env: {
+      VFS_FIXTURE_PROBE_OUT: report,
+      VFS_FIXTURE_PATH: 'plugin.bin', VFS_FIXTURE_EXPECT: '7',
+      VFS_FIXTURE_FILL: String('m'.charCodeAt(0)),
+    } });
+    assert.deepEqual(await relative.wait(), { kind: 'exited', code: 0 });
+    const observed = /^cwd (.*)$/m.exec(fs.readFileSync(report, 'utf8'))?.[1].trim();
+    assert.equal(path.normalize(observed).toLowerCase(), path.join(game, 'Data').toLowerCase());
     assert.deepEqual(snapshot(game), before);
   } finally {
     session.close();

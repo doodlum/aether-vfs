@@ -35,6 +35,7 @@ fn a_shim_that_never_reports_ready_gets_the_process_killed() {
     let result = run_target_with_shim(RunConfig {
         target_exe: probe,
         current_dir: None,
+        windows_verbatim_arguments: false,
         args: vec![
             root.join("does-not-matter.bin")
                 .to_str()

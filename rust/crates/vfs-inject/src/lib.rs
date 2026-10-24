@@ -32,6 +32,9 @@ pub use procparams::rewrite as rewrite_process_parameters;
 pub struct RunConfig {
     pub target_exe: String,
     pub args: Vec<String>,
+    /// Append arguments without CRT quoting (Windows command-shell syntax).
+    /// The caller supplies all required quoting, as with Node's windowsVerbatimArguments.
+    pub windows_verbatim_arguments: bool,
     /// Working directory for the child (typically the managed game root).
     pub current_dir: Option<String>,
     /// The shim DLL (`vfs_shim_dll.dll`).

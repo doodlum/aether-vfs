@@ -834,7 +834,11 @@ fn command_line_for(image: &str, cfg: &RunConfig) -> String {
     let mut cmdline = format!("\"{image}\"");
     for a in &cfg.args {
         cmdline.push(' ');
-        push_arg(&mut cmdline, a);
+        if cfg.windows_verbatim_arguments {
+            cmdline.push_str(a);
+        } else {
+            push_arg(&mut cmdline, a);
+        }
     }
     cmdline
 }

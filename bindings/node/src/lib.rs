@@ -92,6 +92,10 @@ pub struct LaunchOptions {
     /// The program: absolute, or relative to root 0's location.
     pub image: String,
     pub args: Option<Vec<String>>,
+    /// Working directory: absolute, or relative to root 0. Defaults to root 0 on Windows.
+    pub cwd: Option<String>,
+    /// Windows only: preserve caller-supplied shell quoting instead of applying CRT quoting.
+    pub windows_verbatim_arguments: Option<bool>,
     /// Extra environment variables for the program only.
     pub env: Option<std::collections::HashMap<String, String>>,
     /// Variables the program does not inherit from this process.
@@ -438,6 +442,8 @@ impl Session {
         let launch = LaunchOpts {
             image: opts.image,
             args: opts.args.unwrap_or_default(),
+            cwd: opts.cwd,
+            windows_verbatim_arguments: opts.windows_verbatim_arguments.unwrap_or(false),
             wait: false,
             env: opts.env.unwrap_or_default().into_iter().collect(),
             env_remove: opts.env_remove.unwrap_or_default(),

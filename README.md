@@ -169,6 +169,23 @@ form. On Linux the session holds a detached program, and dropping the session
 stops it (a Proton launch cannot outlive the session whose ring it reads
 through).
 
+`LaunchOpts::cwd` (and the Node binding's `launch({ cwd })`) sets the child's working
+directory on Windows as well as Proton. It can be absolute or relative to root 0.
+Omitting it keeps the existing default: root 0 on Windows, the executable's directory
+on Proton. A Windows directory served only by the
+session is visible without creating it in the real game folder. Missing directories
+are refused. The Node binding's Windows smoke suite exercises actual injected
+processes reading relative files from explicit, external, virtual-only and default
+directories: after building the addon in `bindings/node` and the shim/fixture in
+`rust`, run `node --test bindings/node/test/smoke.test.mjs` from the repository root.
+
+Windows command interpreters can opt into `LaunchOpts::windows_verbatim_arguments`
+(Node: `windowsVerbatimArguments: true`). It appends the caller's arguments exactly,
+including shell quotes; the default still quotes each argument for ordinary Windows
+programs. The smoke suite launches an injected `cmd.exe` reading a virtual command
+script, with spaces and ampersands in its paths, and verifies its output and pristine
+game folder.
+
 A session named with `Session::set_prefix_name` keeps a persistent Wine prefix
 at `$VFS_HOME/sessions/<name>/prefix`, so later launches reuse it; an unnamed
 session's prefix is deleted when the session goes down. An existing real

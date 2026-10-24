@@ -48,6 +48,7 @@ fn fuse_init_failure_aborts_the_launch() {
     let result = run_target_with_shim(RunConfig {
         target_exe: probe,
         current_dir: None,
+        windows_verbatim_arguments: false,
         args: vec![
             root.join("does-not-matter.bin")
                 .to_str()

@@ -36,6 +36,7 @@ fn a_config_version_mismatch_kills_the_process_with_the_message() {
     let result = run_target_with_shim(RunConfig {
         target_exe: probe,
         current_dir: None,
+        windows_verbatim_arguments: false,
         args: vec![
             root.join("does-not-matter.bin")
                 .to_str()

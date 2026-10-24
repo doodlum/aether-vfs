@@ -77,6 +77,7 @@ fn main() {
     let exit = run_target_with_shim(RunConfig {
         target_exe: target,
         args,
+        windows_verbatim_arguments: false,
         current_dir,
         dll_path: dll,
         config_path: config,

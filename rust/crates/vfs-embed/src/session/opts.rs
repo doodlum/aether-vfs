@@ -26,6 +26,9 @@ pub struct LaunchOpts {
     /// than handed to `CreateProcess`.
     pub image: String,
     pub args: Vec<String>,
+    /// Windows only: append the arguments verbatim, including caller-supplied shell quotes.
+    /// False by default; ordinary programs receive CRT-quoted literal arguments.
+    pub windows_verbatim_arguments: bool,
     /// Wait for the launch to end (false = detach; session must stay alive).
     ///
     /// A launch ends when the program **and everything it started** have
@@ -100,12 +103,14 @@ pub struct LaunchOpts {
     /// itself through `steam://run` when it inherits `SteamAppId` or
     /// `SteamGameId`; a host that launches one clears those here.
     pub env_remove: Vec<String>,
-    /// **Proton path only**: the working directory the program starts in, as
+    /// The working directory the program starts in, as
     /// it sees it — a `C:\…` path, or a path relative to root 0's location.
     /// A `String`, not a `PathBuf`: it names a place in the Wine prefix, with
     /// Windows spelling, not a host path.
-    /// `None` is the image's own directory. On Windows the child starts in
-    /// root 0's directory, as before, whatever this says.
+    /// `None` is the image's own directory on Proton and root 0 on Windows.
+    /// On Windows a directory that only
+    /// the session serves is presented through the shim without creating it
+    /// in the real game folder.
     pub cwd: Option<String>,
     /// How long the injector waits for the shim to report ready. `None`:
     /// `VFS_READY_TIMEOUT_SECS` from this process's environment, else 180 s.
@@ -146,6 +151,7 @@ impl Default for LaunchOpts {
             // empty image by name instead.
             image: String::new(),
             args: Vec::new(),
+            windows_verbatim_arguments: false,
             wait: true,
             activation: Activation::default(),
             stage_also: Vec::new(),

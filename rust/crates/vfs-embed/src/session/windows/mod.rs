@@ -256,12 +256,40 @@ impl Session {
             }
             ResolvedImage::Outside(p) => (PathBuf::from(p), None),
         };
-        // The program is told it runs in root 0's location, though it really
-        // starts in the backing directory: an absent or virtual location has
-        // no real directory to start in.
+        // Use the caller's working directory (or root 0, the Windows default).
+        // A directory served only by the session has no physical directory
+        // CreateProcess can start in: keep its real handle in the backing
+        // directory and present the requested name through the shim.
         let backing_s = self.virtual_root.to_string_lossy().into_owned();
-        let moved = !backing_s.eq_ignore_ascii_case(&root_s);
-        let virtual_cwd = moved.then(|| root_s.clone());
+        let cwd = match &opts.cwd {
+            Some(cwd) => PathBuf::from(&root_s).join(cwd),
+            None => PathBuf::from(&root_s),
+        };
+        let cwd_s = cwd.to_string_lossy().into_owned();
+        let current_dir = if cwd.is_dir() {
+            cwd_s.clone()
+        } else {
+            // Classify a child name so a root's own location is accepted as
+            // a directory too; classify_image deliberately refuses it as an image.
+            let probe = format!("{}\\.aether-cwd", cwd_s.trim_end_matches(['\\', '/']));
+            let served = match crate::image::classify_image(&probe, &self.root_locations())? {
+                crate::image::ImageTarget::InRoot { root, vpath } => {
+                    let directory = vpath.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+                    self.getattr(RootId(root), directory)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|stat| stat.kind == vfs_provider::KIND_DIR)
+                }
+                crate::image::ImageTarget::Outside(_) => false,
+            };
+            if !served {
+                return Err(format!(
+                    "launch: working directory {cwd_s:?} does not exist"
+                ));
+            }
+            backing_s
+        };
+        let virtual_cwd = (!current_dir.eq_ignore_ascii_case(&cwd_s)).then_some(cwd_s);
         // Named only where it differs from the real path it was started by.
         let virtual_image =
             virtual_image.filter(|v| !v.eq_ignore_ascii_case(&target.to_string_lossy()));
@@ -349,7 +377,8 @@ impl Session {
         let spawned = vfs_inject::spawn_target_with_shim(vfs_inject::RunConfig {
             target_exe: target.to_string_lossy().into_owned(),
             args: opts.args.clone(),
-            current_dir: Some(backing_s),
+            windows_verbatim_arguments: opts.windows_verbatim_arguments,
+            current_dir: Some(current_dir),
             virtual_image,
             virtual_cwd,
             dll_path: dll,
