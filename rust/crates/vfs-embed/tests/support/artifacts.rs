@@ -333,3 +333,68 @@ pub fn ensure_inject_artifacts() {
         let _ = std::fs::copy(&src, &dest);
     }
 }
+
+/// The Rust target the 32-bit artifacts are built for.
+pub const X86_TARGET: &str = "i686-pc-windows-msvc";
+
+/// The 32-bit artifacts a 32-bit launch needs, built for [`X86_TARGET`] when stale and copied
+/// to `<profile>/x86` (`vfs_embed::X86_ARTIFACTS_DIR`) beside the 64-bit shim, where the launch
+/// looks for them: `vfs_shim_dll.dll` and `vfs-injector.exe`. Returns the 32-bit
+/// `vfs-fixture-read.exe`, or `Err` with why it could not be built (a missing Rust target is the
+/// usual one: `rustup target add i686-pc-windows-msvc`).
+pub fn ensure_x86_artifacts() -> Result<PathBuf, String> {
+    let profile = profile_dir();
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..");
+    let profile_name = profile
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "debug".into());
+    let built = profile
+        .parent()
+        .map(|t| t.join(X86_TARGET).join(&profile_name))
+        .ok_or("no target directory above the profile directory")?;
+    let artifacts = [
+        ("vfs_shim_dll.dll", "vfs-shim-dll"),
+        ("vfs-injector.exe", "vfs-inject"),
+        ("vfs-fixture-read.exe", "vfs-fixture-read"),
+    ];
+    let stale = artifacts.iter().any(|(artifact, krate)| {
+        artifact_is_stale(&built.join(artifact), &workspace.join("crates").join(krate))
+    });
+    if stale {
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+        let mut args = vec!["build", "--target", X86_TARGET, "--quiet"];
+        if profile_name == "release" {
+            args.push("--release");
+        }
+        args.extend([
+            "-p",
+            "vfs-shim-dll",
+            "-p",
+            "vfs-fixture-read",
+            "-p",
+            "vfs-inject",
+        ]);
+        let out = std::process::Command::new(&cargo)
+            .current_dir(&workspace)
+            .args(&args)
+            .output()
+            .map_err(|e| format!("spawn cargo: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "cargo {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+    }
+    let x86 = profile.join(vfs_embed::X86_ARTIFACTS_DIR);
+    std::fs::create_dir_all(&x86).map_err(|e| format!("mkdir {}: {e}", x86.display()))?;
+    for name in ["vfs_shim_dll.dll", "vfs-injector.exe"] {
+        std::fs::copy(built.join(name), x86.join(name))
+            .map_err(|e| format!("copy {name} to {}: {e}", x86.display()))?;
+    }
+    Ok(built.join("vfs-fixture-read.exe"))
+}

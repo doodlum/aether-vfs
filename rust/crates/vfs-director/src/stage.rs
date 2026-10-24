@@ -1108,8 +1108,14 @@ mod tests {
     fn each_exe_gets_the_shim_built_for_its_machine() {
         let (x64, x86) = (pe_of(vfs_pe::MACHINE_AMD64), pe_of(vfs_pe::MACHINE_I386));
         let both = vec![x64.clone(), x86.clone()];
-        assert_eq!(shim_for(&both, &pe_of(vfs_pe::MACHINE_I386)).unwrap(), &x86[..]);
-        assert_eq!(shim_for(&both, &pe_of(vfs_pe::MACHINE_AMD64)).unwrap(), &x64[..]);
+        assert_eq!(
+            shim_for(&both, &pe_of(vfs_pe::MACHINE_I386)).unwrap(),
+            &x86[..]
+        );
+        assert_eq!(
+            shim_for(&both, &pe_of(vfs_pe::MACHINE_AMD64)).unwrap(),
+            &x64[..]
+        );
         // Only the 64-bit shim: a 32-bit EXE is named, not given the wrong one.
         let only64 = vec![x64.clone()];
         let e = shim_for(&only64, &pe_of(vfs_pe::MACHINE_I386)).unwrap_err();

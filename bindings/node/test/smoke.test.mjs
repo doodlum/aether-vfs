@@ -109,6 +109,75 @@ test('a mapped mod file, the real game file under it and copy-on-write writes', 
   }
 });
 
+// The same session launching a 32-bit program (Fallout 3, New Vegas and Oblivion are): the
+// 32-bit shim and injector sit in `x86\` beside the 64-bit ones, built for i686-pc-windows-msvc
+// (see the README). Skipped when they, or the 32-bit fixture, have not been built.
+const x86Dir = path.join(artifacts, 'x86');
+const fixture32 = path.resolve(here, '../../../rust/target/i686-pc-windows-msvc', profile, 'vfs-fixture-read.exe');
+const x86Missing =
+  process.platform !== 'win32'
+    ? 'Windows only'
+    : [path.join(x86Dir, 'vfs_shim_dll.dll'), path.join(x86Dir, 'vfs-injector.exe'), fixture32].find(
+        (p) => !fs.existsSync(p),
+      );
+
+test('a 32-bit program sees the mapped mod file and the game file, and writes copy-on-write', { skip: x86Missing ? `no ${x86Missing}` : false }, async () => {
+  const root = scratch('x86');
+  const game = path.join(root, 'Game');
+  const mods = path.join(root, 'staging', 'Some Mod');
+  const overwrite = path.join(root, 'overwrite');
+  fs.mkdirSync(game, { recursive: true });
+  fs.mkdirSync(mods, { recursive: true });
+  fs.writeFileSync(path.join(game, 'base.txt'), 'bbbbb');
+  fs.writeFileSync(path.join(mods, 'plugin.bin'), 'mmmmmmm');
+  // A 32-bit program in the game folder, as a 32-bit game is.
+  const inGame = path.join(game, 'Game32.exe');
+  fs.copyFileSync(fixture32, inGame);
+  const before = snapshot(game);
+  const session = new Session({
+    stateDir: path.join(root, 'state'),
+    artifactsDir: artifacts,
+    roots: [
+      {
+        location: game,
+        base: game,
+        files: [{ path: 'Data/plugin.bin', source: path.join(mods, 'plugin.bin') }],
+        writeTo: overwrite,
+      },
+    ],
+  });
+  const out = path.join(root, 'ops.out');
+  const script = path.join(root, 'ops.txt');
+  fs.writeFileSync(
+    script,
+    [
+      `read\t${path.join(game, 'Data', 'plugin.bin')}`,
+      `read\t${path.join(game, 'base.txt')}`,
+      `write\t${path.join(game, 'base.txt')}\tfrom a 32-bit game`,
+      `write\t${path.join(game, 'Data', 'written.txt')}\tnew`,
+    ].join('\n'),
+  );
+  try {
+    session.start();
+    const launch = await session.launch({
+      image: inGame,
+      env: { VFS_FIXTURE_OPS: script, VFS_FIXTURE_OPS_OUT: out },
+    });
+    assert.deepEqual(await launch.wait(), { kind: 'exited', code: 0 });
+    const results = fs
+      .readFileSync(out, 'utf8')
+      .trim()
+      .split('\n')
+      .map((line) => line.split('\t').at(-1));
+    assert.deepEqual(results, ['ok mmmmmmm', 'ok bbbbb', 'ok', 'ok']);
+    assert.equal(fs.readFileSync(path.join(overwrite, 'base.txt'), 'utf8'), 'from a 32-bit game');
+    assert.equal(fs.readFileSync(path.join(overwrite, 'Data', 'written.txt'), 'utf8'), 'new');
+    assert.deepEqual(snapshot(game), before);
+  } finally {
+    session.close();
+  }
+});
+
 test('a root changed while its program runs is what the program sees next', { skip: process.platform !== 'win32' }, async () => {
   const root = scratch('live');
   const game = path.join(root, 'Game');

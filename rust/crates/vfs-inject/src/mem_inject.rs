@@ -135,6 +135,7 @@ pub unsafe fn patch_imports_in_memory(process: HANDLE) -> Result<(), MemPatchRef
     let want;
     let mut candidate = first;
     let mut last_err = 0u32;
+    let mut tries = 0;
     loop {
         if candidate < base || (candidate - base) > u32::MAX as usize - 0x10_0000 {
             return Err(NoRoomNearImage(format!(
@@ -173,10 +174,18 @@ pub unsafe fn patch_imports_in_memory(process: HANDLE) -> Result<(), MemPatchRef
                 );
             }
         }
-        // Up to 64 steps (a few MiB past the image) before giving up to the
-        // fallback.
-        candidate += step;
-        if candidate >= first + 64 * step {
+        // The next candidate: past the whole region that holds this one when
+        // it is taken (a WOW64 guest's 16 MiB primary stack lands right after
+        // its image, which 64 KiB steps would never clear), else one step on.
+        // Up to 64 tries before giving up to the fallback.
+        // SAFETY: a query of a process we own into a local.
+        let taken_until = unsafe { region_end_if_taken(process, candidate) };
+        candidate = match taken_until {
+            Some(end) => end.div_ceil(GRAN) * GRAN,
+            None => candidate + step,
+        };
+        tries += 1;
+        if tries >= 64 {
             return Err(NoRoomNearImage(format!(
                 "first {first:#x} base {base:#x} region {} bytes: last error {last_err}",
                 old.len() + 200
@@ -196,6 +205,25 @@ pub unsafe fn patch_imports_in_memory(process: HANDLE) -> Result<(), MemPatchRef
             .map_err(|e| RemoteMemory(format!("write header: {e}")))?;
     }
     Ok(())
+}
+
+/// The end of the region holding `at` in `process`, when that region is not
+/// free; `None` when it is free or cannot be queried.
+#[allow(unsafe_code)]
+unsafe fn region_end_if_taken(process: HANDLE, at: usize) -> Option<usize> {
+    use windows_sys::Win32::System::Memory::{VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_FREE};
+    // SAFETY: zeroed plain-data struct, filled by the query.
+    let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { core::mem::zeroed() };
+    // SAFETY: a query of a process we own into a local of its size.
+    let got = unsafe {
+        VirtualQueryEx(
+            process,
+            at as *const c_void,
+            &mut mbi,
+            core::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+        )
+    };
+    (got != 0 && mbi.State != MEM_FREE).then(|| mbi.BaseAddress as usize + mbi.RegionSize)
 }
 
 /// Whether the image at `base` is a SteamStub wrapper that verifies itself:

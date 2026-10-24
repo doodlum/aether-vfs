@@ -80,7 +80,9 @@ impl Session {
                 opts.also,
                 &self.virtual_root,
                 opts.fallback_dirs,
-                &std::iter::once(shim).chain(opts.shim_x86).collect::<Vec<_>>(),
+                &std::iter::once(shim)
+                    .chain(opts.shim_x86)
+                    .collect::<Vec<_>>(),
             )?,
             None => stage_launch_into(
                 source,

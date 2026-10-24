@@ -117,6 +117,18 @@ pub const SH_STATUS: usize = offset_of!(SlotHeader, status);
 pub const SH_ACK: usize = offset_of!(SlotHeader, ack);
 pub const SH_REQ_ID: usize = offset_of!(SlotHeader, req_id);
 
+// The ring is shared between a 64-bit director and a shim of either width (a
+// 32-bit game's shim attaches to the same 64-bit host), so every offset is
+// fixed-width and pinned here at compile time: a build for either target that
+// laid a header out differently fails rather than misreading the other side.
+const _: () = {
+    assert!(RH_MAGIC == 0 && RH_VERSION == 4 && RH_SLOT_COUNT == 8);
+    assert!(RH_SLOT_STRIDE == 12 && RH_PAYLOAD_CAP == 16 && RH_WORKER_HINT == 20);
+    assert!(RH_REQ_SEQ == 24 && RH_SUBMIT_SEQ == 32 && RH_REG_GEN == 40);
+    assert!(SH_STATE == 0 && SH_OPCODE == 4 && SH_FLAGS == 8 && SH_PAYLOAD_LEN == 12);
+    assert!(SH_STATUS == 16 && SH_ACK == 20 && SH_REQ_ID == 24);
+};
+
 /// Round `n` up to a multiple of 8.
 pub const fn align8(n: usize) -> usize {
     (n + 7) & !7
