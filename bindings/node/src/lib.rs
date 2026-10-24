@@ -2,15 +2,24 @@
 //! launches programs through it and watches them end. Type conversion and threading only; every
 //! platform difference stays behind `vfs-embed`.
 //!
+//! **Windows and Linux.** On Windows `start()` serves the session and `launch()` starts a program
+//! with the shim injected; only launched programs see the roots. On Linux `start()` mounts each
+//! root with FUSE at its location instead, so every process sees it (Steam's own Proton, a native
+//! game, this host), `setRoot()` takes effect for the next lookup and open, `close()` unmounts,
+//! and `launch()` is refused with `E_PLATFORM`: start the program any way you like. See
+//! `linux.rs` for the rules a mount adds to a root spec.
+//!
 //! **Errors.** Every rejection is an `Error` whose message starts with a stable code and a colon
 //! (`E_CONFIG: …`), the same on synchronous calls and on Promises:
 //!
 //! | code | meaning |
 //! |---|---|
-//! | `E_CONFIG` | bad path, missing base folder, a map that is not a tree, a write folder that cannot be made |
+//! | `E_CONFIG` | bad path, missing base folder, a map that is not a tree, a write folder that cannot be made; on Linux also nested locations, or a source or write folder inside a location |
 //! | `E_ARTIFACTS` | the shim DLL or injector is missing from `artifactsDir` |
-//! | `E_STATE` | a launch or root change while a launch runs, any call after `close` |
+//! | `E_STATE` | a launch or root change while a launch runs, any call after `close`; on Linux a location another live session has mounted |
 //! | `E_LAUNCH` | the program failed to start or was refused |
+//! | `E_MOUNT` | Linux: a root could not be mounted (no `/dev/fuse`, no `fusermount3`, a location that cannot be made) |
+//! | `E_PLATFORM` | Linux: `launch()`, which a mounted root does not need |
 //! | `E_INTERNAL` | anything else, including a caught panic |
 
 use std::path::{Path, PathBuf};
@@ -25,10 +34,17 @@ use vfs_embed::{
     ReadOnlyProvider, RootId, RootSources,
 };
 
+#[cfg(target_os = "linux")]
+mod linux;
+
 const E_CONFIG: &str = "E_CONFIG";
 const E_ARTIFACTS: &str = "E_ARTIFACTS";
 const E_STATE: &str = "E_STATE";
 const E_LAUNCH: &str = "E_LAUNCH";
+#[cfg(target_os = "linux")]
+const E_MOUNT: &str = "E_MOUNT";
+#[cfg(target_os = "linux")]
+const E_PLATFORM: &str = "E_PLATFORM";
 const E_INTERNAL: &str = "E_INTERNAL";
 
 fn error(code: &str, message: impl std::fmt::Display) -> Error {
@@ -104,6 +120,25 @@ struct Inner {
     file_counts: Vec<usize>,
     serving: bool,
     closed: bool,
+    #[cfg(target_os = "linux")]
+    linux: linux::Linux,
+}
+
+impl Inner {
+    /// Compose root `id` from `spec` the way this platform serves it.
+    fn compose(&self, id: u32, spec: &RootSpec) -> Result<usize> {
+        #[cfg(target_os = "linux")]
+        {
+            self.linux.check_spec(spec)?;
+            compose(&self.session, id, spec, |base| {
+                self.linux.base_provider(base)
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            compose(&self.session, id, spec, |_| None)
+        }
+    }
 }
 
 /// The session's current launch, shared with its `Launch` object.
@@ -154,16 +189,30 @@ fn lock(inner: &Mutex<Inner>) -> Result<std::sync::MutexGuard<'_, Inner>> {
 
 /// Compose root `id` from its spec: `base` read-only, the file map above it, and `write_to` as
 /// the copy-on-write upper. Replaces whatever the root served before.
-fn compose(session: &vfs_embed::Session, id: u32, spec: &RootSpec) -> Result<usize> {
+///
+/// `base_override` serves a base folder some other way than by path, when it returns `Some`:
+/// on Linux, a base inside a mounted location is read through a descriptor opened before the
+/// mount.
+fn compose(
+    session: &vfs_embed::Session,
+    id: u32,
+    spec: &RootSpec,
+    base_override: impl Fn(&str) -> Option<Result<Arc<dyn Provider>>>,
+) -> Result<usize> {
     let mut sources = RootSources::new();
     if let Some(base) = &spec.base {
-        if !Path::new(base).is_dir() {
-            return Err(error(
-                E_CONFIG,
-                format!("base folder {base:?} does not exist"),
-            ));
-        }
-        let disk: Arc<dyn Provider> = Arc::new(DiskProvider::new(base));
+        let disk: Arc<dyn Provider> = match base_override(base) {
+            Some(provider) => provider?,
+            None => {
+                if !Path::new(base).is_dir() {
+                    return Err(error(
+                        E_CONFIG,
+                        format!("base folder {base:?} does not exist"),
+                    ));
+                }
+                Arc::new(DiskProvider::new(base))
+            }
+        };
         sources.add("", 0, Arc::new(ReadOnlyProvider::new(disk)));
     }
     let map = MapProvider::new(
@@ -226,26 +275,33 @@ impl Session {
         let backing = state.join("root0");
         std::fs::create_dir_all(&backing).map_err(|e| error(E_CONFIG, e))?;
         session.set_root(&backing);
-        let mut counts = Vec::with_capacity(opts.roots.len());
-        for (id, spec) in opts.roots.iter().enumerate() {
+        for spec in &opts.roots {
             check_location(&spec.location)?;
-            session.declare_root(id as u32, &spec.location);
-            counts.push(compose(&session, id as u32, spec)?);
         }
+        let mut inner = Inner {
+            session,
+            roots: Vec::new(),
+            file_counts: Vec::with_capacity(opts.roots.len()),
+            serving: false,
+            closed: false,
+            #[cfg(target_os = "linux")]
+            linux: linux::Linux::new(&opts.roots)?,
+        };
+        for (id, spec) in opts.roots.iter().enumerate() {
+            inner.session.declare_root(id as u32, &spec.location);
+            let count = inner.compose(id as u32, spec)?;
+            inner.file_counts.push(count);
+        }
+        inner.roots = opts.roots;
         Ok(Session {
-            inner: Arc::new(Mutex::new(Inner {
-                session,
-                roots: opts.roots,
-                file_counts: counts,
-                serving: false,
-                closed: false,
-            })),
+            inner: Arc::new(Mutex::new(inner)),
             artifacts: PathBuf::from(opts.artifacts_dir),
             current: Arc::new(Mutex::new(None)),
         })
     }
 
-    /// Start serving. Idempotent.
+    /// Start serving: on Windows the ring launched programs reach the session by; on Linux a
+    /// FUSE mount at each root's location, after which every process sees the roots. Idempotent.
     #[napi]
     pub fn start(&self) -> Result<()> {
         let mut inner = lock(&self.inner)?;
@@ -253,10 +309,36 @@ impl Session {
             return Err(error(E_STATE, "the session is closed"));
         }
         if !inner.serving {
+            #[cfg(target_os = "linux")]
+            {
+                let inner = &mut *inner;
+                let director = Arc::clone(inner.session.kernel());
+                inner.linux.mount_all(&director)?;
+            }
+            #[cfg(not(target_os = "linux"))]
             inner.session.serve().map_err(|e| error(E_INTERNAL, e))?;
             inner.serving = true;
         }
         Ok(())
+    }
+
+    /// The ids of the roots mounted at their locations right now (Linux, after `start()`).
+    /// Always empty on Windows, where roots are seen only by launched programs.
+    #[napi]
+    pub fn mounted(&self) -> Result<Vec<u32>> {
+        let inner = lock(&self.inner)?;
+        #[cfg(target_os = "linux")]
+        {
+            Ok((0..inner.roots.len())
+                .filter(|&id| inner.linux.is_mounted(id))
+                .map(|id| id as u32)
+                .collect())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            drop(inner);
+            Ok(Vec::new())
+        }
     }
 
     /// The roots, as programs see them.
@@ -278,7 +360,8 @@ impl Session {
     /// Replace one root's content (its location stays), also while a launch runs: the director
     /// swaps the root's provider and moves its mount generation, so a running program's next
     /// open sees the new content and its read cache drops the old bytes. Handles already open
-    /// keep reading what they opened.
+    /// keep reading what they opened. On Linux, while mounted, the kernel's cached entries are
+    /// dropped too, so the next lookup by any process sees the new content.
     #[napi]
     pub fn set_root(&self, id: u32, spec: RootSpec) -> Result<()> {
         let mut inner = lock(&self.inner)?;
@@ -294,15 +377,56 @@ impl Session {
                 "a root's location cannot change; make a new session",
             ));
         }
-        let count = compose(&inner.session, id, &spec)?;
+        let count = inner.compose(id, &spec)?;
+        #[cfg(target_os = "linux")]
+        inner.linux.invalidate(id as usize);
         inner.file_counts[id as usize] = count;
         inner.roots[id as usize] = spec;
         Ok(())
     }
 
-    /// Launch a program through the session. Resolves once it is running.
+    /// Launch a program through the session. Resolves once it is running. Windows only: on
+    /// Linux the mounted roots are seen by every process, so start the program directly
+    /// (`E_PLATFORM`).
     #[napi(ts_return_type = "Promise<Launch>")]
     pub fn launch(&self, opts: LaunchOptions) -> Result<AsyncTask<LaunchTask>> {
+        #[cfg(target_os = "linux")]
+        {
+            let _ = opts;
+            Err(error(
+                E_PLATFORM,
+                "launch() is not used on Linux: start() mounts each root at its location, so start the program directly",
+            ))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.launch_injected(opts)
+        }
+    }
+
+    /// Stop a running launch, stop serving and release everything. On Linux, unmount every
+    /// root (lazily where a program still holds files open). Idempotent.
+    #[napi]
+    pub fn close(&self) -> Result<()> {
+        if let Some(active) = self.current.lock().ok().and_then(|mut c| c.take()) {
+            let _ = active.stopper.stop();
+        }
+        let mut inner = lock(&self.inner)?;
+        if !inner.closed {
+            #[cfg(target_os = "linux")]
+            inner.linux.unmount_all();
+            inner.session.stop_serve();
+            inner.serving = false;
+            inner.closed = true;
+        }
+        Ok(())
+    }
+}
+
+impl Session {
+    /// [`Session::launch`] where a launch injects the shim (Windows).
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    fn launch_injected(&self, opts: LaunchOptions) -> Result<AsyncTask<LaunchTask>> {
         self.refuse_while_running()?;
         let shim = self.artifacts.join("vfs_shim_dll.dll");
         if !shim.is_file() {
@@ -326,21 +450,6 @@ impl Session {
             opts: Some(launch),
             started: None,
         }))
-    }
-
-    /// Stop a running launch, stop serving and release everything. Idempotent.
-    #[napi]
-    pub fn close(&self) -> Result<()> {
-        if let Some(active) = self.current.lock().ok().and_then(|mut c| c.take()) {
-            let _ = active.stopper.stop();
-        }
-        let mut inner = lock(&self.inner)?;
-        if !inner.closed {
-            inner.session.stop_serve();
-            inner.serving = false;
-            inner.closed = true;
-        }
-        Ok(())
     }
 
     fn refuse_while_running(&self) -> Result<()> {

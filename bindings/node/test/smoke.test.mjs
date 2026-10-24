@@ -8,16 +8,11 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
+import { Session, profile } from './addon.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const require = createRequire(import.meta.url);
-const profile = process.env.AETHER_PROFILE ?? 'debug';
 const artifacts = path.resolve(here, '../../../rust/target', profile);
-const addonPath = path.join(here, '..', 'aether_vfs_node.node');
-fs.copyFileSync(path.resolve(here, '../target', profile, 'aether_vfs_node.dll'), addonPath);
-const { Session } = require(addonPath);
 const fixture = path.join(artifacts, 'vfs-fixture-read.exe');
 
 function scratch(name) {
@@ -207,7 +202,9 @@ test('a launch without the shim is refused by name, and calls after close are re
     roots: [{ location: path.join(root, 'g'), files: [] }],
   });
   session.start();
-  assert.throws(() => session.launch({ image: 'x.exe' }), /^Error: E_ARTIFACTS: /);
+  // On Linux the roots are mounted, so nothing is launched through the session.
+  const refused = process.platform === 'linux' ? /^Error: E_PLATFORM: / : /^Error: E_ARTIFACTS: /;
+  assert.throws(() => session.launch({ image: 'x.exe' }), refused);
   session.close();
   assert.throws(() => session.start(), /^Error: E_STATE: /);
 });
