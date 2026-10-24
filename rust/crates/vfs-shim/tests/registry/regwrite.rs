@@ -383,7 +383,7 @@ fn a_handle_opened_before_the_hooks_writes_to_the_overlay() {
     assert_eq!(st, 0);
     assert_eq!(query_dword(f.pre, "viaWin32"), Ok(5));
     assert_eq!(f.real_value("Pre", "viaWin32"), "none");
-    assert_eq!(registry_handle_path(f.pre), Some(f.canon("Pre")));
+    f.assert_records(registry_handle_path(f.pre), "Pre");
 }
 
 #[test]

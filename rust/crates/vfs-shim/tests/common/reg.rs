@@ -255,6 +255,19 @@ impl Paths {
     pub(crate) fn canon(&self, rel: &str) -> String {
         format!(r"\Registry\User\<CurrentUser>\{}\{rel}", self.base)
     }
+
+    /// Asserts `recorded` names the key `rel`. A path recorded from the kernel's name of a
+    /// handle has the hive's own spelling (`SOFTWARE` on some machines, `Software` on others),
+    /// so names compare as the registry compares them, ignoring case.
+    pub(crate) fn assert_records(&self, recorded: Option<String>, rel: &str) {
+        let want = self.canon(rel);
+        assert!(
+            recorded
+                .as_deref()
+                .is_some_and(|r| r.eq_ignore_ascii_case(&want)),
+            "recorded {recorded:?}, want {want:?} (any case)"
+        );
+    }
 }
 
 /// The unhooked process that answers what is really in the registry: this test binary, started
