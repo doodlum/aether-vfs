@@ -92,6 +92,10 @@ pub unsafe fn patch_imports_in_memory(process: HANDLE) -> Result<(), MemPatchRef
         let verify = match steamstub_verifies(process, base, &headers) {
             Some(true) => "verifies-its-file",
             Some(false) => "no-module-verification",
+            // A 32-bit stub whose header does not decode (Fallout: New Vegas) rejects the patched
+            // header: it never reaches Steam ("Application load error 5:0000065434"). Remote
+            // injection leaves the image alone, and that stub then starts the game.
+            None if guest == Guest::X86 => return Err(MemPatchRefused::SteamStubUnknown),
             None => "unreadable-header",
         };
         eprintln!("vfs-inject: in-memory patch over a SteamStub wrapper ({verify})");
