@@ -526,9 +526,10 @@ fn the_object_name_of_a_synthetic_key_is_its_nt_name() {
         )
     };
     assert_eq!(st, STATUS_BUFFER_OVERFLOW);
+    // The `UNICODE_STRING` header: two pointers' worth (16 bytes on 64-bit, 8 on 32-bit).
     assert_eq!(
         need as usize,
-        16 + f.nt("Overlaid").encode_utf16().count() * 2 + 2
+        2 * std::mem::size_of::<usize>() + f.nt("Overlaid").encode_utf16().count() * 2 + 2
     );
     close(s);
     close(r);

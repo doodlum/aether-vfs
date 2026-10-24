@@ -15,6 +15,7 @@
 
 use crate::fakedirector;
 
+use crate::ntapi;
 use fakedirector::{Fake, ReadStyle};
 use vfs_shim::install;
 use windows_sys::Win32::Foundation::HANDLE;
@@ -45,7 +46,8 @@ fn object_name(h: HANDLE) -> String {
     let len = u16::from_le_bytes([buf[0], buf[1]]) as usize;
     // `as_chunks` rather than `chunks_exact`: clippy's
     // `chunks_exact_to_as_chunks` is denied workspace-wide.
-    let chars: Vec<u16> = buf[16..16 + len]
+    let hdr = ntapi::OBJECT_NAME_HEADER;
+    let chars: Vec<u16> = buf[hdr..hdr + len]
         .as_chunks::<2>()
         .0
         .iter()
@@ -82,13 +84,34 @@ fn a_redirected_handle_reports_its_virtual_name_not_the_backing_one() {
     // queries with a tiny buffer, allocates what `ReturnLength` asks for and
     // queries again either loops forever or fails outright unless the spoof
     // reproduces this, and `ReturnLength` has to describe the shim's own answer.
+    // The header is a `UNICODE_STRING`: 16 bytes on 64-bit, 8 on 32-bit.
+    let hdr = ntapi::OBJECT_NAME_HEADER;
+    let probes = [
+        (0u32, STATUS_INFO_LENGTH_MISMATCH),
+        (hdr as u32 / 2, STATUS_INFO_LENGTH_MISMATCH),
+        (hdr as u32, STATUS_BUFFER_OVERFLOW),
+    ];
+    // The host's own answers for a real file outside the root, at this width: the
+    // spoof must give the same ones.
+    let real = std::env::current_exe().unwrap();
+    let real = std::fs::File::open(&real).expect("open a real file");
+    for (len, expect) in probes {
+        let mut small = [0u8; 16];
+        let mut ret = 0u32;
+        let st = unsafe {
+            NtQueryObject(
+                real.as_raw_handle() as isize,
+                OBJECT_NAME_INFORMATION,
+                small.as_mut_ptr(),
+                len,
+                &mut ret,
+            )
+        };
+        assert_eq!(st, expect, "the host itself, len={len}: got 0x{st:08x}");
+    }
     let h = f.as_raw_handle() as HANDLE;
     let mut required = 0u32;
-    for (len, expect) in [
-        (0u32, STATUS_INFO_LENGTH_MISMATCH),
-        (8, STATUS_INFO_LENGTH_MISMATCH),
-        (16, STATUS_BUFFER_OVERFLOW),
-    ] {
+    for (len, expect) in probes {
         let mut small = [0u8; 16];
         let mut ret = 0u32;
         let st = unsafe {
@@ -130,8 +153,8 @@ fn a_redirected_handle_reports_its_virtual_name_not_the_backing_one() {
         "required-1 must overflow: 0x{st:08x}"
     );
     assert_eq!(ret, required);
-    // And exactly the required size succeeds, with `Buffer` pointing 16 bytes
-    // into the caller's own buffer -- what both hosts were measured to do.
+    // And exactly the required size succeeds, with `Buffer` pointing just past
+    // the header into the caller's own buffer -- what both hosts were measured to do.
     let mut exact = vec![0u8; required as usize];
     let st = unsafe {
         NtQueryObject(
@@ -145,12 +168,13 @@ fn a_redirected_handle_reports_its_virtual_name_not_the_backing_one() {
     assert_eq!(st, 0, "exactly `required` bytes must succeed: 0x{st:08x}");
     let namelen = u16::from_le_bytes([exact[0], exact[1]]) as usize;
     let maxlen = u16::from_le_bytes([exact[2], exact[3]]) as usize;
-    let bufptr = usize::from_le_bytes(exact[8..16].try_into().unwrap());
+    let p = ntapi::PTR;
+    let bufptr = usize::from_le_bytes(exact[p..2 * p].try_into().unwrap());
     assert_eq!(maxlen, namelen + 2, "MaximumLength must include the NUL");
-    assert_eq!(required as usize, 16 + namelen + 2);
+    assert_eq!(required as usize, hdr + namelen + 2);
     assert_eq!(
         bufptr.wrapping_sub(exact.as_ptr() as usize),
-        16,
-        "Buffer must point 16 bytes into the caller's own buffer"
+        hdr,
+        "Buffer must point just past the header into the caller's own buffer"
     );
 }

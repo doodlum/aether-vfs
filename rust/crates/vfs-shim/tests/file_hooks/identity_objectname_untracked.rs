@@ -13,6 +13,7 @@
 //! process-global ntdll trampolines. Every test in these binaries re-executes
 //! itself in a fresh process for that reason (see `tests/common/mod.rs`).
 
+use crate::ntapi;
 use vfs_shim::install;
 use windows_sys::Win32::Foundation::HANDLE;
 
@@ -38,7 +39,8 @@ fn object_name(h: HANDLE) -> String {
     let len = u16::from_le_bytes([buf[0], buf[1]]) as usize;
     // `as_chunks` rather than `chunks_exact`: clippy's
     // `chunks_exact_to_as_chunks` is denied workspace-wide.
-    let chars: Vec<u16> = buf[16..16 + len]
+    let hdr = ntapi::OBJECT_NAME_HEADER;
+    let chars: Vec<u16> = buf[hdr..hdr + len]
         .as_chunks::<2>()
         .0
         .iter()

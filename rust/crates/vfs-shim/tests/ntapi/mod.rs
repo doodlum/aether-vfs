@@ -13,6 +13,20 @@ use std::ffi::c_void;
 pub(crate) const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
 pub(crate) const OBJ_CASE_INSENSITIVE: u32 = 0x40;
 
+/// Bytes in a pointer: the NT layouts these tests build are this target's (the 32-bit test
+/// binaries run against the 32-bit shim).
+pub(crate) const PTR: usize = core::mem::size_of::<usize>();
+
+/// `FILE_RENAME_INFORMATION` / `FILE_LINK_INFORMATION`: the offsets of `RootDirectory`,
+/// `FileNameLength` and `FileName` (8, 16, 20 on 64-bit; 4, 8, 12 on 32-bit).
+pub(crate) const fn rename_offsets() -> (usize, usize, usize) {
+    (PTR, 2 * PTR, 2 * PTR + 4)
+}
+
+/// The `UNICODE_STRING` header an `OBJECT_NAME_INFORMATION` opens with: 16 bytes on 64-bit,
+/// 8 on 32-bit, its `Buffer` pointer at `PTR`.
+pub(crate) const OBJECT_NAME_HEADER: usize = 2 * PTR;
+
 #[repr(C)]
 pub(crate) struct UnicodeString {
     pub(crate) length: u16,
@@ -276,8 +290,8 @@ pub(crate) fn nt_set_disposition_delete(h: *mut c_void) -> i32 {
 /// absolute target (`RootDirectory` NULL), which is what `MoveFileExW` builds.
 ///
 /// Layout, and it must match `hook/path.rs::parse_rename_target` exactly:
-/// `ReplaceIfExists`/`Flags` at 0, `RootDirectory` at 8, `FileNameLength` at
-/// 16, `FileName` at 20.
+/// `ReplaceIfExists`/`Flags` at 0, `RootDirectory` one pointer in, then
+/// `FileNameLength` and `FileName` ([`rename_offsets`]).
 pub(crate) fn nt_rename(h: *mut c_void, target: &str, class: u32) -> i32 {
     let Some(p) = ntdll_proc("NtSetInformationFile") else {
         return -1;
@@ -285,11 +299,12 @@ pub(crate) fn nt_rename(h: *mut c_void, target: &str, class: u32) -> i32 {
     let f: NtSetInformationFileFn = unsafe { core::mem::transmute(p) };
     let wide: Vec<u16> = to_nt(target).encode_utf16().collect();
     let namelen = wide.len() * 2;
-    let mut buf = vec![0u8; 20 + namelen];
+    let (_, len_off, name_off) = rename_offsets();
+    let mut buf = vec![0u8; name_off + namelen];
     buf[0] = 1; // ReplaceIfExists / FILE_RENAME_REPLACE_IF_EXISTS
-    buf[16..20].copy_from_slice(&(namelen as u32).to_le_bytes());
+    buf[len_off..len_off + 4].copy_from_slice(&(namelen as u32).to_le_bytes());
     for (i, u) in wide.iter().enumerate() {
-        buf[20 + i * 2..22 + i * 2].copy_from_slice(&u.to_le_bytes());
+        buf[name_off + i * 2..name_off + 2 + i * 2].copy_from_slice(&u.to_le_bytes());
     }
     let mut iosb = [0u8; 16];
     unsafe {
@@ -449,7 +464,8 @@ pub(crate) fn read_all(h: *mut c_void) -> Vec<u8> {
         )
     };
     assert!(st >= 0, "NtReadFile failed: {st:#x}");
-    let got = usize::from_le_bytes(iosb[8..16].try_into().unwrap());
+    // `IO_STATUS_BLOCK.Information`: one pointer in, a pointer wide.
+    let got = usize::from_le_bytes(iosb[PTR..2 * PTR].try_into().unwrap());
     out.truncate(got);
     out
 }

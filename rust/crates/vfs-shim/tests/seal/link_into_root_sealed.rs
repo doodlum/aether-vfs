@@ -72,8 +72,9 @@ fn a_hard_link_touching_a_managed_root_is_refused_and_one_outside_works() {
     // A target that cannot be decoded (declared name length past the buffer) fails closed.
     let (st, h) = ntapi::nt_open_abs(&outside.join("ctl.esp").to_string_lossy(), DELETE);
     assert!(st >= 0, "opening the control source failed: {st:#x}");
-    let mut bad = vec![0u8; 24];
-    bad[16..20].copy_from_slice(&200u32.to_le_bytes());
+    let (_, len_off, name_off) = ntapi::rename_offsets();
+    let mut bad = vec![0u8; name_off + 4];
+    bad[len_off..len_off + 4].copy_from_slice(&200u32.to_le_bytes());
     let undecodable = ntapi::nt_set_info_raw(h, &mut bad, ntapi::FILE_LINK_INFORMATION);
     ntapi::close(h);
 
