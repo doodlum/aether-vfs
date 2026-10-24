@@ -351,8 +351,9 @@ any child the shim cannot virtualise. 32-bit games under Proton are not supporte
 Tests: `cargo test -p vfs-embed --test launch_x86` builds the 32-bit artifacts itself (it needs
 the Rust target; without it each test prints `SKIP` and passes, or fails under
 `VFS_TEST_REQUIRE_ALL=1`), and `cargo test --target i686-pc-windows-msvc -p vfs-shim -p
-vfs-inject -p vfs-ntlayout -p vfs-pe` runs those crates' tests, the shim's in-process hook
-tests among them, as a 32-bit process.
+vfs-ntlayout -p vfs-pe` runs those crates' tests, the shim's in-process hook tests among them,
+as a 32-bit process (for `vfs-inject` only its `--lib` tests: its integration tests inject the
+64-bit fixtures the default build makes, which a 32-bit run refuses as the wrong width).
 
 ## License
 
