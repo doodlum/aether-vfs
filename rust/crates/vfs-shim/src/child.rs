@@ -201,14 +201,22 @@ fn has_exited(process: HANDLE) -> bool {
     unsafe { WaitForSingleObject(process, 0) == 0 }
 }
 
-/// The absolute path of the DLL this code lives in.
+/// The absolute path of the DLL this code lives in, as it was first read. The bootstrap reads it
+/// before `whereami::rename_image`, which renames every loader entry under a backing directory,
+/// the shim's own when it is staged beside the program: a child injected by that renamed path
+/// (`nvse_loader` starting the game) fails to load a shim that is only in the VFS.
 pub(crate) fn self_dll_path() -> Option<String> {
+    static PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    PATH.get_or_init(read_self_dll_path).clone()
+}
+
+fn read_self_dll_path() -> Option<String> {
     // SAFETY: resolve our module by an address inside it, then read its path.
     unsafe {
         let mut hmod = core::ptr::null_mut();
         let ok = GetModuleHandleExW(
             GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            self_dll_path as *const u16,
+            read_self_dll_path as *const u16,
             &mut hmod,
         );
         if ok == 0 || hmod.is_null() {
