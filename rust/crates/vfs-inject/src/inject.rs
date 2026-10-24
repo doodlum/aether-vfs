@@ -12,8 +12,15 @@ use windows_sys::Win32::System::Diagnostics::Debug::{
     GetThreadContext, SetThreadContext, WriteProcessMemory, CONTEXT,
 };
 
+/// `CONTEXT_FULL` for this target's own `CONTEXT`: `CONTEXT_AMD64` or
+/// `CONTEXT_i386`, with its control and integer registers.
+#[cfg(target_arch = "x86_64")]
 const CONTEXT_FULL: u32 = 0x0010_000B;
+#[cfg(target_arch = "x86")]
+const CONTEXT_FULL: u32 = 0x0001_0007;
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+
+use crate::guest::{read_ptr, teb_of, Guest};
 use windows_sys::Win32::System::Memory::{VirtualAllocEx, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, CreateRemoteThread, GetExitCodeProcess, ResumeThread, TerminateProcess,
@@ -73,80 +80,36 @@ pub unsafe fn expand_primary_stack(
     primary: HANDLE,
     stack_reserve: usize,
 ) -> Result<(), InjectError> {
-    type NtQueryInformationThreadFn =
-        unsafe extern "system" fn(HANDLE, u32, *mut c_void, u32, *mut u32) -> i32;
-
-    let ntdll = GetModuleHandleW(wide("ntdll.dll").as_ptr());
-    if ntdll.is_null() {
-        return Err(InjectError::Ntdll);
-    }
-    let nt_qit: NtQueryInformationThreadFn =
-        match GetProcAddress(ntdll, c"NtQueryInformationThread".as_ptr().cast()) {
-            Some(p) => core::mem::transmute::<
-                unsafe extern "system" fn() -> isize,
-                NtQueryInformationThreadFn,
-            >(p),
-            None => return Err(InjectError::Ntdll),
-        };
-
-    // THREADINFOCLASS ThreadBasicInformation = 0
-    // struct { ExitStatus, TebBaseAddress, ClientId, Affinity, Priority, BasePriority }
-    #[repr(C)]
-    struct ThreadBasicInformation {
-        exit_status: i32,
-        teb_base: u64,
-        client_id: [u64; 2],
-        affinity: u64,
-        priority: i32,
-        base_priority: i32,
-    }
-    let mut tbi: ThreadBasicInformation = zeroed();
-    let mut ret_len = 0u32;
-    let st = nt_qit(
-        primary,
-        0,
-        &mut tbi as *mut _ as *mut c_void,
-        size_of::<ThreadBasicInformation>() as u32,
-        &mut ret_len,
-    );
-    if st != 0 || tbi.teb_base == 0 {
-        eprintln!("vfs-inject: NtQueryInformationThread TEB failed status={st:x}");
+    // A 32-bit target's primary thread runs on its 32-bit stack, described by
+    // its TEB32 and its 32-bit context (for a WOW64 guest of this process, the
+    // ones the WOW64 layer keeps); a 64-bit one's by its own TEB and context.
+    let guest = Guest::of(process).map_err(|e| {
+        eprintln!("vfs-inject: {e}");
+        InjectError::CreateProcess
+    })?;
+    if guest.ptr() > size_of::<usize>() {
+        eprintln!("vfs-inject: a 64-bit target's stack cannot be grown from a 32-bit process");
         return Err(InjectError::CreateProcess);
     }
+    let teb = teb_of(process, primary, guest).map_err(|e| {
+        eprintln!("vfs-inject: the primary thread's TEB: {e}");
+        InjectError::CreateProcess
+    })?;
+    let field = |off: usize| {
+        read_ptr(process, teb + off as u64, guest)
+            .ok()
+            .filter(|v| *v != 0)
+            .ok_or_else(|| {
+                eprintln!("vfs-inject: TEB stack field read failed off={off:#x}");
+                InjectError::CreateProcess
+            })
+    };
+    let old_base = field(guest.teb_stack_base())?;
+    let old_limit = field(guest.teb_stack_limit())?;
+    let old_dealloc = field(guest.teb_deallocation_stack())?;
 
-    let teb = tbi.teb_base as *mut c_void;
-    // TEB x64: StackBase=0x08, StackLimit=0x10, DeallocationStack=0x1478
-    let mut old_base = 0u64;
-    let mut old_limit = 0u64;
-    let mut old_dealloc = 0u64;
-    let mut read_n = 0usize;
-    for (off, dst) in [
-        (0x08u64, &mut old_base),
-        (0x10u64, &mut old_limit),
-        (0x1478u64, &mut old_dealloc),
-    ] {
-        let ok = windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory(
-            process,
-            (teb as u64 + off) as *const c_void,
-            dst as *mut u64 as *mut c_void,
-            8,
-            &mut read_n,
-        );
-        if ok == 0 || read_n != 8 || *dst == 0 {
-            eprintln!("vfs-inject: TEB stack field read failed off={off:#x}");
-            return Err(InjectError::CreateProcess);
-        }
-    }
-
-    let mut ctx_buf = vec![0u8; size_of::<CONTEXT>() + 16];
-    let ctx_addr = (ctx_buf.as_mut_ptr() as usize + 15) & !15;
-    let ctx = ctx_addr as *mut CONTEXT;
-    core::ptr::write_bytes(ctx as *mut u8, 0, size_of::<CONTEXT>());
-    (*ctx).ContextFlags = CONTEXT_FULL;
-    if GetThreadContext(primary, ctx) == 0 {
-        return Err(InjectError::CreateProcess);
-    }
-    let old_rsp = (*ctx).Rsp;
+    let mut ctx = PrimaryContext::read(primary, guest)?;
+    let old_rsp = ctx.sp();
     if old_rsp == 0 || old_rsp >= old_base || old_rsp < old_limit {
         eprintln!(
             "vfs-inject: primary RSP={old_rsp:#x} outside stack [{old_limit:#x},{old_base:#x})"
@@ -160,6 +123,8 @@ pub unsafe fn expand_primary_stack(
         return Err(InjectError::Alloc);
     }
 
+    // Anywhere in a 64-bit target; a WOW64 guest's address space ends below
+    // 4 GiB, so `VirtualAllocEx` places it there.
     let stack = VirtualAllocEx(
         process,
         core::ptr::null(),
@@ -170,6 +135,7 @@ pub unsafe fn expand_primary_stack(
     if stack.is_null() {
         return Err(InjectError::Alloc);
     }
+    let mut read_n = 0usize;
     let new_base = stack as u64 + stack_reserve as u64; // high address (grows down)
                                                         // Guard-ish low page as StackLimit (committed but not used for frames).
     let new_limit = stack as u64 + 0x1000;
@@ -202,34 +168,126 @@ pub unsafe fn expand_primary_stack(
     }
 
     for (off, val) in [
-        (0x08u64, new_base),
-        (0x10u64, new_limit),
-        (0x1478u64, stack as u64),
+        (guest.teb_stack_base(), new_base),
+        (guest.teb_stack_limit(), new_limit),
+        (guest.teb_deallocation_stack(), stack as u64),
     ] {
+        // Little-endian: the low `ptr` bytes are the field at that width.
         let ok = WriteProcessMemory(
             process,
-            (teb as u64 + off) as *mut c_void,
+            (teb + off as u64) as usize as *mut c_void,
             &val as *const u64 as *const c_void,
-            8,
+            guest.ptr(),
             &mut written,
         );
-        if ok == 0 || written != 8 {
+        if ok == 0 || written != guest.ptr() {
             eprintln!("vfs-inject: TEB stack field write failed off={off:#x}");
             return Err(InjectError::Write);
         }
     }
 
-    (*ctx).Rsp = new_rsp;
-    if SetThreadContext(primary, ctx) == 0 {
-        return Err(InjectError::CreateProcess);
-    }
+    ctx.set_sp(new_rsp);
+    ctx.write(primary)?;
     eprintln!(
         "vfs-inject: expanded primary stack to {stack_reserve:#x} \
-         (TEB={:#x} RSP {old_rsp:#x}→{new_rsp:#x} used={used:#x}; \
-         old dealloc={old_dealloc:#x})",
-        tbi.teb_base
+         ({guest:?} TEB={teb:#x} SP {old_rsp:#x}→{new_rsp:#x} used={used:#x}; \
+         old dealloc={old_dealloc:#x})"
     );
     Ok(())
+}
+
+/// The primary thread's register context, at the target's width: the native
+/// `CONTEXT`, or the 32-bit `WOW64_CONTEXT` of a WOW64 guest of this process.
+enum PrimaryContext {
+    /// A `CONTEXT`, in a buffer over-allocated so it can be 16-byte aligned
+    /// (the x64 `CONTEXT` requires it), and the aligned offset into it.
+    Native(Vec<u8>, usize),
+    #[cfg(target_pointer_width = "64")]
+    Wow64(Box<windows_sys::Win32::System::Diagnostics::Debug::WOW64_CONTEXT>),
+}
+
+impl PrimaryContext {
+    /// # Safety
+    /// `thread` is a suspended thread of a process of `guest`'s width, with
+    /// `THREAD_GET_CONTEXT`.
+    unsafe fn read(thread: HANDLE, guest: Guest) -> Result<Self, InjectError> {
+        #[cfg(target_pointer_width = "64")]
+        if guest.is_wow64_from_here() {
+            use windows_sys::Win32::System::Diagnostics::Debug::{
+                Wow64GetThreadContext, WOW64_CONTEXT, WOW64_CONTEXT_FULL,
+            };
+            let mut ctx: Box<WOW64_CONTEXT> = Box::new(zeroed());
+            ctx.ContextFlags = WOW64_CONTEXT_FULL;
+            if Wow64GetThreadContext(thread, &mut *ctx) == 0 {
+                return Err(InjectError::ThreadContext);
+            }
+            return Ok(PrimaryContext::Wow64(ctx));
+        }
+        let _ = guest;
+        let mut buf = vec![0u8; size_of::<CONTEXT>() + 16];
+        let at = (buf.as_ptr() as usize).next_multiple_of(16) - buf.as_ptr() as usize;
+        let ctx = buf.as_mut_ptr().add(at) as *mut CONTEXT;
+        (*ctx).ContextFlags = CONTEXT_FULL;
+        if GetThreadContext(thread, ctx) == 0 {
+            return Err(InjectError::ThreadContext);
+        }
+        Ok(PrimaryContext::Native(buf, at))
+    }
+
+    /// The stack pointer.
+    fn sp(&self) -> u64 {
+        match self {
+            #[cfg(target_pointer_width = "64")]
+            PrimaryContext::Wow64(c) => c.Esp as u64,
+            PrimaryContext::Native(buf, at) => {
+                let ctx = buf[*at..].as_ptr() as *const CONTEXT;
+                // SAFETY: the aligned `CONTEXT` `read` filled.
+                #[cfg(target_arch = "x86_64")]
+                return unsafe { (*ctx).Rsp };
+                // SAFETY: as above.
+                #[cfg(target_arch = "x86")]
+                return unsafe { (*ctx).Esp as u64 };
+            }
+        }
+    }
+
+    fn set_sp(&mut self, sp: u64) {
+        match self {
+            #[cfg(target_pointer_width = "64")]
+            PrimaryContext::Wow64(c) => c.Esp = sp as u32,
+            PrimaryContext::Native(buf, at) => {
+                let ctx = buf[*at..].as_mut_ptr() as *mut CONTEXT;
+                // SAFETY: the aligned `CONTEXT` `read` filled.
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    (*ctx).Rsp = sp
+                };
+                // SAFETY: as above.
+                #[cfg(target_arch = "x86")]
+                unsafe {
+                    (*ctx).Esp = sp as u32
+                };
+            }
+        }
+    }
+
+    /// # Safety
+    /// As [`PrimaryContext::read`], with `THREAD_SET_CONTEXT`.
+    unsafe fn write(&mut self, thread: HANDLE) -> Result<(), InjectError> {
+        let ok = match self {
+            #[cfg(target_pointer_width = "64")]
+            PrimaryContext::Wow64(c) => {
+                windows_sys::Win32::System::Diagnostics::Debug::Wow64SetThreadContext(thread, &**c)
+            }
+            PrimaryContext::Native(buf, at) => {
+                SetThreadContext(thread, buf[*at..].as_ptr() as *const CONTEXT)
+            }
+        };
+        if ok == 0 {
+            return Err(InjectError::ThreadContext);
+        }
+        Ok(())
+    }
 }
 
 /// `LoadLibraryW(dll_path)` in `process` on a remote thread, and wait up to
@@ -270,6 +328,13 @@ pub unsafe fn inject_dll_exit_code(
     dll_path: &str,
     timeout_ms: u32,
 ) -> Result<u32, InjectError> {
+    // A WOW64 guest needs its own `LoadLibraryW`, the 32-bit kernel32's,
+    // which a 64-bit process cannot look up: the 32-bit helper does it.
+    // SAFETY: a query of the live handle the contract gives.
+    if unsafe { Guest::of(process) }.is_ok_and(|g| g.is_wow64_from_here()) {
+        // SAFETY: as this function's contract.
+        return unsafe { load_library_through_helper(process, dll_path, timeout_ms) };
+    }
     // SAFETY: standard remote LoadLibrary injection; `process` is a live process
     // handle with the needed rights (per the contract above).
     unsafe {
@@ -335,6 +400,54 @@ pub unsafe fn inject_dll_exit_code(
             Err(InjectError::Timeout)
         }
     }
+}
+
+/// The 32-bit build of `vfs-injector.exe`, looked for beside the 32-bit shim a
+/// WOW64 guest is given: it runs that guest's remote `LoadLibrary`
+/// (`--load-library`, see [`crate::LOAD_LIBRARY_FLAG`]).
+pub const WOW64_HELPER_EXE: &str = "vfs-injector.exe";
+
+/// [`inject_dll_exit_code`] for a WOW64 guest of this 64-bit process, by the
+/// 32-bit [`WOW64_HELPER_EXE`] beside `dll_path`. It runs the same remote
+/// `LoadLibraryW` natively, from a process whose kernel32 is the guest's, and
+/// reports one line (`crate::cli::load_library_report`).
+///
+/// # Safety
+/// As [`inject_dll`].
+unsafe fn load_library_through_helper(
+    process: HANDLE,
+    dll_path: &str,
+    timeout_ms: u32,
+) -> Result<u32, InjectError> {
+    let helper = std::path::Path::new(dll_path)
+        .parent()
+        .map(|d| d.join(WOW64_HELPER_EXE))
+        .filter(|p| p.is_file())
+        .ok_or_else(|| {
+            InjectError::Wow64Helper(format!(
+                "no {WOW64_HELPER_EXE} (32-bit) beside the 32-bit shim {dll_path}"
+            ))
+        })?;
+    // SAFETY: a query of the live handle the contract gives.
+    let pid = unsafe { windows_sys::Win32::System::Threading::GetProcessId(process) };
+    let out = std::process::Command::new(&helper)
+        .args([
+            crate::LOAD_LIBRARY_FLAG,
+            &pid.to_string(),
+            dll_path,
+            &timeout_ms.to_string(),
+        ])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| InjectError::Wow64Helper(format!("run {}: {e}", helper.display())))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout.lines().last().unwrap_or_default();
+    eprintln!(
+        "vfs-inject: WOW64 LoadLibrary through {}: {line} (exit {:?})",
+        helper.display(),
+        out.status.code()
+    );
+    crate::parse_load_library_report(line)
 }
 
 /// What the contents of the shim's ready file say.
@@ -542,6 +655,12 @@ fn start_target(
             return Err(InjectError::CreateProcess);
         }
 
+        // A shim of the other width would only fail later, and less clearly
+        // (a 32-bit program cannot load a 64-bit DLL, nor the reverse).
+        if let Err(e) = check_shim_width(pi.hProcess, &cfg.dll_path) {
+            return Err(fail_closed(&pi, e));
+        }
+
         // Before anything of the target runs — the remote thread below runs
         // its process initialisation — so nothing it starts escapes the job.
         if let Some(job) = job {
@@ -634,6 +753,41 @@ fn start_target(
             pid: pi.dwProcessId,
             import_activated: false,
         })
+    }
+}
+
+/// Refuse a shim built for the other width than `process`. A shim whose
+/// headers cannot be read is left to fail on its own, as before.
+///
+/// # Safety
+/// `process` is a live process handle with `PROCESS_QUERY_LIMITED_INFORMATION`.
+unsafe fn check_shim_width(process: HANDLE, dll_path: &str) -> Result<(), InjectError> {
+    use std::io::Read;
+    let mut head = Vec::with_capacity(0x1000);
+    let Some(machine) = std::fs::File::open(dll_path)
+        .and_then(|f| f.take(0x1000).read_to_end(&mut head))
+        .ok()
+        .and_then(|_| vfs_pe::pe_machine(&head))
+    else {
+        return Ok(());
+    };
+    // SAFETY: as this function's contract.
+    let guest = unsafe { Guest::of(process) }.map_err(InjectError::ShimWidth)?;
+    let fits = match guest {
+        Guest::X64 => machine == vfs_pe::MACHINE_AMD64,
+        Guest::X86 => machine == vfs_pe::MACHINE_I386,
+    };
+    if fits {
+        Ok(())
+    } else {
+        Err(InjectError::ShimWidth(format!(
+            "the target is a {} process and the shim {dll_path} is for machine {machine:#x}",
+            if guest == Guest::X86 {
+                "32-bit"
+            } else {
+                "64-bit"
+            }
+        )))
     }
 }
 

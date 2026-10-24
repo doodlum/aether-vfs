@@ -34,6 +34,15 @@ const STEAM_HELPER_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
+    if let Some(parsed) = vfs_inject::parse_load_library_args(&a) {
+        match parsed {
+            Ok(args) => load_library(args),
+            Err(usage) => {
+                eprintln!("{usage}");
+                std::process::exit(2);
+            }
+        }
+    }
     let parsed = match parse_injector_args(&a) {
         Ok(parsed) => parsed,
         Err(usage) => {
@@ -104,6 +113,38 @@ fn main() {
     });
     eprintln!("[vfs-injector] target exited {exit}");
     std::process::exit(exit);
+}
+
+/// `--load-library`: `LoadLibraryW` the DLL into the suspended process `pid` on
+/// a remote thread, print the one-line report, and exit 0 if the thread ran to
+/// completion (3 otherwise). The 32-bit build is how a 64-bit launch injects a
+/// WOW64 guest: this process's kernel32 is the guest's.
+#[allow(unsafe_code)]
+fn load_library(args: vfs_inject::LoadLibraryArgs) -> ! {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_SYNCHRONIZE,
+        PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE,
+    };
+    let access = PROCESS_CREATE_THREAD
+        | PROCESS_QUERY_INFORMATION
+        | PROCESS_VM_OPERATION
+        | PROCESS_VM_READ
+        | PROCESS_VM_WRITE
+        | PROCESS_SYNCHRONIZE;
+    // SAFETY: opening a process by id; the handle is closed below.
+    let process = unsafe { OpenProcess(access, 0, args.pid) };
+    let result = if process.is_null() {
+        Err(InjectError::RemoteThread)
+    } else {
+        // SAFETY: a live handle with the rights `inject_dll` needs.
+        let r = unsafe { vfs_inject::inject_dll_exit_code(process, &args.dll, args.timeout_ms) };
+        // SAFETY: the handle opened above.
+        unsafe { CloseHandle(process) };
+        r
+    };
+    println!("{}", vfs_inject::load_library_report(&result));
+    std::process::exit(if result.is_ok() { 0 } else { 3 });
 }
 
 /// Acts on `VFS_INJECT_STEAM_HELPER` and returns the report line for

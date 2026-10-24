@@ -21,8 +21,7 @@ use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
 use windows_sys::Win32::System::Memory::{VirtualAllocEx, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
 
-/// The PEB's `ImageBaseAddress` (x64: PEB + 0x10).
-const PEB_IMAGE_BASE: usize = 0x10;
+use crate::guest::{peb_of, read_ptr, Guest};
 
 /// Why an in-memory import patch did not happen. The caller treats any of
 /// these as "fall back to remote-thread injection".
@@ -61,14 +60,17 @@ pub unsafe fn patch_imports_in_memory(process: HANDLE) -> Result<(), MemPatchRef
     if crate::running_under_wine() {
         return Err(MemPatchRefused::UnderWine);
     }
+    // A WOW64 guest's image is named in its PEB32, in the 32-bit layout; the
+    // headers say PE32 and `plan_mem_patch` builds 4-byte thunks for it.
     // SAFETY: as this function's contract.
-    let base = unsafe { crate::procparams::peb_base(process) }
-        .map_err(Unreadable)
+    let guest = unsafe { Guest::of(process) }.map_err(Unreadable)?;
+    // SAFETY: as this function's contract.
+    let base = unsafe { peb_of(process, guest) }
         .and_then(|peb| {
             // SAFETY: reading the PEB field of a process we own.
-            unsafe { read_u64(process, peb as usize + PEB_IMAGE_BASE) }
-                .ok_or_else(|| Unreadable("read ImageBaseAddress".into()))
-        })?;
+            unsafe { read_ptr(process, peb + guest.peb_image_base() as u64, guest) }
+        })
+        .map_err(|e| Unreadable(format!("read ImageBaseAddress: {e}")))?;
     let base = base as usize;
 
     // The headers: one page is more than SizeOfHeaders for any real image.
@@ -227,13 +229,6 @@ unsafe fn read_bytes(process: HANDLE, at: usize, len: usize) -> Option<Vec<u8>> 
         )
     };
     (ok != 0 && got == len).then_some(buf)
-}
-
-#[allow(unsafe_code)]
-unsafe fn read_u64(process: HANDLE, at: usize) -> Option<u64> {
-    // SAFETY: as `read_bytes`.
-    let b = unsafe { read_bytes(process, at, 8) }?;
-    Some(u64::from_le_bytes(b.try_into().ok()?))
 }
 
 /// Write `bytes` at `at`, making the page writable first and restoring its

@@ -16,21 +16,22 @@
 //! from it while it maps the static imports, which happens before any hook
 //! exists and so must find real files. The shim renames it once the loader
 //! is done (see the shim's bootstrap).
+//!
+//! A 32-bit target has the 32-bit layouts ([`Guest`]); for a WOW64 guest of a
+//! 64-bit host they are the PEB32's parameter block, which is the one its
+//! 32-bit kernelbase initialises from.
 
 use core::ffi::c_void;
 use std::mem::size_of;
 
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
-use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows_sys::Win32::System::Memory::{VirtualQueryEx, MEMORY_BASIC_INFORMATION};
 
-/// `PEB.ProcessParameters` (x64).
-const PEB_PROCESS_PARAMETERS: usize = 0x20;
-/// `RTL_USER_PROCESS_PARAMETERS` fields (x64).
+use crate::guest::{peb_of, read_ptr, Guest};
+
+/// `RTL_USER_PROCESS_PARAMETERS.Flags`, at the same offset at both widths.
 const PP_FLAGS: usize = 0x08;
-const PP_CURDIR_DOS_PATH: usize = 0x38;
-const PP_COMMAND_LINE: usize = 0x70;
 /// `RTL_USER_PROC_PARAMS_NORMALIZED`: the string buffers hold addresses, not
 /// offsets from the block.
 const PARAMS_NORMALIZED: u32 = 1;
@@ -38,33 +39,6 @@ const PARAMS_NORMALIZED: u32 = 1;
 /// a new directory into it in place (`RtlSetCurrentDirectory_U`), checking
 /// against `MaximumLength`.
 const CURDIR_BUFFER_BYTES: usize = 260 * 2;
-
-/// `UNICODE_STRING` (x64).
-#[repr(C)]
-#[derive(Default)]
-struct RemoteUnicodeString {
-    length: u16,
-    maximum_length: u16,
-    _pad: u32,
-    buffer: u64,
-}
-
-/// `PROCESS_BASIC_INFORMATION`.
-#[repr(C)]
-#[derive(Default)]
-struct BasicInformation {
-    exit_status: i32,
-    _pad: u32,
-    peb_base_address: u64,
-    affinity_mask: u64,
-    base_priority: i32,
-    _pad2: u32,
-    unique_process_id: u64,
-    inherited_from_unique_process_id: u64,
-}
-
-type NtQueryInformationProcessFn =
-    unsafe extern "system" fn(HANDLE, u32, *mut c_void, u32, *mut u32) -> i32;
 
 /// Rewrite the suspended `process`'s command line to `command_line` and its
 /// current directory to `cwd` (a directory; a trailing `\` is added), each
@@ -83,7 +57,8 @@ pub unsafe fn rewrite(
     if command_line.is_none() && cwd.is_none() {
         return Ok(());
     }
-    let params = process_parameters(process)?;
+    let guest = Guest::of(process)?;
+    let params = process_parameters(process, guest)?;
     let flags: u32 = read(process, params + PP_FLAGS)?;
     if flags & PARAMS_NORMALIZED == 0 {
         return Err("the target's process parameters are not normalized".into());
@@ -92,8 +67,9 @@ pub unsafe fn rewrite(
         let units: Vec<u16> = cmd.encode_utf16().collect();
         put_string(
             process,
+            guest,
             params,
-            params + PP_COMMAND_LINE,
+            params + guest.pp_command_line(),
             &units,
             units.len() * 2 + 2,
         )?;
@@ -109,8 +85,9 @@ pub unsafe fn rewrite(
         }
         put_string(
             process,
+            guest,
             params,
-            params + PP_CURDIR_DOS_PATH,
+            params + guest.pp_curdir_dos_path(),
             &units,
             CURDIR_BUFFER_BYTES,
         )?;
@@ -118,35 +95,11 @@ pub unsafe fn rewrite(
     Ok(())
 }
 
-/// The base address of `process`'s PEB.
-///
-/// # Safety
-/// `process` is a live process handle with `PROCESS_QUERY_INFORMATION`.
+/// The address of `process`'s `RTL_USER_PROCESS_PARAMETERS`, in `guest`'s layout.
 #[allow(unsafe_code)]
-pub(crate) unsafe fn peb_base(process: HANDLE) -> Result<u64, String> {
-    let ntdll = GetModuleHandleW(wide("ntdll.dll").as_ptr());
-    let query = GetProcAddress(ntdll, c"NtQueryInformationProcess".as_ptr().cast())
-        .ok_or("ntdll has no NtQueryInformationProcess")?;
-    let query: NtQueryInformationProcessFn = core::mem::transmute(query);
-    let mut info = BasicInformation::default();
-    let st = query(
-        process,
-        0, // ProcessBasicInformation
-        (&mut info as *mut BasicInformation).cast(),
-        size_of::<BasicInformation>() as u32,
-        core::ptr::null_mut(),
-    );
-    if st < 0 || info.peb_base_address == 0 {
-        return Err(format!("NtQueryInformationProcess: {st:#x}"));
-    }
-    Ok(info.peb_base_address)
-}
-
-/// The address of `process`'s `RTL_USER_PROCESS_PARAMETERS`.
-#[allow(unsafe_code)]
-unsafe fn process_parameters(process: HANDLE) -> Result<usize, String> {
-    let peb = peb_base(process)? as usize;
-    let params: u64 = read(process, peb + PEB_PROCESS_PARAMETERS)?;
+unsafe fn process_parameters(process: HANDLE, guest: Guest) -> Result<usize, String> {
+    let peb = peb_of(process, guest)?;
+    let params = read_ptr(process, peb + guest.peb_process_parameters() as u64, guest)?;
     if params == 0 {
         return Err("the target has no process parameters yet".into());
     }
@@ -166,6 +119,7 @@ unsafe fn process_parameters(process: HANDLE) -> Result<usize, String> {
 #[allow(unsafe_code)]
 unsafe fn put_string(
     process: HANDLE,
+    guest: Guest,
     params: usize,
     at: usize,
     units: &[u16],
@@ -175,9 +129,12 @@ unsafe fn put_string(
     let capacity = capacity.max(need);
     let mut text = units.to_vec();
     text.push(0);
-    let old: RemoteUnicodeString = read(process, at)?;
-    if old.buffer != 0 && old.maximum_length as usize >= capacity {
-        write_bytes(process, old.buffer as usize, text.as_ptr().cast(), need)?;
+    let old_bytes: [u8; 16] = read(process, at)?;
+    let (_, old_max, old_buffer) = guest
+        .parse_unicode_string(&old_bytes)
+        .ok_or("a UNICODE_STRING shorter than its layout")?;
+    if old_buffer != 0 && old_max as usize >= capacity {
+        write_bytes(process, old_buffer as usize, text.as_ptr().cast(), need)?;
         let len = (units.len() * 2) as u16;
         return write_bytes(process, at, (&len as *const u16).cast(), 2);
     }
@@ -203,19 +160,9 @@ unsafe fn put_string(
         ));
     }
     write_bytes(process, place, text.as_ptr().cast(), need)?;
-    let s = RemoteUnicodeString {
-        length: (units.len() * 2) as u16,
-        maximum_length: capacity as u16,
-        _pad: 0,
-        buffer: place as u64,
-    };
-    // Only the first 16 bytes: a `CURDIR`'s handle follows the string.
-    write_bytes(
-        process,
-        at,
-        (&s as *const RemoteUnicodeString).cast(),
-        size_of::<RemoteUnicodeString>(),
-    )?;
+    let s = guest.unicode_string((units.len() * 2) as u16, capacity as u16, place as u64);
+    // Only the string itself: a `CURDIR`'s handle follows it.
+    write_bytes(process, at, s.as_ptr().cast(), s.len())?;
     let used = (end - params) as u32;
     write_bytes(process, params + 4, (&used as *const u32).cast(), 4)?;
     let max_len = max_len.max(used);
@@ -252,8 +199,4 @@ unsafe fn write_bytes(
         return Err(format!("WriteProcessMemory at {at:#x}"));
     }
     Ok(())
-}
-
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(Some(0)).collect()
 }

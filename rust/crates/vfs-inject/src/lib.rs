@@ -11,6 +11,7 @@ use std::time::Duration;
 mod artifacts;
 mod cli;
 mod env_block;
+mod guest;
 mod inject;
 mod map;
 mod mem_inject;
@@ -107,13 +108,24 @@ pub enum InjectError {
     /// A [`TreeKiller`] could not terminate the launch's job (or, for a
     /// launch without one, its process).
     Terminate,
+    /// The 32-bit `vfs-injector.exe` a WOW64 guest's remote `LoadLibrary`
+    /// goes through (beside the 32-bit shim) is missing or failed: why.
+    Wow64Helper(String),
+    /// The shim cannot load into the target: it was built for the other
+    /// width (a 64-bit shim and a 32-bit program, or the reverse).
+    ShimWidth(String),
 }
 
 pub use artifacts::{exe_imports_shim, find_near};
-pub use cli::{parse_injector_args, InjectorArgs};
+pub use cli::{
+    load_library_report, parse_injector_args, parse_load_library_args, parse_load_library_report,
+    InjectorArgs, LoadLibraryArgs, LOAD_LIBRARY_FLAG,
+};
+/// A target process's width, and the layouts that go with it.
+pub use guest::Guest;
 pub use inject::{
     expand_primary_stack, inject_dll, inject_dll_exit_code, resume_primary_thread,
-    run_target_with_shim, spawn_target_with_shim, PRIMARY_STACK_BYTES,
+    run_target_with_shim, spawn_target_with_shim, PRIMARY_STACK_BYTES, WOW64_HELPER_EXE,
 };
 pub use steam_helper::{
     active_process_pid, check_helper_command, clear_active_process_pid, running_under_wine,
