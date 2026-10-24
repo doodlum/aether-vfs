@@ -47,5 +47,6 @@ pub use base_dir::{BaseDir, BaseDirProvider};
 pub use errno::errno_of;
 #[cfg(target_os = "linux")]
 pub use mount::{
-    mount_state, recover_stale_mount, FuseMount, MountOpts, MountState, Unmounted, FS_NAME,
+    fusermount, fusermount_receive, mount_state, recover_stale_mount, FuseMount, MountOpts,
+    MountState, Unmounted, FS_NAME,
 };

@@ -51,24 +51,35 @@ jobs:
           name: windows-x64
           path: dist/*
 
-  # Linux: the binding alone. Roots are FUSE mounts there (vfs-fuse), so there is no shim to ship;
-  # the user's machine needs fusermount3 (package fuse3), not libfuse headers.
+  # Linux: the binding, and `fusermount-relay` for a Flatpak (vfs-fuse). Roots are FUSE mounts
+  # there, so there is no shim to ship; the user's machine needs fusermount3 (package fuse3), not
+  # libfuse headers.
   linux-x64:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          # The relay runs on the host of a Flatpak, outside its runtime: static, with musl.
+          targets: x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: bindings/node
+          workspaces: |
+            rust
+            bindings/node
       - name: Build the Node binding
         run: cargo build --release
         working-directory: bindings/node
+      - name: Build the relay
+        run: cargo build --release --target x86_64-unknown-linux-musl -p vfs-fuse --bin fusermount-relay
+        working-directory: rust
       - name: Collect the artifacts
         run: |
           mkdir -p dist
           cp bindings/node/target/release/libaether_vfs_node.so dist/aether_vfs_node-linux-x64.node
-          (cd dist && sha256sum aether_vfs_node-linux-x64.node > SHA256SUMS-linux-x64.txt)
+          cp rust/target/x86_64-unknown-linux-musl/release/fusermount-relay dist/fusermount-relay-linux-x64
+          strip dist/fusermount-relay-linux-x64
+          (cd dist && sha256sum aether_vfs_node-linux-x64.node fusermount-relay-linux-x64 > SHA256SUMS-linux-x64.txt)
           cat dist/SHA256SUMS-linux-x64.txt
       - uses: actions/upload-artifact@v4
         with:

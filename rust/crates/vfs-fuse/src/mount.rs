@@ -1,14 +1,18 @@
 //! Mount lifecycle: mount a root, invalidate after a remount, unmount, and
 //! recover a mount a dead process left behind.
 
-use std::ffi::OsStr;
-use std::io;
+use std::ffi::{OsStr, OsString};
+use std::io::{self, IoSliceMut};
+use std::mem::MaybeUninit;
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
 use fuser::{BackgroundSession, Config, INodeNo, MountOption, Notifier};
+use rustix::net::{recvmsg, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags};
 use vfs_director::Director;
 use vfs_provider::RootId;
 
@@ -121,14 +125,31 @@ impl FuseMount {
             MountOption::NoAtime,
         ];
         config.n_threads = Some(opts.threads.max(1));
-        config.clone_fd = true;
-        let session = fuser::Session::new(
-            AetherFs {
-                shared: Arc::clone(&shared),
-            },
-            &mountpoint,
-            &config,
-        )?;
+        let fs = AetherFs {
+            shared: Arc::clone(&shared),
+        };
+        let session = if std::env::var_os("FUSERMOUNT_PATH").is_none() && dev_fuse_usable() {
+            config.clone_fd = true;
+            fuser::Session::new(fs, &mountpoint, &config)?
+        } else {
+            // There is no `/dev/fuse` here to give each thread a descriptor of its own.
+            config.clone_fd = false;
+            let fd = fusermount_receive(&[
+                OsStr::new("-o"),
+                OsStr::new(MOUNT_OPTIONS),
+                OsStr::new("--"),
+                mountpoint.as_os_str(),
+            ])?;
+            let acl = config.acl;
+            fuser::Session::from_fd(fs, fd, acl, config).inspect_err(|_| {
+                let _ = fusermount(&[
+                    OsStr::new("-u"),
+                    OsStr::new("-z"),
+                    OsStr::new("--"),
+                    mountpoint.as_os_str(),
+                ]);
+            })?
+        };
         let session = session.spawn()?;
         let notifier = session.notifier();
         tracing::info!(mountpoint = %mountpoint.display(), root = root.0, "mounted");
@@ -219,17 +240,100 @@ impl Drop for FuseMount {
     }
 }
 
-/// Run the setuid FUSE helper: `$FUSERMOUNT_PATH`, else `fusermount3`, else
-/// `fusermount`.
-fn fusermount(args: &[&OsStr]) -> io::Result<()> {
-    let mut candidates: Vec<std::ffi::OsString> = Vec::new();
+/// The mount options a mount through [`fusermount_receive`] passes: the ones
+/// fuser is given.
+const MOUNT_OPTIONS: &str = "fsname=aether-vfs,subtype=aether-vfs,default_permissions,noatime";
+
+/// Whether this process can open `/dev/fuse` itself. A sandbox (Flatpak) has
+/// none, and fuser then fails instead of falling back to the setuid helper.
+fn dev_fuse_usable() -> bool {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/fuse")
+        .is_ok()
+}
+
+/// The setuid FUSE helpers to try, in order: `$FUSERMOUNT_PATH`,
+/// `fusermount3`, `fusermount`.
+fn fusermount_candidates() -> Vec<OsString> {
+    let mut candidates: Vec<OsString> = Vec::new();
     if let Some(p) = std::env::var_os("FUSERMOUNT_PATH") {
         candidates.push(p);
     }
     candidates.push("fusermount3".into());
     candidates.push("fusermount".into());
+    candidates
+}
+
+/// Start the first helper there is.
+fn spawn_fusermount(build: impl Fn(&OsStr) -> Command) -> io::Result<Child> {
     let mut last = io::Error::new(io::ErrorKind::NotFound, "fusermount3 is not installed");
-    for bin in candidates {
+    for bin in fusermount_candidates() {
+        match build(&bin).spawn() {
+            Ok(child) => return Ok(child),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => last = e,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last)
+}
+
+/// Run the setuid helper with `args` (a mount: `-o <options> -- <folder>`) and
+/// take the FUSE descriptor it sends back over `_FUSE_COMMFD`, as libfuse
+/// does: for a process that cannot open `/dev/fuse`, or is told which helper
+/// to use (a Flatpak's `$FUSERMOUNT_PATH`, through the host's
+/// `fusermount-relay`).
+pub fn fusermount_receive(args: &[&OsStr]) -> io::Result<OwnedFd> {
+    let (ours, theirs) = UnixStream::pair()?;
+    // The helper inherits its end of the socket; ours stays close-on-exec.
+    rustix::io::fcntl_setfd(&theirs, rustix::io::FdFlags::empty())?;
+    let child = spawn_fusermount(|bin| {
+        let mut command = Command::new(bin);
+        command
+            .args(args)
+            .env("_FUSE_COMMFD", theirs.as_raw_fd().to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command
+    })?;
+    drop(theirs);
+    let mut byte = [0u8; 1];
+    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+    let mut control = RecvAncillaryBuffer::new(&mut space);
+    let received = recvmsg(
+        &ours,
+        &mut [IoSliceMut::new(&mut byte)],
+        &mut control,
+        RecvFlags::CMSG_CLOEXEC,
+    );
+    let fd = match received {
+        Ok(_) => control.drain().find_map(|message| match message {
+            RecvAncillaryMessage::ScmRights(mut fds) => fds.next(),
+            _ => None,
+        }),
+        Err(_) => None,
+    };
+    let output = child.wait_with_output()?;
+    match fd {
+        Some(fd) if output.status.success() => Ok(fd),
+        _ => Err(io::Error::other(format!(
+            "fusermount {}: {}",
+            args.iter()
+                .map(|a| a.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))),
+    }
+}
+
+/// Run the setuid FUSE helper: `$FUSERMOUNT_PATH`, else `fusermount3`, else
+/// `fusermount`.
+pub fn fusermount(args: &[&OsStr]) -> io::Result<()> {
+    let mut last = io::Error::new(io::ErrorKind::NotFound, "fusermount3 is not installed");
+    for bin in fusermount_candidates() {
         match Command::new(&bin).args(args).output() {
             Ok(out) if out.status.success() => return Ok(()),
             Ok(out) => {

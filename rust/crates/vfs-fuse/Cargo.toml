@@ -23,7 +23,7 @@ vfs-provider.workspace = true
 fuser = { version = "0.18", default-features = false }
 # `openat2`/`statat`/`Dir` relative to a directory opened before the mount, so
 # the real folder underneath stays readable. Safe wrappers: no `unsafe` here.
-rustix = { version = "1", features = ["fs", "process"] }
+rustix = { version = "1", features = ["fs", "process", "net"] }
 tracing.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
