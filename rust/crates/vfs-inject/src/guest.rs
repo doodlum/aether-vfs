@@ -82,6 +82,51 @@ impl Guest {
         }
     }
 
+    /// `PEB.Ldr`.
+    pub const fn peb_ldr(self) -> usize {
+        match self {
+            Guest::X64 => 0x18,
+            Guest::X86 => 0x0C,
+        }
+    }
+
+    /// `PEB.LoaderLock`.
+    pub const fn peb_loader_lock(self) -> usize {
+        match self {
+            Guest::X64 => 0x110,
+            Guest::X86 => 0xA0,
+        }
+    }
+
+    /// `PEB_LDR_DATA.InLoadOrderModuleList`.
+    pub const fn ldr_in_load_order(self) -> usize {
+        match self {
+            Guest::X64 => 0x10,
+            Guest::X86 => 0x0C,
+        }
+    }
+
+    /// `LDR_DATA_TABLE_ENTRY.FullDllName`.
+    pub const fn ldr_entry_full_dll_name(self) -> usize {
+        match self {
+            Guest::X64 => 0x48,
+            Guest::X86 => 0x24,
+        }
+    }
+
+    /// `RTL_USER_PROCESS_PARAMETERS.CurrentDirectory.Handle`, after its `DosPath`.
+    pub const fn pp_curdir_handle(self) -> usize {
+        self.pp_curdir_dos_path() + 2 * self.ptr()
+    }
+
+    /// `RTL_USER_PROCESS_PARAMETERS.ImagePathName`.
+    pub const fn pp_image_path_name(self) -> usize {
+        match self {
+            Guest::X64 => 0x60,
+            Guest::X86 => 0x38,
+        }
+    }
+
     /// `RTL_USER_PROCESS_PARAMETERS.CurrentDirectory.DosPath`.
     pub const fn pp_curdir_dos_path(self) -> usize {
         match self {
@@ -215,7 +260,7 @@ unsafe fn is_wow64(process: HANDLE) -> Result<bool, String> {
 ///
 /// # Safety
 /// `process` is a live process handle with `PROCESS_QUERY_INFORMATION`.
-pub(crate) unsafe fn peb_of(process: HANDLE, guest: Guest) -> Result<u64, String> {
+pub unsafe fn peb_of(process: HANDLE, guest: Guest) -> Result<u64, String> {
     let query = nt_query(c"NtQueryInformationProcess")?;
     if guest.is_wow64_from_here() {
         let mut peb32 = 0usize;
@@ -342,6 +387,39 @@ mod tests {
             Guest::X86.teb_deallocation_stack(),
         );
         assert_eq!(x86, (0x08, 0x10, 0x24, 0x40, 0x04, 0x08, 0x18, 0xE0C));
+        let loader = |g: Guest| {
+            (
+                g.peb_ldr(),
+                g.peb_loader_lock(),
+                g.ldr_in_load_order(),
+                g.ldr_entry_full_dll_name(),
+                g.pp_curdir_handle(),
+                g.pp_image_path_name(),
+            )
+        };
+        assert_eq!(loader(Guest::X64), (0x18, 0x110, 0x10, 0x48, 0x48, 0x60));
+        assert_eq!(loader(Guest::X86), (0x0C, 0xA0, 0x0C, 0x24, 0x2C, 0x38));
+    }
+
+    /// This process's own PEB, read through the offsets for its own width, names a parameter
+    /// block whose image path is this test binary's.
+    #[test]
+    fn this_process_s_peb_names_its_image() {
+        // SAFETY: the current-process pseudo-handle; reads of this process's own PEB.
+        unsafe {
+            let me = windows_sys::Win32::System::Threading::GetCurrentProcess();
+            let peb = peb_of(me, Guest::HOST).unwrap() as usize;
+            let params = *((peb + Guest::HOST.peb_process_parameters()) as *const usize);
+            let image = &*((params + Guest::HOST.pp_image_path_name())
+                as *const windows_sys::Win32::Foundation::UNICODE_STRING);
+            let name = String::from_utf16_lossy(core::slice::from_raw_parts(
+                image.Buffer,
+                image.Length as usize / 2,
+            ));
+            let exe = std::env::current_exe().unwrap();
+            let file = exe.file_name().unwrap().to_string_lossy().to_lowercase();
+            assert!(name.to_lowercase().ends_with(&file), "{name}");
+        }
     }
 
     #[test]

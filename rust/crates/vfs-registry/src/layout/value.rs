@@ -145,15 +145,44 @@ pub fn write_multiple_values(
     }
 }
 
-/// sizeof(KEY_VALUE_ENTRY) on x64: ValueName@0 (pointer) DataLength@8 DataOffset@12 Type@16.
-pub const KEY_VALUE_ENTRY_SIZE: usize = 24;
+/// sizeof(KEY_VALUE_ENTRY) in a process whose pointers are `ptr` bytes: `ValueName` (a pointer)
+/// then `DataLength`, `DataOffset` and `Type`, padded to the pointer's alignment. 24 on x64
+/// (fields at 8, 12, 16), 16 on x86 (at 4, 8, 12).
+pub const fn key_value_entry_size(ptr: usize) -> usize {
+    (ptr + 12).div_ceil(ptr) * ptr
+}
+
+/// [`key_value_entry_size`] for this target.
+pub const KEY_VALUE_ENTRY_SIZE: usize = key_value_entry_size(core::mem::size_of::<usize>());
 
 impl ValueEntry {
-    /// Write this entry into a caller's x64 KEY_VALUE_ENTRY slot, leaving ValueName unchanged.
+    /// Write this entry into a caller's KEY_VALUE_ENTRY slot at this target's width, leaving
+    /// ValueName unchanged.
     pub fn store(&self, slot: &mut [u8]) {
+        self.store_for(slot, core::mem::size_of::<usize>());
+    }
+
+    /// [`ValueEntry::store`] for a process whose pointers are `ptr` bytes.
+    pub fn store_for(&self, slot: &mut [u8], ptr: usize) {
         let mut o = Out(slot);
-        o.u32(8, self.data_length);
-        o.u32(12, self.data_offset);
-        o.u32(16, self.ty);
+        o.u32(ptr, self.data_length);
+        o.u32(ptr + 4, self.data_offset);
+        o.u32(ptr + 8, self.ty);
+    }
+
+    /// The `DataLength`, `DataOffset` and `Type` of a caller's KEY_VALUE_ENTRY slot, at this
+    /// target's width: what a slot holds before [`write_multiple_values`] fills it.
+    pub fn load(slot: &[u8]) -> Option<ValueEntry> {
+        Self::load_for(slot, core::mem::size_of::<usize>())
+    }
+
+    /// [`ValueEntry::load`] for a process whose pointers are `ptr` bytes.
+    pub fn load_for(slot: &[u8], ptr: usize) -> Option<ValueEntry> {
+        let u = |o: usize| Some(u32::from_le_bytes(slot.get(o..o + 4)?.try_into().ok()?));
+        Some(ValueEntry {
+            data_length: u(ptr)?,
+            data_offset: u(ptr + 4)?,
+            ty: u(ptr + 8)?,
+        })
     }
 }

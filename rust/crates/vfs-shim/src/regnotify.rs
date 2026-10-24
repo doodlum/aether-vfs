@@ -317,7 +317,6 @@ unsafe fn duplicate(real: &Real, h: isize, access: u32, options: u32) -> Result<
 /// could never end if the notifier has to be started: a new thread cannot run until the lock is
 /// released.
 fn holds_loader_lock() -> bool {
-    #[cfg(target_arch = "x86_64")]
     {
         type Locked = unsafe extern "system" fn(*mut c_void) -> u32;
         static F: OnceLock<Option<Locked>> = OnceLock::new();
@@ -334,17 +333,13 @@ fn holds_loader_lock() -> bool {
         let Some(f) = f else {
             return false;
         };
-        // SAFETY: x64 `gs:[0x60]` is the PEB, whose `LoaderLock` (offset 0x110) is the loader's
-        // critical section; both are valid for the life of the process.
-        unsafe {
-            let peb: *const u8;
-            core::arch::asm!("mov {}, gs:[0x60]", out(reg) peb, options(nostack, readonly));
-            let lock = *(peb.add(0x110) as *const *mut c_void);
-            !lock.is_null() && f(lock) != 0
-        }
+        // `PEB.LoaderLock` is the loader's critical section, valid for the life of the process.
+        let Some(lock) = crate::peb::loader_lock() else {
+            return false;
+        };
+        // SAFETY: a live critical section, passed to the ntdll export made to ask about one.
+        unsafe { f(lock as *mut c_void) != 0 }
     }
-    #[cfg(not(target_arch = "x86_64"))]
-    false
 }
 
 /// A synchronous notification: block until the waiter completes, and answer its status.

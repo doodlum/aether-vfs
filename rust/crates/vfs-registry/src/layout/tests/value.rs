@@ -254,16 +254,33 @@ fn multiple_empty_data_into_empty_buffer() {
 
 #[test]
 fn value_entry_store_leaves_the_name_pointer() {
-    // KEY_VALUE_ENTRY (x64): ValueName@0 (8) DataLength@8 DataOffset@12 Type@16, size 24.
-    let mut slot = [S; KEY_VALUE_ENTRY_SIZE];
-    ValueEntry {
+    let e = ValueEntry {
         data_length: 0x0102_0304,
         data_offset: 0x10,
         ty: 4,
-    }
-    .store(&mut slot);
+    };
+    // KEY_VALUE_ENTRY (x64): ValueName@0 (8) DataLength@8 DataOffset@12 Type@16, size 24.
+    assert_eq!(super::super::value::key_value_entry_size(8), 24);
+    let mut slot = [S; 24];
+    e.store_for(&mut slot, 8);
     let expected = cat(&[&pad(8), &n(0x0102_0304), &n(0x10), &n(4), &pad(4)]);
     assert_eq!(slot[..], expected[..]);
+    assert_eq!(ValueEntry::load_for(&slot, 8), Some(e));
+    // KEY_VALUE_ENTRY (x86): ValueName@0 (4) DataLength@4 DataOffset@8 Type@12, size 16.
+    assert_eq!(super::super::value::key_value_entry_size(4), 16);
+    let mut slot = [S; 16];
+    e.store_for(&mut slot, 4);
+    let expected = cat(&[&pad(4), &n(0x0102_0304), &n(0x10), &n(4)]);
+    assert_eq!(slot[..], expected[..]);
+    assert_eq!(ValueEntry::load_for(&slot, 4), Some(e));
+    // This target's.
+    let mut slot = [S; KEY_VALUE_ENTRY_SIZE];
+    e.store(&mut slot);
+    assert_eq!(ValueEntry::load(&slot), Some(e));
+    assert_eq!(
+        KEY_VALUE_ENTRY_SIZE,
+        super::super::value::key_value_entry_size(core::mem::size_of::<usize>())
+    );
 }
 
 #[test]

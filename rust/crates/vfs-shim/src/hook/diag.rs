@@ -31,9 +31,10 @@ use windows_sys::Win32::Foundation::{HANDLE, NTSTATUS};
 const STATUS_DLL_NOT_FOUND: NTSTATUS = 0xC000_0135u32 as i32;
 
 /// Byte offset of `ImagePathName` (a `UNICODE_STRING`) within
-/// `RTL_USER_PROCESS_PARAMETERS` on x64. Stable across Windows and Wine:
-/// `Reserved1[16]` then `Reserved2[10]` pointers (16 + 80 = 0x60).
-const RTL_UPP_IMAGE_PATH_OFF: usize = 0x60;
+/// `RTL_USER_PROCESS_PARAMETERS`, at this target's width. Stable across Windows
+/// and Wine: `Reserved1[16]` then `Reserved2[10]` pointers (0x60 on x64, 0x38 on
+/// x86).
+const RTL_UPP_IMAGE_PATH_OFF: usize = vfs_inject::Guest::HOST.pp_image_path_name();
 
 /// `NtRaiseHardError`: log it, then call through unchanged.
 ///

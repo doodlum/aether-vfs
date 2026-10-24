@@ -13,6 +13,7 @@
 //! hooks.
 
 use crate::director::{backings_from_env, roots_from_env};
+use crate::ntdef::UnicodeString;
 use vfs_protocol::RootId;
 
 /// `path` (a DOS path) moved from under a backing directory to the same place
@@ -85,36 +86,23 @@ pub(crate) unsafe fn rename_image() {
     // SAFETY: as this function's contract; every pointer is checked for null
     // and read from structures the loader keeps for the process's lifetime.
     unsafe {
-        let teb: usize;
-        core::arch::asm!("mov {}, gs:[0x30]", out(reg) teb, options(nostack, preserves_flags));
-        if teb == 0 {
-            return;
+        // ProcessParameters.ImagePathName, at this target's layout (`crate::peb`).
+        if let Some(image) = crate::peb::image_path_name() {
+            rename_string(image, &map);
         }
-        let peb = *((teb + 0x60) as *const usize);
-        if peb == 0 {
-            return;
-        }
-        // ProcessParameters.ImagePathName (x64: params + 0x60).
-        let params = *((peb + 0x20) as *const usize);
-        if params != 0 {
-            rename_string(params + 0x60, &map);
-        }
-        // The executable's loader entry: first in InLoadOrderModuleList
-        // (PEB.Ldr @ 0x18, PEB_LDR_DATA.InLoadOrderModuleList @ 0x10);
-        // LDR_DATA_TABLE_ENTRY.FullDllName @ 0x48.
+        // The executable's loader entry: first in `PEB_LDR_DATA.InLoadOrderModuleList`,
+        // its `LDR_DATA_TABLE_ENTRY.FullDllName`.
         // Every loader entry mapped from a backing directory, not only the executable's: the
         // static imports staged beside it (a plugin preloader among them) are loaded from the
         // backing directory too, and one that builds paths from its own module name would
         // otherwise load what SKSE loads by the location under a second spelling — a second
         // copy of the same DLL. The list is walked from its head; `map` leaves every other
         // entry (system DLLs, the shim) as it is.
-        let ldr = *((peb + 0x18) as *const usize);
-        if ldr != 0 {
-            let head = ldr + 0x10;
+        if let Some(head) = crate::peb::load_order_head() {
             let mut entry = *(head as *const usize);
             let mut seen = 0;
             while entry != 0 && entry != head && seen < 4096 {
-                rename_string(entry + 0x48, &map);
+                rename_string(crate::peb::full_dll_name(entry), &map);
                 entry = *(entry as *const usize);
                 seen += 1;
             }
@@ -122,18 +110,18 @@ pub(crate) unsafe fn rename_image() {
     }
 }
 
-/// Replace the `UNICODE_STRING` at `at` with `map` of it, when `map` has an
+/// Replace the `UNICODE_STRING` at `us` with `map` of it, when `map` has an
 /// answer. The new buffer is leaked: it names the image for the life of the
 /// process.
 ///
 /// # Safety
-/// `at` is a live `UNICODE_STRING` of this process.
+/// `us` is a live `UNICODE_STRING` of this process.
 #[allow(unsafe_code)]
-unsafe fn rename_string(at: usize, map: &dyn Fn(&str) -> Option<String>) {
+unsafe fn rename_string(us: *mut UnicodeString, map: &dyn Fn(&str) -> Option<String>) {
     // SAFETY: as this function's contract.
     unsafe {
-        let len = *(at as *const u16) as usize / 2;
-        let buf = *((at + 8) as *const *const u16);
+        let len = (*us).length as usize / 2;
+        let buf = (*us).buffer as *const u16;
         if buf.is_null() || len == 0 {
             return;
         }
@@ -148,9 +136,9 @@ unsafe fn rename_string(at: usize, map: &dyn Fn(&str) -> Option<String>) {
         }
         units.push(0);
         let leaked: &'static mut [u16] = Box::leak(units.into_boxed_slice());
-        *((at + 8) as *mut *const u16) = leaked.as_ptr();
-        *((at + 2) as *mut u16) = (bytes + 2) as u16;
-        *(at as *mut u16) = bytes as u16;
+        (*us).buffer = leaked.as_mut_ptr();
+        (*us).maximum_length = (bytes + 2) as u16;
+        (*us).length = bytes as u16;
     }
 }
 

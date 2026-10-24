@@ -18,6 +18,7 @@ mod lazy_section;
 pub mod loadlog;
 mod ntbuf;
 mod ntdef;
+mod peb;
 mod read_cache;
 /// The registry hooks' client for the director's registry overlay.
 pub mod regclient;

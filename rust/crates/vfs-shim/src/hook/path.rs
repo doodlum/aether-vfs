@@ -20,32 +20,11 @@ pub(super) unsafe fn object_name_str(oa: *const ObjectAttributes) -> Option<Stri
 /// `RTL_USER_PROCESS_PARAMETERS.CurrentDirectory` is the only place the handle
 /// is published; there is no API that hands it back.
 pub(super) unsafe fn cwd_from_peb() -> Option<(isize, String)> {
-    // x64: TEB.ProcessEnvironmentBlock @ 0x60, PEB.ProcessParameters @ 0x20,
-    // params.CurrentDirectory @ 0x38 = { UNICODE_STRING DosPath; HANDLE Handle }.
-    let teb: usize;
+    // `CurrentDirectory` = { UNICODE_STRING DosPath; HANDLE Handle }, at this
+    // target's layout (`crate::peb`).
+    let (dos, handle) = crate::peb::current_directory()?;
     // SAFETY: raw access under the NT-pointer contract (hook/mod.rs).
-    unsafe {
-        core::arch::asm!("mov {}, gs:[0x30]", out(reg) teb, options(nostack, preserves_flags))
-    };
-    if teb == 0 {
-        return None;
-    }
-    // SAFETY: raw access under the NT-pointer contract (hook/mod.rs).
-    let peb = unsafe { *((teb + 0x60) as *const usize) };
-    if peb == 0 {
-        return None;
-    }
-    // SAFETY: raw access under the NT-pointer contract (hook/mod.rs).
-    let params = unsafe { *((peb + 0x20) as *const usize) };
-    if params == 0 {
-        return None;
-    }
-    // SAFETY: raw access under the NT-pointer contract (hook/mod.rs).
-    let units = unsafe { *((params + 0x38) as *const u16) } as usize / 2;
-    // SAFETY: raw access under the NT-pointer contract (hook/mod.rs).
-    let buf = unsafe { *((params + 0x40) as *const *const u16) };
-    // SAFETY: raw access under the NT-pointer contract (hook/mod.rs).
-    let handle = unsafe { *((params + 0x48) as *const isize) };
+    let (units, buf) = unsafe { ((*dos).length as usize / 2, (*dos).buffer as *const u16) };
     if buf.is_null() || units == 0 || handle == 0 {
         return None;
     }

@@ -68,6 +68,8 @@ fn bootstrap_steps(path: &str) -> Result<HookGuard, BootstrapError> {
             return Err(BootstrapError::Fuse(msg));
         }
     }
+    // The PEB's address, asked for once here so no hook has to.
+    crate::peb::warm();
     // The program was started from its root's backing directory: now that the
     // loader is done with the real path, tell it where it is.
     // SAFETY: no thread of the program has run yet (see `rename_image`).

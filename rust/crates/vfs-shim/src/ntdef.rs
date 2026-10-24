@@ -209,7 +209,8 @@ pub(crate) type NtQueryObjectFn = unsafe extern "system" fn(
 pub(crate) const OBJECT_NAME_INFORMATION: u32 = 1;
 
 /// Bytes of the `UNICODE_STRING` header an `OBJECT_NAME_INFORMATION` opens with
-/// (x64: `u16` Length, `u16` MaximumLength, 4 bytes padding, `*mut u16` Buffer).
+/// (`u16` Length, `u16` MaximumLength, padding to the pointer, `*mut u16` Buffer: 16 on x64,
+/// 8 on x86).
 /// Measured on both hosts: `Buffer` points exactly this far into the caller's
 /// own buffer.
 pub(crate) use vfs_ntlayout::OBJECT_NAME_INFORMATION_HEADER;
@@ -231,8 +232,9 @@ pub(crate) const FILE_DISPOSITION_INFORMATION_EX: u32 = 64;
 pub(crate) const FILE_DISPOSITION_DELETE: u32 = 0x1;
 
 /// `FileRenameInformation` (class 10) / `FileRenameInformationEx` (class 65).
-/// Layout (x64): `[0] ReplaceIfExists/Flags`, `[8] RootDirectory (HANDLE)`,
-/// `[16] FileNameLength (ULONG)`, `[20] FileName (WCHAR[])`.
+/// Layout: `ReplaceIfExists/Flags`, then `RootDirectory (HANDLE)` one pointer in,
+/// `FileNameLength (ULONG)` and `FileName (WCHAR[])`: 0/8/16/20 on x64, 0/4/8/12 on x86
+/// (`vfs_ntlayout::parse_rename_info`).
 pub(crate) const FILE_RENAME_INFORMATION: u32 = 10;
 pub(crate) const FILE_RENAME_INFORMATION_EX: u32 = 65;
 /// `FILE_LINK_INFORMATION` and its `_EX` form: laid out exactly as the rename classes.
@@ -563,8 +565,9 @@ pub(crate) type NtEnumerateValueKeyFn = unsafe extern "system" fn(
     *mut u32,    // ResultLength
 ) -> NTSTATUS;
 
-/// `ntdll!NtQueryMultipleValueKey`. `ValueEntries` is an array of x64 `KEY_VALUE_ENTRY`
-/// (24 bytes each); `BufferLength` is in/out, `RequiredBufferLength` nullable.
+/// `ntdll!NtQueryMultipleValueKey`. `ValueEntries` is an array of `KEY_VALUE_ENTRY`
+/// (`vfs_registry::layout::KEY_VALUE_ENTRY_SIZE` each: 24 bytes on x64, 16 on x86);
+/// `BufferLength` is in/out, `RequiredBufferLength` nullable.
 pub(crate) type NtQueryMultipleValueKeyFn = unsafe extern "system" fn(
     HANDLE,      // KeyHandle
     *mut c_void, // ValueEntries
