@@ -3,7 +3,7 @@
 //! process environment.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -312,6 +312,9 @@ impl Session {
             }
         }
         env_set.extend(opts.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+        if let Some(shim_dir) = Path::new(&dll).parent() {
+            put_shim_on_path(&mut env_set, &shim_dir.to_string_lossy());
+        }
         // `Activation::Inject`: the shim goes into the target and every child
         // by remote `LoadLibrary` on the suspended process, never by the
         // in-memory import patch, the same path a launch under Wine takes.
@@ -476,6 +479,36 @@ impl Session {
             }
         }
     }
+}
+
+/// Put the shim's directory first on the child's `PATH`.
+///
+/// The in-memory import patch names the shim by file name, so the loader has to find it on the
+/// child's search path. A staged image has it beside itself, but a real program launched in its
+/// own folder (a game in a root located at its install directory) does not, and the loader
+/// stops the process before it runs ("vfs_shim_dll.dll was not found"). `PATH` is searched for
+/// imports and is inherited by every child, so it covers the processes the program starts too.
+///
+/// The effective value is the last `PATH` the launch sets (names compare without case, and a
+/// later entry wins in `env_block::build`), else this process's own.
+#[cfg(windows)]
+fn put_shim_on_path(env_set: &mut Vec<(String, String)>, shim_dir: &str) {
+    let current = env_set
+        .iter()
+        .rev()
+        .find(|(name, _)| name.eq_ignore_ascii_case("PATH"))
+        .map(|(_, value)| value.clone())
+        .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
+    env_set.retain(|(name, _)| !name.eq_ignore_ascii_case("PATH"));
+    let trimmed = |p: &str| p.trim_end_matches(['\\', '/']).to_ascii_lowercase();
+    let value = if current.split(';').any(|p| trimmed(p) == trimmed(shim_dir)) {
+        current
+    } else if current.is_empty() {
+        shim_dir.to_string()
+    } else {
+        format!("{shim_dir};{current}")
+    };
+    env_set.push(("PATH".to_string(), value));
 }
 
 // Only `launch`'s Windows body calls this, so it is gated alongside it.
@@ -699,5 +732,46 @@ impl Session {
             out.push((id, location));
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod shim_path_tests {
+    use super::put_shim_on_path;
+
+    fn path_of(env: &[(String, String)]) -> Vec<&str> {
+        env.iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("PATH"))
+            .map(|(_, value)| value.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn the_shim_directory_goes_first_on_the_launch_path_replacing_any_spelling() {
+        let mut env = vec![
+            ("Path".to_string(), r"C:\Windows;C:\Tools".to_string()),
+            ("OTHER".to_string(), "x".to_string()),
+        ];
+        put_shim_on_path(&mut env, r"C:\Vortex\aether-vfs");
+        assert_eq!(path_of(&env), [r"C:\Vortex\aether-vfs;C:\Windows;C:\Tools"]);
+        assert!(env.iter().any(|(name, _)| name == "OTHER"));
+    }
+
+    #[test]
+    fn a_shim_directory_already_on_the_path_is_not_added_twice() {
+        let mut env = vec![("PATH".to_string(), r"c:\vortex\AETHER-VFS\;C:\Windows".to_string())];
+        put_shim_on_path(&mut env, r"C:\Vortex\aether-vfs");
+        assert_eq!(path_of(&env), [r"c:\vortex\AETHER-VFS\;C:\Windows"]);
+    }
+
+    #[test]
+    fn without_a_path_from_the_launch_this_process_s_is_used() {
+        let mut env = Vec::new();
+        put_shim_on_path(&mut env, r"C:\Vortex\aether-vfs");
+        let path = path_of(&env)[0].to_string();
+        assert!(path.starts_with(r"C:\Vortex\aether-vfs"));
+        if let Ok(own) = std::env::var("PATH") {
+            assert!(path.ends_with(&own));
+        }
     }
 }

@@ -86,6 +86,20 @@ test('a mapped mod file, the real game file under it and copy-on-write writes', 
     );
     // The real game file is still visible underneath.
     assert.deepEqual(await read(path.join(game, 'base.txt'), 5, 'b'), { kind: 'exited', code: 0 });
+    // A program that lives in the game folder, as a game does: the shim is not beside it, so
+    // the in-memory import patch must find it on the launch's PATH.
+    const inGame = path.join(game, 'game.exe');
+    fs.copyFileSync(fixture, inGame);
+    before['game.exe'] = fs.readFileSync(inGame, 'utf8');
+    const launch = await session.launch({
+      image: inGame,
+      env: {
+        VFS_FIXTURE_PATH: path.join(game, 'Data', 'plugin.bin'),
+        VFS_FIXTURE_EXPECT: '7',
+        VFS_FIXTURE_FILL: String('m'.charCodeAt(0)),
+      },
+    });
+    assert.deepEqual(await launch.wait(), { kind: 'exited', code: 0 });
     // Writes went to the write folder; the game folder is untouched.
     assert.equal(fs.readFileSync(path.join(overwrite, 'Data', 'written.txt'), 'utf8'), 'from the game');
     assert.deepEqual(snapshot(game), before);
