@@ -331,16 +331,19 @@ mod tests {
         }
     }
 
-    /// FILE_RENAME_INFORMATION: ReplaceIfExists(1)+pad, RootDirectory@8,
-    /// FileNameLength@16, FileName@20.
+    /// FILE_RENAME_INFORMATION at this target's width: ReplaceIfExists(1)+pad,
+    /// RootDirectory one pointer in, then FileNameLength and FileName (8, 16, 20 on
+    /// 64-bit; 4, 8, 12 on 32-bit).
     fn rename_info(root_dir: usize, name: &str) -> Vec<u8> {
+        let p = core::mem::size_of::<usize>();
         let units: Vec<u16> = name.encode_utf16().collect();
         let namelen = units.len() * 2;
-        let mut buf = vec![0u8; 20 + namelen];
-        buf[8..16].copy_from_slice(&root_dir.to_le_bytes());
-        buf[16..20].copy_from_slice(&(namelen as u32).to_le_bytes());
+        let name_off = 2 * p + 4;
+        let mut buf = vec![0u8; name_off + namelen];
+        buf[p..2 * p].copy_from_slice(&root_dir.to_le_bytes());
+        buf[2 * p..name_off].copy_from_slice(&(namelen as u32).to_le_bytes());
         for (i, u) in units.iter().enumerate() {
-            buf[20 + i * 2..22 + i * 2].copy_from_slice(&u.to_le_bytes());
+            buf[name_off + i * 2..name_off + 2 + i * 2].copy_from_slice(&u.to_le_bytes());
         }
         buf
     }

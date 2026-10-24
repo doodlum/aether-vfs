@@ -16,7 +16,7 @@
 //! file behind it at all. (It was called `zipserve` while it still served
 //! zip-window bytes.)
 
-use crate::handle_tags::SYNTH_SECTION_TAG;
+use crate::handle_tags::{is_section_tagged, SECTION_PAYLOAD, SYNTH_SECTION_TAG};
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
@@ -45,7 +45,7 @@ static NEXT_SLOT: Mutex<usize> = Mutex::new(0);
 
 /// Whether `handle` is a synthetic section (from [`register_mapped_image`]).
 pub(crate) fn is_synth_section(handle: isize) -> bool {
-    (handle as usize) & SYNTH_SECTION_TAG != 0
+    is_section_tagged(handle as usize)
 }
 
 /// Register an already-mapped PE image (from `map_image_from_pe_bytes_local`,
@@ -53,7 +53,7 @@ pub(crate) fn is_synth_section(handle: isize) -> bool {
 /// `MapViewOfSection` returns `base`.
 pub(crate) fn register_mapped_image(base: usize, size: u64) -> Option<isize> {
     let mut slot = NEXT_SLOT.lock().ok()?;
-    let handle = SYNTH_SECTION_TAG | (*slot << 3);
+    let handle = SYNTH_SECTION_TAG | ((*slot << 3) & SECTION_PAYLOAD);
     *slot += 1;
     drop(slot);
     SYNTH_SECTIONS.lock().ok()?.insert(

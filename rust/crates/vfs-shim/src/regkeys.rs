@@ -1700,7 +1700,8 @@ pub(crate) unsafe fn serves_target(real: &Real, oa: *const ObjectAttributes) -> 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::handle_tags::{SYNTH_FILE_TAG, SYNTH_SECTION_TAG};
+    #[cfg(target_pointer_width = "64")]
+    use crate::handle_tags::SYNTH_SECTION_TAG;
 
     unsafe extern "system" fn name_query_fails(
         _: HANDLE,
@@ -1802,14 +1803,12 @@ pub(crate) mod tests {
         .unwrap();
         assert!(is_synthetic(h));
         assert_eq!(h % 4, 0);
-        assert_eq!(
-            h as usize & SYNTH_SECTION_TAG,
-            0,
+        assert!(
+            !crate::handle_tags::is_section_tagged(h as usize),
             "would read as a synthetic section"
         );
-        assert_eq!(
-            h as usize & SYNTH_FILE_TAG,
-            0,
+        assert!(
+            !crate::handle_tags::is_file_tagged(h as usize),
             "would read as a synthetic file"
         );
         assert!(!is_synthetic(-1), "a pseudo-handle is not a key handle");
@@ -1821,10 +1820,15 @@ pub(crate) mod tests {
         assert!(!is_synthetic(0x544a_4def ^ 4));
         assert!(!is_synthetic(0x544a_4def ^ (0x00ff_ffff << 2)));
         // Other tags, and a synthetic value with a high bit set, are not key handles.
-        assert!(!is_synthetic((1 << 46) | 0x7c));
-        assert!(!is_synthetic(
-            (SYNTH_SECTION_TAG as isize) | (REG_TAG as isize)
-        ));
+        // At 64 bits the other tags sit above bit 31; at 32 they share the top nibble and are
+        // told apart by `handle_tags`' predicates, checked above.
+        #[cfg(target_pointer_width = "64")]
+        {
+            assert!(!is_synthetic((1 << 46) | 0x7c));
+            assert!(!is_synthetic(
+                (SYNTH_SECTION_TAG as isize) | (REG_TAG as isize)
+            ));
+        }
         assert!(!is_synthetic(0x2000_0000));
         assert!(!is_synthetic(0x4000_0000));
         assert_eq!(path_of(h).as_deref(), Some(r"\Registry\Machine\X"));

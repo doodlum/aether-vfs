@@ -228,16 +228,22 @@ impl OwnedOa {
 /// The fields are written unaligned: the hooks take the block as an opaque `*mut c_void`
 /// and a caller's block is not ours to assume aligned.
 ///
+/// `Information` follows the status union at pointer alignment: at 8 on a 64-bit target, at 4
+/// on a 32-bit one, whose block is 8 bytes in all.
+///
 /// # Safety
-/// `iosb` is NULL or points to 16 writable bytes (an `IO_STATUS_BLOCK`).
+/// `iosb` is NULL or points to a writable `IO_STATUS_BLOCK` (16 bytes on 64-bit, 8 on 32-bit).
 pub(crate) unsafe fn iosb_set(iosb: *mut c_void, status: NTSTATUS, info: usize) {
     if iosb.is_null() {
         return;
     }
     let p = iosb as *mut u8;
     core::ptr::write_unaligned(p as *mut u32, status as u32);
-    core::ptr::write_unaligned(p.add(8) as *mut usize, info);
+    core::ptr::write_unaligned(p.add(IOSB_INFORMATION) as *mut usize, info);
 }
+
+/// The offset of `IO_STATUS_BLOCK.Information`: one pointer in.
+pub(crate) const IOSB_INFORMATION: usize = core::mem::size_of::<usize>();
 
 /// The `ByteOffset` argument of `NtReadFile`/`NtWriteFile`: `Some` for an explicit offset,
 /// `None` for a NULL pointer or a negative value (`FILE_USE_FILE_POINTER_POSITION` and
@@ -459,13 +465,19 @@ mod tests {
 
     #[test]
     fn iosb_set_writes_status_and_information() {
+        // The block is two pointers: 16 bytes on 64-bit, 8 on 32-bit (`Information` at 4).
+        let ptr = core::mem::size_of::<usize>();
         let mut block = [0xAAu8; 24];
         unsafe { iosb_set(block.as_mut_ptr().cast(), -1073741823, 0x1234) };
         assert_eq!(&block[0..4], &(-1073741823i32).to_ne_bytes());
-        assert_eq!(&block[8..16], &0x1234usize.to_ne_bytes());
+        assert_eq!(&block[ptr..2 * ptr], &0x1234usize.to_ne_bytes());
         // Bytes outside the block are untouched.
-        assert_eq!(&block[4..8], &[0xAA; 4]);
-        assert_eq!(&block[16..], &[0xAA; 8]);
+        assert!(block[4..ptr].iter().all(|b| *b == 0xAA));
+        assert!(block[2 * ptr..].iter().all(|b| *b == 0xAA));
+        assert_eq!(
+            core::mem::size_of::<windows_sys::Win32::System::IO::IO_STATUS_BLOCK>(),
+            2 * ptr
+        );
         unsafe { iosb_set(core::ptr::null_mut(), 0, 0) };
     }
 }
