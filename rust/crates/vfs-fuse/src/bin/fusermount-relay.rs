@@ -55,7 +55,12 @@ fn send_fd(socket: &std::os::fd::OwnedFd, fd: &std::os::fd::OwnedFd) -> std::io:
     let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
     let mut control = SendAncillaryBuffer::new(&mut space);
     control.push(SendAncillaryMessage::ScmRights(&fds));
-    sendmsg(socket, &[IoSlice::new(&[0])], &mut control, SendFlags::empty())?;
+    sendmsg(
+        socket,
+        &[IoSlice::new(&[0])],
+        &mut control,
+        SendFlags::empty(),
+    )?;
     Ok(())
 }
 
