@@ -98,13 +98,17 @@ impl Session {
             return Ok(());
         }
 
+        // A sequence number as well as the time: two sessions served in the same millisecond
+        // (seen on CI) otherwise share one ring name, and the second takes the first's ring.
+        static SERVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let section = format!(
-            "Local\\vfs_ring_{}_{}",
+            "Local\\vfs_ring_{}_{}_{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis())
-                .unwrap_or(0)
+                .unwrap_or(0),
+            SERVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
         let ipc =
             IpcServe::start_with_workers(Arc::clone(&self.kernel), section, self.io_workers())?;
