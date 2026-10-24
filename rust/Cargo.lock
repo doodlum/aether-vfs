@@ -1343,6 +1343,7 @@ dependencies = [
  "vfs-core",
  "vfs-director",
  "vfs-provider",
+ "vfs-testkit",
 ]
 
 [[package]]

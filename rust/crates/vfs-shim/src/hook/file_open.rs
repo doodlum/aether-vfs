@@ -555,6 +555,21 @@ pub(super) struct OpenCall {
     pub create: bool,
 }
 
+/// Whether a path names a wildcard (`*`, `?` and NT's DOS wildcards `<`, `>`, `"`) or a pipe
+/// character anywhere after its device or drive prefix, where no file name can have one. The
+/// `?`s of the object-manager spellings before a drive (`\??\`, `\\?\`,
+/// `\\?\GLOBALROOT\GLOBAL??\`) are not one, so a drive path is checked after its `X:` only.
+pub(super) fn has_wildcard(path: &str) -> bool {
+    let rest = match path.find(':') {
+        Some(i) if i > 0 && path.as_bytes()[i - 1].is_ascii_alphabetic() => &path[i + 1..],
+        _ => path
+            .strip_prefix(r"\??\")
+            .or_else(|| path.strip_prefix(r"\\?\"))
+            .unwrap_or(path),
+    };
+    rest.contains(['*', '?', '<', '>', '"', '|'])
+}
+
 /// The routing of an `NtCreateFile` or `NtOpenFile` call past the in-hook re-entry check: the
 /// director's answer for an under-root open, else the real call (a path outside every root, or
 /// an under-root miss behind `allow_disk_fallthrough`). `real` makes the original call with the
@@ -597,6 +612,15 @@ unsafe fn route_open(
     // `note_passthrough_outcome`) must not be cached under it. See
     // `vfs_redirect::UncachedScope`'s doc comment.
     let _uncached_guard = os_consulted.then(vfs_redirect::UncachedScope::enter);
+
+    // A name with a wildcard under a root: NT refuses it outright ("invalid name"), and callers
+    // rely on that to tell a pattern from a file (`copy Data\*.bsa` in cmd.exe). The director
+    // would otherwise open a file literally named `*.bsa` and fail its reads.
+    if let Some(p) = path {
+        if has_wildcard(p) && crate::director::global().is_some_and(|c| c.route(p).is_some()) {
+            return crate::ntdef::STATUS_OBJECT_NAME_INVALID;
+        }
+    }
 
     // Directory create under the managed root → ring OP_MKDIR (must precede the
     // generic file open below, which would otherwise create a FILE named as the
@@ -732,5 +756,23 @@ pub(super) unsafe fn open_hook_body(
         route_open(&call, &mut _hs, &|oa| {
             tramp(file_handle, access, oa, iosb, share, opts)
         })
+    }
+}
+
+#[cfg(test)]
+mod wildcard_tests {
+    use super::has_wildcard;
+
+    #[test]
+    fn a_pattern_is_not_a_file_name_but_an_nt_prefix_is_fine() {
+        assert!(has_wildcard(r"\??\C:\Game\Data\*.bsa"));
+        assert!(has_wildcard(r"C:\Game\Data\a?.esp"));
+        assert!(has_wildcard(r"\??\C:\Game\<.esp"));
+        assert!(!has_wildcard(r"\??\C:\Game\Data\Skyrim - Misc.bsa"));
+        assert!(!has_wildcard(r"\\?\C:\Game\Data"));
+        assert!(!has_wildcard(r"\\?\GLOBALROOT\GLOBAL??\C:\Game\Data\a.esp"));
+        assert!(has_wildcard(r"\\?\GLOBALROOT\GLOBAL??\C:\Game\Data\*.esp"));
+        assert!(!has_wildcard(r"\??\C:\Game\Data\a.esp:stream"));
+        assert!(has_wildcard(r"\??\UNC\server\share\*.esp"));
     }
 }

@@ -215,6 +215,51 @@ pub(super) unsafe fn create_key_hook_body(
 }
 
 /// `NtDuplicateObject` hook: duplicates of tracked key handles stay tracked. See
+/// Whether `process` is this process: the pseudo-handle, or a real handle to it.
+fn is_this_process(process: HANDLE) -> bool {
+    process as isize == -1 || {
+        // SAFETY: plain Win32 queries of a process handle and of this process.
+        unsafe {
+            windows_sys::Win32::System::Threading::GetProcessId(process)
+                == windows_sys::Win32::System::Threading::GetCurrentProcessId()
+        }
+    }
+}
+
+/// `NtDuplicateObject` of a synthetic file handle: a second synthetic handle to the same file
+/// ([`crate::synth_file::duplicate`]), with the path record the first had. The kernel must not
+/// see a synthetic handle, where it fails "invalid handle" (`CopyFile`, `DuplicateHandle`); and
+/// one means nothing to another process, so duplicating it there is not supported.
+unsafe fn synth_duplicate(
+    src_process: HANDLE,
+    src: HANDLE,
+    dst_process: HANDLE,
+    dst: *mut HANDLE,
+    options: u32,
+) -> NTSTATUS {
+    const STATUS_NOT_SUPPORTED: NTSTATUS = 0xC000_00BBu32 as i32;
+    const DUPLICATE_CLOSE_SOURCE: u32 = 0x1;
+    if !is_this_process(src_process) || (!dst.is_null() && !is_this_process(dst_process)) {
+        return STATUS_NOT_SUPPORTED;
+    }
+    if !dst.is_null() {
+        let Some(copy) = crate::synth_file::duplicate(src as isize) else {
+            return crate::ntdef::STATUS_INVALID_HANDLE;
+        };
+        if let Ok(mut table) = super::HANDLES.lock() {
+            if let Some(path) = table.under_root(src as isize).cloned() {
+                table.set_under_root(copy, path);
+            }
+        }
+        // SAFETY: `dst` is the caller's non-null out pointer (hook/mod.rs).
+        unsafe { core::ptr::write_unaligned(dst, copy as HANDLE) };
+    }
+    if options & DUPLICATE_CLOSE_SOURCE != 0 {
+        // SAFETY: closing the caller's own synthetic handle, as the flag asks.
+        unsafe { super::close::close_hook_body(src) };
+    }
+    crate::ntdef::STATUS_SUCCESS
+}
 /// `regkeys::duplicate`.
 pub(super) unsafe fn dup_hook_body(
     src_process: HANDLE,
@@ -229,7 +274,12 @@ pub(super) unsafe fn dup_hook_body(
     let Some(tramp) = TRAMP_DUP.get() else {
         return STATUS_UNSUCCESSFUL;
     };
-    if reg_bypass() {
+    if crate::synth_file::is_fuse_synth(src as isize) {
+        // SAFETY: same NT-pointer contract as this fn (hook/mod.rs).
+        return unsafe { synth_duplicate(src_process, src, dst_process, dst, options) };
+    }
+    // Without the registry overlay (installed for the line above alone) nothing else is ours.
+    if !crate::regclient::enabled() || reg_bypass() {
         // SAFETY: the original NT function, called with valid NT arguments.
         return unsafe {
             tramp(
@@ -490,6 +540,10 @@ pub(super) unsafe fn query_security_hook_body(
     let Some(tramp) = TRAMP_QUERY_SECURITY.get() else {
         return STATUS_UNSUCCESSFUL;
     };
+    if crate::synth_file::is_fuse_synth(handle as isize) {
+        // SAFETY: same NT-pointer contract as this fn (hook/mod.rs).
+        return unsafe { super::file_info::synth_query_security(handle, info, sd, length, needed) };
+    }
     if !crate::regkeys::is_synthetic(handle as isize) || reg_bypass() {
         // SAFETY: the original NT function, called with valid NT arguments.
         return unsafe { tramp(handle, info, sd, length, needed) };
@@ -525,6 +579,11 @@ pub(super) unsafe fn set_security_hook_body(
     let Some(tramp) = TRAMP_SET_SECURITY.get() else {
         return STATUS_UNSUCCESSFUL;
     };
+    if crate::synth_file::is_fuse_synth(handle as isize) {
+        // A virtual file's security is its location's (`synth_query_security`); it cannot be
+        // changed through the file, and the kernel must not see the synthetic handle.
+        return crate::ntdef::STATUS_ACCESS_DENIED;
+    }
     if !crate::regclient::enabled() {
         // SAFETY: the original NT function, called with valid NT arguments.
         return unsafe { tramp(handle, info, sd) };
@@ -554,6 +613,11 @@ pub(super) unsafe fn set_info_object_hook_body(
     let Some(tramp) = TRAMP_SET_INFO_OBJECT.get() else {
         return STATUS_UNSUCCESSFUL;
     };
+    if crate::synth_file::is_fuse_synth(handle as isize) {
+        // Handle flags (inherit, protect from close) on a handle no other process can use and
+        // whose close the shim handles: accepted, as `synth_query_object` reports none.
+        return crate::ntdef::STATUS_SUCCESS;
+    }
     if !crate::regkeys::is_synthetic(handle as isize) || reg_bypass() {
         // SAFETY: the original NT function, called with valid NT arguments.
         return unsafe { tramp(handle, class, info, length) };

@@ -337,6 +337,85 @@ macro_rules! detour_table {
                     iosb: *mut c_void,
                 ) -> NTSTATUS,
                 on_panic: STATUS_HOOK_PANICKED,
+            }            // Control codes and extended attributes. A synthetic handle reaching the kernel
+            // fails "invalid handle", which `CopyFile` (and other callers that only probe for a
+            // feature) take as fatal; a file system that lacks the feature says so instead.
+            // Real handles pass straight through.
+            {
+                export: "NtFsControlFile",
+                stat: [FsControl = 59],
+                tramp: TRAMP_FSCTL: NtControlFileFn,
+                install: Optional, group: File, flags: [],
+                hook: fsctl_hook = fsctl_hook_body(
+                    handle: HANDLE,
+                    event: HANDLE,
+                    apc: *const c_void,
+                    apc_ctx: *const c_void,
+                    iosb: *mut c_void,
+                    code: u32,
+                    input: *const c_void,
+                    input_len: u32,
+                    output: *mut c_void,
+                    output_len: u32,
+                ) -> NTSTATUS,
+                on_panic: STATUS_HOOK_PANICKED,
+            }
+            {
+                export: "NtDeviceIoControlFile",
+                stat: [],
+                tramp: TRAMP_IOCTL: NtControlFileFn,
+                install: Optional, group: File, flags: [],
+                hook: ioctl_hook = ioctl_hook_body(
+                    handle: HANDLE,
+                    event: HANDLE,
+                    apc: *const c_void,
+                    apc_ctx: *const c_void,
+                    iosb: *mut c_void,
+                    code: u32,
+                    input: *const c_void,
+                    input_len: u32,
+                    output: *mut c_void,
+                    output_len: u32,
+                ) -> NTSTATUS,
+                on_panic: STATUS_HOOK_PANICKED,
+            }
+            // Windows 11 24H2's `CopyFile` copies with this, the source handle going to the kernel.
+            {
+                export: "NtCopyFileChunk",
+                stat: [CopyChunk = 61],
+                tramp: TRAMP_COPY_CHUNK: NtCopyFileChunkFn,
+                install: Optional, group: File, flags: [],
+                hook: copy_chunk_hook = copy_chunk_hook_body(
+                    src: HANDLE,
+                    dst: HANDLE,
+                    event: HANDLE,
+                    iosb: *mut c_void,
+                    length: u32,
+                    src_offset: *const i64,
+                    dst_offset: *const i64,
+                    src_key: *const u32,
+                    dst_key: *const u32,
+                    flags: u32,
+                ) -> NTSTATUS,
+                on_panic: STATUS_HOOK_PANICKED,
+            }
+            {
+                export: "NtQueryEaFile",
+                stat: [QueryEa = 60],
+                tramp: TRAMP_QEA: NtQueryEaFileFn,
+                install: Optional, group: File, flags: [],
+                hook: qea_hook = qea_hook_body(
+                    handle: HANDLE,
+                    iosb: *mut c_void,
+                    buffer: *mut c_void,
+                    length: u32,
+                    single: u8,
+                    ea_list: *const c_void,
+                    ea_list_len: u32,
+                    ea_index: *const u32,
+                    restart: u8,
+                ) -> NTSTATUS,
+                on_panic: STATUS_HOOK_PANICKED,
             }
             // Present since Win10 1709. Optional so an older host still installs.
             {
@@ -621,10 +700,12 @@ macro_rules! detour_table {
                 on_panic: STATUS_HOOK_PANICKED,
             }
             {
+                // File as well as Registry: a synthetic file handle must not reach the kernel
+                // (`DuplicateHandle`, `CopyFile`). So for the two below.
                 export: "NtDuplicateObject",
                 stat: [DuplicateObject = 23],
                 tramp: TRAMP_DUP: NtDuplicateObjectFn,
-                install: Optional, group: Registry, flags: [],
+                install: Optional, group: File, flags: [],
                 hook: dup_hook = dup_hook_body(
                     src_process: HANDLE,
                     src: HANDLE,
@@ -682,7 +763,9 @@ macro_rules! detour_table {
                 export: "NtQuerySecurityObject",
                 stat: [QuerySecurityObject = 37],
                 tramp: TRAMP_QUERY_SECURITY: NtQuerySecurityObjectFn,
-                install: IfPresent, group: Registry, flags: [],
+                // File as well as Registry: a synthetic file handle must not reach the kernel
+                // either (`GetSecurityInfo`, `CopyFile`).
+                install: IfPresent, group: File, flags: [],
                 hook: query_security_hook = query_security_hook_body(
                     handle: HANDLE,
                     info: u32,
@@ -696,7 +779,7 @@ macro_rules! detour_table {
                 export: "NtSetSecurityObject",
                 stat: [SetSecurityObject = 38],
                 tramp: TRAMP_SET_SECURITY: NtSetSecurityObjectFn,
-                install: IfPresent, group: Registry, flags: [],
+                install: IfPresent, group: File, flags: [],
                 hook: set_security_hook = set_security_hook_body(
                     handle: HANDLE,
                     info: u32,
@@ -708,7 +791,7 @@ macro_rules! detour_table {
                 export: "NtSetInformationObject",
                 stat: [SetInformationObject = 39],
                 tramp: TRAMP_SET_INFO_OBJECT: NtSetInformationObjectFn,
-                install: IfPresent, group: Registry, flags: [],
+                install: IfPresent, group: File, flags: [],
                 hook: set_info_object_hook = set_info_object_hook_body(
                     handle: HANDLE,
                     class: u32,

@@ -4,6 +4,7 @@ use crate::handle_tags::{is_file_tagged, FILE_PAYLOAD, SYNTH_FILE_TAG};
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
+#[derive(Clone)]
 struct FuseOpen {
     fh: u64,
     size: u64,
@@ -37,6 +38,17 @@ pub(crate) struct ReadView {
 
 static TABLE: Mutex<BTreeMap<usize, FuseOpen>> = Mutex::new(BTreeMap::new());
 static NEXT: Mutex<usize> = Mutex::new(1);
+/// How many handles share each director `fh`: a duplicated handle shares its original's, and
+/// only the last close releases it ([`close_fuse`]). Taken after `TABLE`, never before.
+static REFS: Mutex<BTreeMap<u64, usize>> = Mutex::new(BTreeMap::new());
+
+/// A fresh synthetic handle value.
+fn next_handle() -> Option<usize> {
+    let mut next = NEXT.lock().ok()?;
+    let slot = *next;
+    *next = next.wrapping_add(1);
+    Some((slot & FILE_PAYLOAD) | SYNTH_FILE_TAG)
+}
 
 pub(crate) fn is_fuse_synth(handle: isize) -> bool {
     is_file_tagged(handle as usize)
@@ -69,11 +81,9 @@ pub(crate) fn open_fuse_at_ex(
     abs_path: Option<String>,
     append_only: bool,
 ) -> Option<isize> {
-    let mut next = NEXT.lock().ok()?;
-    let slot = *next;
-    *next = next.wrapping_add(1);
-    let handle = (slot & FILE_PAYLOAD) | SYNTH_FILE_TAG;
+    let handle = next_handle()?;
     let mut g = TABLE.lock().ok()?;
+    *REFS.lock().ok()?.entry(fh).or_insert(0) += 1;
     g.insert(
         handle,
         FuseOpen {
@@ -205,17 +215,55 @@ pub(crate) fn set_delete_on_close(handle: isize, on: bool) {
     }
 }
 
-/// Forget `handle`. Returns its director `fh`, and the path to delete now that it is closed
-/// when it was opened with `FILE_DELETE_ON_CLOSE` ([`set_delete_on_close`]).
+/// A second handle to `handle`'s file (`NtDuplicateObject` within the process): a copy of its
+/// entry sharing the director `fh`, which stays open until both are closed. The position is
+/// copied, not shared. `None` for a handle that is not in the table.
+pub(crate) fn duplicate(handle: isize) -> Option<isize> {
+    let mut g = TABLE.lock().ok()?;
+    let entry = g.get(&(handle as usize))?.clone();
+    let copy = next_handle()?;
+    *REFS.lock().ok()?.entry(entry.fh).or_insert(0) += 1;
+    g.insert(copy, entry);
+    Some(copy as isize)
+}
+
+/// Forget `handle`. Returns its director `fh` when this was the last handle to it, and the path
+/// to delete now that it is closed when it was opened with `FILE_DELETE_ON_CLOSE`
+/// ([`set_delete_on_close`]). `None` for a handle not in the table, or one whose `fh` another
+/// handle still holds ([`duplicate`]).
 pub(crate) fn close_fuse(handle: isize) -> Option<(u64, Option<String>)> {
     let mut g = TABLE.lock().ok()?;
-    g.remove(&(handle as usize))
-        .map(|e| (e.fh, e.abs_path.filter(|_| e.delete_on_close)))
+    let e = g.remove(&(handle as usize))?;
+    let mut refs = REFS.lock().ok()?;
+    let left = refs.get_mut(&e.fh).map(|n| {
+        *n -= 1;
+        *n
+    });
+    if left.unwrap_or(0) > 0 {
+        return None;
+    }
+    refs.remove(&e.fh);
+    Some((e.fh, e.abs_path.filter(|_| e.delete_on_close)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_duplicate_shares_the_file_and_only_the_last_close_releases_it() {
+        let h = open_fuse_at_ex(91, 10, false, Some(r"\??\C:\g\a.bin".into()), false).unwrap();
+        set_position(h, 4);
+        let d = duplicate(h).unwrap();
+        assert_ne!(d, h);
+        assert!(is_fuse_synth(d));
+        let v = lookup(d).unwrap();
+        assert_eq!((v.fh, v.size, v.position), (91, 10, 4));
+        assert_eq!(abs_path(d).as_deref(), Some(r"\??\C:\g\a.bin"));
+        assert_eq!(close_fuse(h), None, "the duplicate still holds the file");
+        assert_eq!(close_fuse(d), Some((91, None)));
+        assert_eq!(close_fuse(d), None);
+    }
 
     /// Two writes on one handle that both read the size before either
     /// finished: [0, 100) and [100, 200). Whichever reports last, the file

@@ -408,6 +408,54 @@ pub(crate) type NtFlushBuffersFileFn = unsafe extern "system" fn(
     *mut c_void, // IoStatusBlock
 ) -> NTSTATUS;
 
+/// `ntdll!NtFsControlFile` and `ntdll!NtDeviceIoControlFile` (one signature).
+pub(crate) type NtControlFileFn = unsafe extern "system" fn(
+    HANDLE,        // FileHandle
+    HANDLE,        // Event
+    *const c_void, // ApcRoutine
+    *const c_void, // ApcContext
+    *mut c_void,   // IoStatusBlock
+    u32,           // IoControlCode / FsControlCode
+    *const c_void, // InputBuffer
+    u32,           // InputBufferLength
+    *mut c_void,   // OutputBuffer
+    u32,           // OutputBufferLength
+) -> NTSTATUS;
+
+/// `ntdll!NtCopyFileChunk` (Windows 11 24H2 and later; what `CopyFile` copies with).
+pub(crate) type NtCopyFileChunkFn = unsafe extern "system" fn(
+    HANDLE,      // SourceHandle
+    HANDLE,      // DestHandle
+    HANDLE,      // Event
+    *mut c_void, // IoStatusBlock
+    u32,         // Length
+    *const i64,  // SourceOffset
+    *const i64,  // DestOffset
+    *const u32,  // SourceKey
+    *const u32,  // DestKey
+    u32,         // Flags
+) -> NTSTATUS;
+
+/// `ntdll!NtQueryEaFile`.
+pub(crate) type NtQueryEaFileFn = unsafe extern "system" fn(
+    HANDLE,        // FileHandle
+    *mut c_void,   // IoStatusBlock
+    *mut c_void,   // Buffer
+    u32,           // Length
+    u8,            // ReturnSingleEntry
+    *const c_void, // EaList
+    u32,           // EaListLength
+    *const u32,    // EaIndex
+    u8,            // RestartScan
+) -> NTSTATUS;
+
+/// `STATUS_INVALID_DEVICE_REQUEST`: a control code the file system does not support.
+pub(crate) const STATUS_INVALID_DEVICE_REQUEST: NTSTATUS = 0xC000_0010u32 as i32;
+/// `STATUS_NOT_A_REPARSE_POINT`.
+pub(crate) const STATUS_NOT_A_REPARSE_POINT: NTSTATUS = 0xC000_0275u32 as i32;
+/// `STATUS_NO_EAS_ON_FILE`.
+pub(crate) const STATUS_NO_EAS_ON_FILE: NTSTATUS = 0xC000_0052u32 as i32;
+
 /// `ntdll!NtQueryVolumeInformationFile`.
 pub(crate) type NtQueryVolumeInformationFileFn = unsafe extern "system" fn(
     HANDLE,      // FileHandle

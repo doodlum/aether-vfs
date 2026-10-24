@@ -2,10 +2,12 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use super::{
-    open_synth, synth_path, TRAMP_FLUSH, TRAMP_LOCK, TRAMP_READ, TRAMP_UNLOCK, TRAMP_WRITE,
+    open_synth, synth_path, TRAMP_COPY_CHUNK, TRAMP_FLUSH, TRAMP_FSCTL, TRAMP_IOCTL, TRAMP_LOCK,
+    TRAMP_QEA, TRAMP_READ, TRAMP_UNLOCK, TRAMP_WRITE,
 };
 use crate::ntdef::{
-    STATUS_END_OF_FILE, STATUS_INVALID_HANDLE, STATUS_SUCCESS, STATUS_UNSUCCESSFUL,
+    STATUS_END_OF_FILE, STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_HANDLE,
+    STATUS_NOT_A_REPARSE_POINT, STATUS_NO_EAS_ON_FILE, STATUS_SUCCESS, STATUS_UNSUCCESSFUL,
 };
 use crate::synth_file::FileView;
 use core::ffi::c_void;
@@ -142,6 +144,206 @@ pub(super) unsafe fn flush_hook_body(handle: HANDLE, iosb: *mut c_void) -> NTSTA
     }
     // SAFETY: the original NT function, called with valid NT arguments.
     unsafe { tramp(handle, iosb) }
+}
+
+/// `STATUS_PENDING`: an asynchronous handle's transfer has not finished yet.
+const STATUS_PENDING: NTSTATUS = 0x103;
+
+/// The status and count of a transfer through [`read_hook_body`] / [`write_hook_body`] into a
+/// local `IO_STATUS_BLOCK`, waited for on `handle` if it is an asynchronous real handle.
+fn settle(handle: HANDLE, status: NTSTATUS, io: &[usize; 2]) -> (NTSTATUS, usize) {
+    if status == STATUS_PENDING {
+        // SAFETY: waiting on a real file handle until its transfer completes.
+        unsafe { windows_sys::Win32::System::Threading::WaitForSingleObject(handle, u32::MAX) };
+        return (io[0] as u32 as NTSTATUS, io[1]);
+    }
+    (status, io[1])
+}
+
+/// `NtCopyFileChunk` hook. The kernel cannot copy from or to a synthetic handle (it fails
+/// "invalid handle", and `CopyFile` with it), so with one on either side the chunk is read and
+/// written through the shim's own paths: the source's served bytes, then the destination,
+/// synchronously, as the call is for a synchronous handle. Real handles on both sides pass
+/// straight through.
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn copy_chunk_hook_body(
+    src: HANDLE,
+    dst: HANDLE,
+    event: HANDLE,
+    iosb: *mut c_void,
+    length: u32,
+    src_offset: *const i64,
+    dst_offset: *const i64,
+    src_key: *const u32,
+    dst_key: *const u32,
+    flags: u32,
+) -> NTSTATUS {
+    let _hs = crate::hookstats::Timed::new(crate::hookstats::Hook::CopyChunk);
+    let Some(tramp) = TRAMP_COPY_CHUNK.get() else {
+        return STATUS_UNSUCCESSFUL;
+    };
+    let synth = |h: HANDLE| crate::synth_file::is_fuse_synth(h as isize);
+    if !synth(src) && !synth(dst) {
+        // SAFETY: the original NT function, called with the caller's NT arguments.
+        return unsafe {
+            tramp(
+                src, dst, event, iosb, length, src_offset, dst_offset, src_key, dst_key, flags,
+            )
+        };
+    }
+    let mut buf = vec![0u8; length as usize];
+    let mut io = [0usize; 2];
+    // SAFETY: our own buffer and IO_STATUS_BLOCK; the caller's offset and key pointers.
+    let read = unsafe {
+        read_hook_body(
+            src,
+            core::ptr::null_mut(),
+            core::ptr::null(),
+            core::ptr::null(),
+            io.as_mut_ptr().cast(),
+            buf.as_mut_ptr().cast(),
+            length,
+            src_offset,
+            src_key,
+        )
+    };
+    let (status, count) = settle(src, read, &io);
+    let (status, written) = if status < 0 {
+        (status, 0)
+    } else {
+        let mut io = [0usize; 2];
+        // SAFETY: as above, writing the bytes just read.
+        let write = unsafe {
+            write_hook_body(
+                dst,
+                core::ptr::null_mut(),
+                core::ptr::null(),
+                core::ptr::null(),
+                io.as_mut_ptr().cast(),
+                buf.as_mut_ptr().cast(),
+                count as u32,
+                dst_offset,
+                dst_key,
+            )
+        };
+        settle(dst, write, &io)
+    };
+    // SAFETY: the caller's IO_STATUS_BLOCK (hook/mod.rs).
+    unsafe { crate::ntbuf::iosb_set(iosb, status, written) };
+    if !event.is_null() {
+        // SAFETY: signalling the caller's own event, as a completed transfer does.
+        unsafe { windows_sys::Win32::System::Threading::SetEvent(event) };
+    }
+    status
+}
+/// `FSCTL_GET_REPARSE_POINT`: a virtual file is never a reparse point.
+const FSCTL_GET_REPARSE_POINT: u32 = 0x0009_00A8;
+
+/// What a control code on a synthetic handle gets: the answer of a file system without the
+/// feature. The kernel must never see a synthetic handle, where it fails "invalid handle":
+/// `CopyFile` probes the source with several codes and abandons the copy on that error.
+fn synthetic_control_status(code: u32) -> NTSTATUS {
+    if code == FSCTL_GET_REPARSE_POINT {
+        STATUS_NOT_A_REPARSE_POINT
+    } else {
+        STATUS_INVALID_DEVICE_REQUEST
+    }
+}
+
+/// `NtFsControlFile` hook. Synthetic handles get [`synthetic_control_status`]; real handles pass
+/// straight through.
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn fsctl_hook_body(
+    handle: HANDLE,
+    event: HANDLE,
+    apc: *const c_void,
+    apc_ctx: *const c_void,
+    iosb: *mut c_void,
+    code: u32,
+    input: *const c_void,
+    input_len: u32,
+    output: *mut c_void,
+    output_len: u32,
+) -> NTSTATUS {
+    let _hs = crate::hookstats::Timed::new(crate::hookstats::Hook::FsControl);
+    let Some(tramp) = TRAMP_FSCTL.get() else {
+        return STATUS_UNSUCCESSFUL;
+    };
+    if crate::synth_file::is_fuse_synth(handle as isize) {
+        return synthetic_control_status(code);
+    }
+    // SAFETY: the original NT function, called with the caller's NT arguments.
+    unsafe {
+        tramp(
+            handle, event, apc, apc_ctx, iosb, code, input, input_len, output, output_len,
+        )
+    }
+}
+
+/// `NtDeviceIoControlFile` hook: as [`fsctl_hook_body`]. No stats row: every socket operation
+/// passes through here.
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn ioctl_hook_body(
+    handle: HANDLE,
+    event: HANDLE,
+    apc: *const c_void,
+    apc_ctx: *const c_void,
+    iosb: *mut c_void,
+    code: u32,
+    input: *const c_void,
+    input_len: u32,
+    output: *mut c_void,
+    output_len: u32,
+) -> NTSTATUS {
+    let Some(tramp) = TRAMP_IOCTL.get() else {
+        return STATUS_UNSUCCESSFUL;
+    };
+    if crate::synth_file::is_fuse_synth(handle as isize) {
+        return synthetic_control_status(code);
+    }
+    // SAFETY: the original NT function, called with the caller's NT arguments.
+    unsafe {
+        tramp(
+            handle, event, apc, apc_ctx, iosb, code, input, input_len, output, output_len,
+        )
+    }
+}
+
+/// `NtQueryEaFile` hook. A virtual file has no extended attributes (`FileEaInformation` says
+/// so too); real handles pass straight through.
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn qea_hook_body(
+    handle: HANDLE,
+    iosb: *mut c_void,
+    buffer: *mut c_void,
+    length: u32,
+    single: u8,
+    ea_list: *const c_void,
+    ea_list_len: u32,
+    ea_index: *const u32,
+    restart: u8,
+) -> NTSTATUS {
+    let _hs = crate::hookstats::Timed::new(crate::hookstats::Hook::QueryEa);
+    let Some(tramp) = TRAMP_QEA.get() else {
+        return STATUS_UNSUCCESSFUL;
+    };
+    if crate::synth_file::is_fuse_synth(handle as isize) {
+        return STATUS_NO_EAS_ON_FILE;
+    }
+    // SAFETY: the original NT function, called with the caller's NT arguments.
+    unsafe {
+        tramp(
+            handle,
+            iosb,
+            buffer,
+            length,
+            single,
+            ea_list,
+            ea_list_len,
+            ea_index,
+            restart,
+        )
+    }
 }
 
 /// `NtWriteFile` hook. For synthetic (fuse) write handles, forward the game's

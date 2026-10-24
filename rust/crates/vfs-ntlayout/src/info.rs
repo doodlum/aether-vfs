@@ -222,9 +222,60 @@ pub fn put_file_name(name: &str, buf: &mut [u8]) -> (Fit, usize) {
     (fit, 4 + fits * 2)
 }
 
+/// The fixed part of a `FILE_STREAM_INFORMATION` entry: NextEntryOffset 0 | StreamNameLength 4 |
+/// StreamSize 8 | StreamAllocationSize 16, then the name.
+pub const STREAM_FIXED_LEN: usize = 24;
+
+/// `FILE_STREAM_INFORMATION` of a synthetic file: one entry, its unnamed data stream
+/// (`::$DATA`), of `size` bytes. A directory has no stream: nothing is written. `CopyFile` asks
+/// this of its source, to copy the streams, and walks what it gets back. Short of room for the
+/// fixed part NT says `STATUS_INFO_LENGTH_MISMATCH`; with the fixed part but not the whole name,
+/// `STATUS_BUFFER_OVERFLOW`, and the caller asks again with a larger buffer. Returns the fit and
+/// the bytes written (`IoStatusBlock.Information`).
+pub fn put_streams(buf: &mut [u8], size: u64, is_dir: bool) -> (Fit, usize) {
+    if is_dir {
+        return (Fit::Fits, 0);
+    }
+    if buf.len() < STREAM_FIXED_LEN {
+        return (Fit::Mismatch, 0);
+    }
+    let name: Vec<u16> = "::$DATA".encode_utf16().collect();
+    put_u32(buf, 0, 0);
+    put_u32(buf, 4, (name.len() * 2) as u32);
+    put_i64(buf, 8, size as i64);
+    put_i64(buf, 16, size as i64);
+    let room = (buf.len() - STREAM_FIXED_LEN) / 2;
+    if room < name.len() {
+        return (Fit::Overflow, STREAM_FIXED_LEN);
+    }
+    for (i, u) in name.iter().enumerate() {
+        let at = STREAM_FIXED_LEN + i * 2;
+        buf[at..at + 2].copy_from_slice(&u.to_le_bytes());
+    }
+    (Fit::Fits, STREAM_FIXED_LEN + name.len() * 2)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_file_has_one_unnamed_data_stream_and_a_directory_none() {
+        let mut buf = vec![0xAAu8; 64];
+        assert_eq!(put_streams(&mut buf, 1234, false), (Fit::Fits, 38));
+        assert_eq!(u32_at(&buf, 0), 0, "the only entry");
+        assert_eq!(u32_at(&buf, 4), 14);
+        assert_eq!(i64_at(&buf, 8), 1234);
+        assert_eq!(i64_at(&buf, 16), 1234);
+        let name: Vec<u16> = buf[24..38]
+            .chunks(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        assert_eq!(String::from_utf16(&name).unwrap(), "::$DATA");
+        assert_eq!(put_streams(&mut buf, 1234, true), (Fit::Fits, 0));
+        assert_eq!(put_streams(&mut [0u8; 30], 1, false), (Fit::Overflow, 24));
+        assert_eq!(put_streams(&mut [0u8; 20], 1, false), (Fit::Mismatch, 0));
+    }
 
     fn u32_at(b: &[u8], o: usize) -> u32 {
         u32::from_le_bytes(b[o..o + 4].try_into().unwrap())

@@ -15,14 +15,25 @@ use crate::ntdef::{
     FILE_NAME_INFORMATION, FILE_NETWORK_OPEN_INFORMATION, FILE_NORMALIZED_NAME_INFORMATION,
     FILE_POSITION_INFORMATION, FILE_STANDARD_INFORMATION, FILE_STAT_INFORMATION,
     OBJECT_NAME_INFORMATION, OBJECT_NAME_INFORMATION_HEADER, STATUS_BUFFER_OVERFLOW,
-    STATUS_INFO_LENGTH_MISMATCH, STATUS_INVALID_HANDLE, STATUS_OBJECT_NAME_INVALID,
-    STATUS_OBJECT_PATH_NOT_FOUND, STATUS_SUCCESS, STATUS_UNSUCCESSFUL,
+    STATUS_INFO_LENGTH_MISMATCH, STATUS_INVALID_HANDLE, STATUS_INVALID_INFO_CLASS,
+    STATUS_OBJECT_NAME_INVALID, STATUS_OBJECT_PATH_NOT_FOUND, STATUS_SUCCESS, STATUS_UNSUCCESSFUL,
 };
 use crate::synth_file::FileView;
+
+/// `FileEaInformation`: the size of the file's extended attributes (none).
+const FILE_EA_INFORMATION: u32 = 7;
+/// `FileStreamInformation`: the file's data streams.
+const FILE_STREAM_INFORMATION: u32 = 22;
+/// One `u32` each: the handle's granted access, its mode flags, its buffer alignment.
+const FILE_ACCESS_INFORMATION: u32 = 8;
+const FILE_MODE_INFORMATION: u32 = 16;
+const FILE_ALIGNMENT_INFORMATION: u32 = 17;
+/// One `BOOLEAN`: whether the file is on a remote device.
+const FILE_IS_REMOTE_DEVICE_INFORMATION: u32 = 51;
 use core::ffi::c_void;
 use std::sync::OnceLock;
 use vfs_ntlayout::spoofed_object_name;
-use vfs_ntlayout::{filetime_of, SYNTH_FILETIME};
+use vfs_ntlayout::{filetime_of, put_streams, SYNTH_FILETIME};
 use windows_sys::Win32::Foundation::{HANDLE, NTSTATUS};
 
 /// The volume every synthetic handle says it is on, where a volume serial
@@ -368,12 +379,235 @@ unsafe fn fuse_query_information(
             unsafe { crate::ntbuf::iosb_set(iosb, STATUS_SUCCESS, ATTRIBUTE_TAG_LEN) };
             STATUS_SUCCESS
         }
-        _ => {
+        FILE_STREAM_INFORMATION => {
+            // `CopyFile` asks this of its source to copy every stream, and walks the entries
+            // it gets back. The old catch-all below answered success with nothing written:
+            // it walked its own uninitialised buffer and crashed.
+            // SAFETY: `info` is non-null and valid for `length` bytes (hook/mod.rs).
+            let buf = unsafe { caller_buf(info, length as usize) };
+            let (fit, written) = put_streams(buf, size, is_dir);
+            let status = match fit {
+                Fit::Mismatch => return STATUS_INFO_LENGTH_MISMATCH,
+                Fit::Overflow => STATUS_BUFFER_OVERFLOW,
+                Fit::Fits => STATUS_SUCCESS,
+            };
             // SAFETY: same NT-pointer contract as this fn (hook/mod.rs).
-            unsafe { crate::ntbuf::iosb_set(iosb, STATUS_SUCCESS, 0) };
+            unsafe { crate::ntbuf::iosb_set(iosb, status, written) };
+            status
+        }
+        FILE_EA_INFORMATION
+        | FILE_ACCESS_INFORMATION
+        | FILE_MODE_INFORMATION
+        | FILE_ALIGNMENT_INFORMATION
+        | FILE_IS_REMOTE_DEVICE_INFORMATION => {
+            // No extended attributes, read access (FILE_GENERIC_READ), no mode flags, byte
+            // alignment, a local device.
+            let (len, value): (usize, u32) = match class {
+                FILE_ACCESS_INFORMATION => (4, 0x0012_0089),
+                FILE_IS_REMOTE_DEVICE_INFORMATION => (1, 0),
+                _ => (4, 0),
+            };
+            if (length as usize) < len {
+                return STATUS_INFO_LENGTH_MISMATCH;
+            }
+            // SAFETY: `info` is non-null and `length` covers the field (checked above).
+            let buf = unsafe { caller_buf(info, len) };
+            buf.copy_from_slice(&value.to_le_bytes()[..len]);
+            // SAFETY: same NT-pointer contract as this fn (hook/mod.rs).
+            unsafe { crate::ntbuf::iosb_set(iosb, STATUS_SUCCESS, len) };
             STATUS_SUCCESS
         }
+        _ => {
+            // A class this does not answer. Success with nothing written makes the caller
+            // read its own uninitialised buffer as the answer (as `FileStatInformation`,
+            // `FileIdInformation` and `FileStreamInformation` each did); NT's answer for a
+            // class a file system does not support is an error the caller handles.
+            STATUS_INVALID_INFO_CLASS
+        }
     }
+}
+
+/// `ObjectBasicInformation`, `ObjectTypeInformation`, `ObjectHandleFlagInformation`.
+const OBJECT_BASIC_INFORMATION: u32 = 0;
+const OBJECT_TYPE_INFORMATION: u32 = 2;
+const OBJECT_HANDLE_FLAG_INFORMATION: u32 = 4;
+
+/// A real file handle that answers for a synthetic one where only its type matters (as
+/// `regkeys::type_donor` does for keys): the `NUL` device, opened once and kept.
+fn file_type_donor() -> Option<HANDLE> {
+    static DONOR: OnceLock<Option<usize>> = OnceLock::new();
+    let donor = DONOR.get_or_init(|| {
+        let open = super::TRAMP_OPEN.get()?;
+        let oa = crate::ntbuf::OwnedOa::absolute(None, r"\??\NUL", true).ok()?;
+        let mut h: HANDLE = core::ptr::null_mut();
+        let mut iosb = [0u64; 2];
+        const FILE_READ_ATTRIBUTES: u32 = 0x80;
+        const SYNCHRONIZE: u32 = 0x0010_0000;
+        // SAFETY: the original NtOpenFile, with an owned name and a local IO_STATUS_BLOCK.
+        let st = unsafe {
+            open(
+                &mut h,
+                FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                oa.as_ptr(),
+                iosb.as_mut_ptr().cast(),
+                0x7,
+                0,
+            )
+        };
+        (st >= 0).then_some(h as usize)
+    });
+    donor.map(|h| h as HANDLE)
+}
+
+/// `NtQueryObject` on a synthetic handle, for the classes other than its name (answered by
+/// the caller): the type and basic information of a real file handle, and no handle flags. The
+/// kernel must not see the synthetic handle, where it fails "invalid handle" (`GetSecurityInfo`
+/// asks the object type first, `CopyFile` the security).
+unsafe fn synth_query_object(
+    tramp: crate::ntdef::NtQueryObjectFn,
+    class: u32,
+    info: *mut c_void,
+    length: u32,
+    ret_len: *mut u32,
+) -> NTSTATUS {
+    match class {
+        OBJECT_BASIC_INFORMATION | OBJECT_TYPE_INFORMATION => {
+            let Some(donor) = file_type_donor() else {
+                return STATUS_UNSUCCESSFUL;
+            };
+            // SAFETY: the original NT function, on a real handle, into the caller's buffer.
+            unsafe { tramp(donor, class, info, length, ret_len) }
+        }
+        OBJECT_HANDLE_FLAG_INFORMATION => {
+            // Inherit 0 | ProtectFromClose 0.
+            if !ret_len.is_null() {
+                // SAFETY: a caller-supplied out pointer (hook/mod.rs).
+                unsafe { core::ptr::write_unaligned(ret_len, 2) };
+            }
+            if info.is_null() || length < 2 {
+                return STATUS_INFO_LENGTH_MISMATCH;
+            }
+            // SAFETY: `info` is valid for `length` (>= 2) bytes (hook/mod.rs).
+            unsafe { caller_buf(info, 2) }.fill(0);
+            STATUS_SUCCESS
+        }
+        _ => STATUS_INVALID_INFO_CLASS,
+    }
+}
+
+/// `NtQuerySecurityObject` for a synthetic handle: the security descriptor of the nearest real
+/// location of its path, the file itself when it is on disk, else its closest real parent (the
+/// game folder at the latest), which is what a file there inherits. The kernel must not see the
+/// synthetic handle, where it fails "invalid handle" (`GetSecurityInfo`, `CopyFile`).
+pub(super) unsafe fn synth_query_security(
+    handle: HANDLE,
+    info: u32,
+    sd: *mut c_void,
+    length: u32,
+    needed: *mut u32,
+) -> NTSTATUS {
+    let Some(opened) = crate::synth_file::abs_path(handle as isize) else {
+        return STATUS_INVALID_HANDLE;
+    };
+    let nt = format!(
+        "\\??\\{}",
+        crate::director::strip_nt_device(&opened).trim_end_matches('\\')
+    );
+    let (Some(open), Some(query), Some(close)) = (
+        super::TRAMP_OPEN.get(),
+        super::TRAMP_QUERY_SECURITY.get(),
+        super::TRAMP_CLOSE.get(),
+    ) else {
+        return STATUS_UNSUCCESSFUL;
+    };
+    const READ_CONTROL: u32 = 0x0002_0000;
+    const SHARE_ALL: u32 = 0x7;
+    const FILE_OPEN_FOR_BACKUP_INTENT: u32 = 0x0000_4000;
+    let mut path = nt.as_str();
+    loop {
+        let Ok(oa) = crate::ntbuf::OwnedOa::absolute(None, path, true) else {
+            return STATUS_OBJECT_NAME_INVALID;
+        };
+        let mut real: HANDLE = core::ptr::null_mut();
+        let mut iosb = [0u64; 2];
+        // SAFETY: the original NT functions, with an owned name, a local IO_STATUS_BLOCK and the
+        // caller's own security-query arguments.
+        unsafe {
+            if open(
+                &mut real,
+                READ_CONTROL,
+                oa.as_ptr(),
+                iosb.as_mut_ptr().cast(),
+                SHARE_ALL,
+                FILE_OPEN_FOR_BACKUP_INTENT,
+            ) >= 0
+            {
+                let status = query(real, info, sd, length, needed);
+                close(real);
+                return status;
+            }
+        }
+        // Up one level, never past the drive (`\??\C:`).
+        match path.rfind('\\') {
+            Some(i) if path[..i].contains(':') => path = &path[..i],
+            _ => return STATUS_OBJECT_PATH_NOT_FOUND,
+        }
+    }
+}
+
+/// A real handle on the volume a synthetic handle's path is on: its drive's root, opened once per
+/// drive letter and kept.
+fn volume_donor(handle: HANDLE) -> Option<HANDLE> {
+    static DONORS: std::sync::Mutex<[usize; 26]> = std::sync::Mutex::new([0; 26]);
+    let opened = crate::synth_file::abs_path(handle as isize)?;
+    let dos = crate::director::strip_nt_device(&opened);
+    let letter = dos.chars().next()?.to_ascii_uppercase();
+    if !letter.is_ascii_uppercase() || dos.chars().nth(1) != Some(':') {
+        return None;
+    }
+    let slot = (letter as u8 - b'A') as usize;
+    let mut donors = DONORS.lock().ok()?;
+    if donors[slot] == 0 {
+        let open = super::TRAMP_OPEN.get()?;
+        let oa = crate::ntbuf::OwnedOa::absolute(None, &format!(r"\??\{letter}:\"), true).ok()?;
+        let mut h: HANDLE = core::ptr::null_mut();
+        let mut iosb = [0u64; 2];
+        const FILE_READ_ATTRIBUTES: u32 = 0x80;
+        const SYNCHRONIZE: u32 = 0x0010_0000;
+        const FILE_DIRECTORY_FILE: u32 = 0x1;
+        const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x20;
+        // SAFETY: the original NtOpenFile, with an owned name and a local IO_STATUS_BLOCK.
+        let st = unsafe {
+            open(
+                &mut h,
+                FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                oa.as_ptr(),
+                iosb.as_mut_ptr().cast(),
+                0x7,
+                FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+            )
+        };
+        if st < 0 {
+            return None;
+        }
+        donors[slot] = h as usize;
+    }
+    Some(donors[slot] as HANDLE)
+}
+
+/// `NtQueryVolumeInformationFile` on a synthetic handle, answered by the real volume its path
+/// is on ([`volume_donor`]). `None` when there is no such volume to ask.
+unsafe fn real_volume_query(
+    handle: HANDLE,
+    tramp: crate::ntdef::NtQueryVolumeInformationFileFn,
+    iosb: *mut c_void,
+    info: *mut c_void,
+    length: u32,
+    class: u32,
+) -> Option<NTSTATUS> {
+    let donor = volume_donor(handle)?;
+    // SAFETY: the original NT function, on a real handle, into the caller's buffers.
+    Some(unsafe { tramp(donor, iosb, info, length, class) })
 }
 
 /// `NtQueryVolumeInformationFile` hook — `GetFileType` needs
@@ -415,7 +649,17 @@ pub(super) unsafe fn qvol_hook_body(
             };
             return STATUS_SUCCESS;
         }
-        // Soft-success for other volume classes (size/attr) with zeros.
+        // Every other class but the volume's identity (class 1, below) is the real volume's
+        // the file's path is on: its sizes, sector sizes and file system. Zeros there made an
+        // unbuffered copy (xcopy, cmd's `copy` of a pattern) size its reads by a sector of 0.
+        if class != 1 {
+            // SAFETY: same NT-pointer contract as this fn (hook/mod.rs).
+            if let Some(st) = unsafe { real_volume_query(handle, tramp, iosb, info, length, class) }
+            {
+                return st;
+            }
+        }
+        // Soft-success with zeros where the real volume cannot answer.
         if !info.is_null() && length > 0 {
             // SAFETY: raw access under the NT-pointer contract (hook/mod.rs).
             unsafe { core::ptr::write_bytes(info as *mut u8, 0, length as usize) };
@@ -567,6 +811,10 @@ pub(super) unsafe fn qobj_hook_body(
             .unwrap_or(STATUS_OBJECT_NAME_INVALID);
     }
     if class != OBJECT_NAME_INFORMATION {
+        if crate::synth_file::is_fuse_synth(handle as isize) {
+            // SAFETY: same NT-pointer contract as this fn (hook/mod.rs).
+            return unsafe { synth_query_object(tramp, class, info, length, ret_len) };
+        }
         // SAFETY: the original NT function, called with valid NT arguments.
         return unsafe { tramp(handle, class, info, length, ret_len) };
     }

@@ -48,10 +48,13 @@ pub(crate) const SECTION_PAYLOAD: usize = SYNTH_SECTION_TAG - 1;
 #[cfg(target_pointer_width = "32")]
 pub(crate) const SECTION_PAYLOAD: usize = 0x0FFF_FFFF;
 
-/// Whether `h` carries the synthetic file tag.
+/// Whether `h` carries the synthetic file tag: the tag bit and nothing above it. A pseudo-handle
+/// (`-1` this process, `-2` this thread, ...) has every high bit set, the tag's among them, and
+/// is not a file: `DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), ...)` took it for
+/// one.
 pub(crate) fn is_file_tagged(h: usize) -> bool {
     #[cfg(target_pointer_width = "64")]
-    return h & SYNTH_FILE_TAG != 0;
+    return h >> SYNTH_FILE_TAG.trailing_zeros() == 1;
     #[cfg(target_pointer_width = "32")]
     return h >> 28 == SYNTH_FILE_TAG >> 28;
 }
@@ -59,7 +62,7 @@ pub(crate) fn is_file_tagged(h: usize) -> bool {
 /// Whether `h` carries the synthetic section tag.
 pub(crate) fn is_section_tagged(h: usize) -> bool {
     #[cfg(target_pointer_width = "64")]
-    return h & SYNTH_SECTION_TAG != 0;
+    return h >> SYNTH_SECTION_TAG.trailing_zeros() == 1;
     #[cfg(target_pointer_width = "32")]
     return h >> 28 == SYNTH_SECTION_TAG >> 28;
 }
@@ -80,6 +83,23 @@ pub(crate) fn is_section_tagged(h: usize) -> bool {
 /// `0x544a4def`, whose bit 29 is clear. The sign bit is clear, so the value is never a
 /// pseudo-handle, and none of [`SYNTH_SECTION_TAG`]'s (2^45) or [`SYNTH_FILE_TAG`]'s (2^47) bits is set.
 pub(crate) const REG_TAG: usize = 0x6000_0000;
+
+#[cfg(test)]
+mod pseudo_handle_tests {
+    use super::*;
+
+    #[test]
+    fn pseudo_handles_are_neither_files_nor_sections() {
+        for pseudo in 1..=6usize {
+            let h = 0usize.wrapping_sub(pseudo);
+            assert!(!is_file_tagged(h), "{h:#x}");
+            assert!(!is_section_tagged(h), "{h:#x}");
+        }
+        assert!(is_file_tagged(SYNTH_FILE_TAG | 5));
+        assert!(is_section_tagged(SYNTH_SECTION_TAG | 5));
+        assert!(!is_section_tagged(SYNTH_FILE_TAG | 5));
+    }
+}
 
 #[cfg(test)]
 mod tests {

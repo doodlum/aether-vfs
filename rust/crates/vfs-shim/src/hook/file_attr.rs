@@ -74,6 +74,14 @@ fn stat_by_path(
     mut note: impl FnMut(StatEvent),
     mut fill: impl FnMut(&PathStat) -> bool,
 ) -> Option<NTSTATUS> {
+    // A pattern is not a name: NT says so ("invalid name"), and `cmd`'s `copy Data\*.bsa` reads
+    // that answer as "this is a pattern". The director, asked for a file named `*.bsa`, failed.
+    if super::file_open::has_wildcard(path)
+        && crate::director::global().is_some_and(|c| c.route(path).is_some())
+    {
+        note(StatEvent::Failed);
+        return Some(crate::ntdef::STATUS_OBJECT_NAME_INVALID);
+    }
     // SAFETY: `fuse_path_attr` takes no pointer; it asks the director about a path.
     match unsafe { fuse_path_attr(path) } {
         None => note(StatEvent::Outside),

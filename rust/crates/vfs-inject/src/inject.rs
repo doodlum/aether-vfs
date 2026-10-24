@@ -824,7 +824,7 @@ unsafe fn poll_ready(
     }
 }
 
-/// The target's command line: its path and each argument, quoted.
+/// The target's command line: its path and each argument, quoted where needed.
 fn command_line(cfg: &RunConfig) -> String {
     command_line_for(&cfg.target_exe, cfg)
 }
@@ -833,9 +833,41 @@ fn command_line(cfg: &RunConfig) -> String {
 fn command_line_for(image: &str, cfg: &RunConfig) -> String {
     let mut cmdline = format!("\"{image}\"");
     for a in &cfg.args {
-        cmdline.push_str(&format!(" \"{a}\""));
+        cmdline.push(' ');
+        push_arg(&mut cmdline, a);
     }
     cmdline
+}
+
+/// Append one argument as `CommandLineToArgvW` (and the CRT) read it back. Quoted only when it
+/// has to be: `cmd.exe` takes a quoted switch (`"/c"`) for a command to run, and a plain quote
+/// around a trailing backslash (`"C:\dir\"`) escapes the closing quote.
+fn push_arg(cmdline: &mut String, arg: &str) {
+    if !arg.is_empty() && !arg.contains([' ', '\t', '\n', '\u{b}', '"']) {
+        cmdline.push_str(arg);
+        return;
+    }
+    cmdline.push('"');
+    let mut backslashes = 0;
+    for ch in arg.chars() {
+        match ch {
+            '\\' => backslashes += 1,
+            '"' => {
+                // Each backslash before a quote is doubled, and the quote itself escaped.
+                cmdline.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
+                cmdline.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                cmdline.extend(std::iter::repeat_n('\\', backslashes));
+                cmdline.push(ch);
+                backslashes = 0;
+            }
+        }
+    }
+    // Backslashes before the closing quote are doubled so that it stays a closing quote.
+    cmdline.extend(std::iter::repeat_n('\\', backslashes * 2));
+    cmdline.push('"');
 }
 
 /// Tell the suspended target its virtual image path and working directory,
@@ -951,6 +983,25 @@ pub unsafe fn resume_primary_thread(thread: HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn quoted(arg: &str) -> String {
+        let mut s = String::new();
+        push_arg(&mut s, arg);
+        s
+    }
+
+    #[test]
+    fn arguments_are_quoted_only_where_needed_and_read_back_whole() {
+        // cmd.exe reads a quoted switch as a command to run.
+        assert_eq!(quoted("/c"), "/c");
+        assert_eq!(quoted("-epicapp=Foo"), "-epicapp=Foo");
+        assert_eq!(quoted(""), "\"\"");
+        assert_eq!(quoted("exit 7"), "\"exit 7\"");
+        assert_eq!(quoted(r"C:\a dir\"), r#""C:\a dir\\""#);
+        assert_eq!(quoted(r#"say "hi""#), r#""say \"hi\"""#);
+        assert_eq!(quoted(r#"a\"b"#), r#""a\\\"b""#);
+        assert_eq!(quoted(r"C:\no\spaces\"), r"C:\no\spaces\");
+    }
 
     #[test]
     fn ready_file_contents_map_to_release_kill_or_wait() {

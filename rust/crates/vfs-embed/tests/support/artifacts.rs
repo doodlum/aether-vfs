@@ -227,7 +227,19 @@ fn move_locked_artifacts_aside(names: &[&str]) {
     }
 }
 
+/// Build and co-locate the launch artifacts, once per test binary.
+///
+/// Once, because the tests of a binary run in parallel and each calls this before taking the
+/// launch lock: a second call moving aside, rebuilding or re-copying `vfs_shim_dll.dll` or a
+/// fixture while another test launches it made that launch fail with "not found near" or
+/// `TargetExited(0xC0000142)` (the loader mapped a half-written DLL). Seen on CI and locally,
+/// on a different test each run.
 pub fn ensure_inject_artifacts() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(ensure_inject_artifacts_now);
+}
+
+fn ensure_inject_artifacts_now() {
     // Session::launch locates the shim near the current exe (the test
     // binary). Co-locate them into the profile dir if cargo left them only in
     // deps/ or they were never built for this package.
