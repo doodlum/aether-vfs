@@ -45,9 +45,16 @@ pub fn spoofed_object_name(
     }
 }
 
-/// Bytes of the `UNICODE_STRING` header an `OBJECT_NAME_INFORMATION` opens with (two lengths, 4
-/// bytes of padding, and the `Buffer` pointer on a 64-bit target).
-pub const OBJECT_NAME_INFORMATION_HEADER: usize = 16;
+/// Bytes of the `UNICODE_STRING` header an `OBJECT_NAME_INFORMATION` opens with, in a process
+/// whose pointers are `ptr` bytes wide: two `u16` lengths, padding to the pointer's alignment, and
+/// the `Buffer` pointer. 16 on a 64-bit target, 8 on a 32-bit one.
+pub const fn object_name_information_header(ptr: usize) -> usize {
+    2 * ptr
+}
+
+/// [`object_name_information_header`] for this target.
+pub const OBJECT_NAME_INFORMATION_HEADER: usize =
+    object_name_information_header(core::mem::size_of::<usize>());
 
 /// What [`put_object_name`] found: how much room the answer needs, and whether the buffer had it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,25 +66,42 @@ pub struct ObjectNameReply {
     pub fit: Fit,
 }
 
-/// Write `name` as an `OBJECT_NAME_INFORMATION` into `buf`, following the too-small-buffer
-/// contract measured on Windows 11 and Wine 11 alike: under the 16-byte header is
+/// Write `name` as an `OBJECT_NAME_INFORMATION` into `buf`, laid out for this target: see
+/// [`put_object_name_for`].
+pub fn put_object_name(name: &str, buf: &mut [u8], buffer_addr: usize) -> Option<ObjectNameReply> {
+    put_object_name_for(name, buf, buffer_addr as u64, core::mem::size_of::<usize>())
+}
+
+/// Write `name` as an `OBJECT_NAME_INFORMATION` into `buf`, for a process whose pointers are
+/// `ptr` bytes wide, following the too-small-buffer contract measured on Windows 11 and Wine 11
+/// alike: under the header ([`object_name_information_header`]: 16 bytes on 64-bit) is
 /// `STATUS_INFO_LENGTH_MISMATCH`, the header or more but under `required` is
 /// `STATUS_BUFFER_OVERFLOW`, and in both nothing is written. A caller that size-probes loops or
 /// fails unless this is exact.
 ///
 /// `buffer_addr` is the address `buf` starts at: both hosts point the `UNICODE_STRING::Buffer`
-/// at the caller's own buffer, 16 bytes in, so the answer has to carry it.
+/// at the caller's own buffer, just past the header, so the answer has to carry it.
 ///
 /// `None` if the name cannot be described at all (it does not fit a `UNICODE_STRING`, whose
-/// `MaximumLength` is a `u16` that must cover the NUL), in which case nothing was written.
-pub fn put_object_name(name: &str, buf: &mut [u8], buffer_addr: usize) -> Option<ObjectNameReply> {
+/// `MaximumLength` is a `u16` that must cover the NUL), or `ptr` is neither 4 nor 8, in which
+/// case nothing was written.
+pub fn put_object_name_for(
+    name: &str,
+    buf: &mut [u8],
+    buffer_addr: u64,
+    ptr: usize,
+) -> Option<ObjectNameReply> {
+    if ptr != 4 && ptr != 8 {
+        return None;
+    }
+    let header = object_name_information_header(ptr);
     let units: Vec<u16> = name.encode_utf16().collect();
     let name_bytes = units.len() * 2;
     if name_bytes + 2 > u16::MAX as usize {
         return None;
     }
-    let required = OBJECT_NAME_INFORMATION_HEADER + name_bytes + 2;
-    let fit = if buf.len() < OBJECT_NAME_INFORMATION_HEADER {
+    let required = header + name_bytes + 2;
+    let fit = if buf.len() < header {
         Fit::Mismatch
     } else if buf.len() < required {
         Fit::Overflow
@@ -87,10 +111,10 @@ pub fn put_object_name(name: &str, buf: &mut [u8], buffer_addr: usize) -> Option
     if fit == Fit::Fits {
         buf[0..2].copy_from_slice(&(name_bytes as u16).to_le_bytes());
         buf[2..4].copy_from_slice(&((name_bytes + 2) as u16).to_le_bytes());
-        buf[4..8].fill(0);
-        let ptr = buffer_addr.wrapping_add(OBJECT_NAME_INFORMATION_HEADER);
-        buf[8..8 + core::mem::size_of::<usize>()].copy_from_slice(&ptr.to_le_bytes());
-        let dst = &mut buf[OBJECT_NAME_INFORMATION_HEADER..required];
+        buf[4..ptr].fill(0);
+        let at = buffer_addr.wrapping_add(header as u64);
+        buf[ptr..header].copy_from_slice(&at.to_le_bytes()[..ptr]);
+        let dst = &mut buf[header..required];
         for (i, u) in units.iter().enumerate() {
             dst[i * 2..i * 2 + 2].copy_from_slice(&u.to_le_bytes());
         }
@@ -214,7 +238,7 @@ mod tests {
     #[test]
     fn the_answer_carries_lengths_a_pointer_into_the_buffer_and_a_nul() {
         let mut b = vec![0xEEu8; 64];
-        let r = put_object_name(r"\??\C:\x", &mut b, 0x1000).unwrap();
+        let r = put_object_name_for(r"\??\C:\x", &mut b, 0x1000, 8).unwrap();
         let name_bytes = r"\??\C:\x".len() * 2;
         assert_eq!(
             r,
@@ -225,7 +249,8 @@ mod tests {
         );
         assert_eq!(u16::from_le_bytes([b[0], b[1]]) as usize, name_bytes);
         assert_eq!(u16::from_le_bytes([b[2], b[3]]) as usize, name_bytes + 2);
-        assert_eq!(usize::from_le_bytes(b[8..16].try_into().unwrap()), 0x1010);
+        assert_eq!(&b[4..8], &[0; 4], "padding before the pointer");
+        assert_eq!(u64::from_le_bytes(b[8..16].try_into().unwrap()), 0x1010);
         assert_eq!(&b[16..18], &[b'\\', 0]);
         assert_eq!(
             &b[16 + name_bytes..16 + name_bytes + 2],
@@ -234,29 +259,68 @@ mod tests {
         );
     }
 
-    /// The measured contract: 0 and 8 bytes are a length mismatch, 16 (header only) and
+    /// A 32-bit process's `UNICODE_STRING` is 8 bytes: the pointer follows the lengths with no
+    /// padding, and the name starts 8 bytes in.
+    #[test]
+    fn a_32_bit_answer_has_an_8_byte_header() {
+        assert_eq!(object_name_information_header(4), 8);
+        let mut b = vec![0xEEu8; 64];
+        let r = put_object_name_for(r"\??\C:\x", &mut b, 0x1000, 4).unwrap();
+        let name_bytes = r"\??\C:\x".len() * 2;
+        assert_eq!((r.required, r.fit), (8 + name_bytes + 2, Fit::Fits));
+        assert_eq!(u16::from_le_bytes([b[0], b[1]]) as usize, name_bytes);
+        assert_eq!(u32::from_le_bytes(b[4..8].try_into().unwrap()), 0x1008);
+        assert_eq!(&b[8..10], &[b'\\', 0]);
+        assert_eq!(&b[8 + name_bytes..8 + name_bytes + 2], &[0, 0]);
+        assert!(b[8 + name_bytes + 2..].iter().all(|x| *x == 0xEE));
+    }
+
+    /// This target's constant and wrapper agree with the width-explicit forms.
+    #[test]
+    fn the_native_layout_is_this_targets_width() {
+        let ptr = core::mem::size_of::<usize>();
+        assert_eq!(
+            OBJECT_NAME_INFORMATION_HEADER,
+            object_name_information_header(ptr)
+        );
+        let (mut a, mut b) = (vec![0u8; 64], vec![0u8; 64]);
+        put_object_name("ab", &mut a, 0x2000).unwrap();
+        put_object_name_for("ab", &mut b, 0x2000, ptr).unwrap();
+        assert_eq!(a, b);
+    }
+
+    /// The measured contract (64-bit): 0 and 8 bytes are a length mismatch, 16 (header only) and
     /// `required - 1` are an overflow, `required` fits; `required` is reported in all of them.
+    /// The 32-bit form keeps the same shape around its 8-byte header.
     #[test]
     fn the_too_small_buffer_contract() {
-        let required = 16 + 4 + 2;
-        for (len, fit) in [
-            (0, Fit::Mismatch),
-            (8, Fit::Mismatch),
-            (15, Fit::Mismatch),
-            (16, Fit::Overflow),
-            (required - 1, Fit::Overflow),
-            (required, Fit::Fits),
-        ] {
-            let mut b = vec![0xEEu8; len];
-            let r = put_object_name("ab", &mut b, 0).unwrap();
-            assert_eq!((r.required, r.fit), (required, fit), "buffer of {len}");
-            if fit != Fit::Fits {
-                assert!(
-                    b.iter().all(|x| *x == 0xEE),
-                    "wrote into a short buffer of {len}"
+        for ptr in [8usize, 4] {
+            let header = object_name_information_header(ptr);
+            let required = header + 4 + 2;
+            for (len, fit) in [
+                (0, Fit::Mismatch),
+                (header / 2, Fit::Mismatch),
+                (header - 1, Fit::Mismatch),
+                (header, Fit::Overflow),
+                (required - 1, Fit::Overflow),
+                (required, Fit::Fits),
+            ] {
+                let mut b = vec![0xEEu8; len];
+                let r = put_object_name_for("ab", &mut b, 0, ptr).unwrap();
+                assert_eq!(
+                    (r.required, r.fit),
+                    (required, fit),
+                    "{ptr}-byte pointers, buffer of {len}"
                 );
+                if fit != Fit::Fits {
+                    assert!(
+                        b.iter().all(|x| *x == 0xEE),
+                        "wrote into a short buffer of {len}"
+                    );
+                }
             }
         }
+        assert_eq!(put_object_name_for("ab", &mut [0u8; 64], 0, 2), None);
     }
 
     #[test]

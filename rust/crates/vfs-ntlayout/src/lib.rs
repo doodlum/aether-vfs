@@ -3,10 +3,12 @@
 //! `IO_STATUS_BLOCK` write); everything that is arithmetic on bytes lives here.
 #![forbid(unsafe_code)]
 
-// `objname` writes a native-width pointer and `rename` reads a `usize` from 8 bytes; both
-// assume the 64-bit NT layouts. Fail the build rather than misread on a 32-bit target.
-#[cfg(not(target_pointer_width = "64"))]
-compile_error!("vfs-ntlayout encodes the 64-bit NT layouts and needs a 64-bit target");
+// Two layouts here hold a pointer, `objname` (`UNICODE_STRING::Buffer`) and `rename`
+// (`RootDirectory`); each has a `_for` form taking the pointer width, so both the 64-bit and the
+// 32-bit (WOW64 guest) layouts are tested on any host, and a plain form for this target. Every
+// other layout is pointer-free: its `LARGE_INTEGER`s are 8-aligned on both targets.
+#[cfg(not(any(target_pointer_width = "64", target_pointer_width = "32")))]
+compile_error!("vfs-ntlayout encodes the 64-bit and 32-bit NT layouts only");
 
 mod dirinfo;
 mod disposition;
