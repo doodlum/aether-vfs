@@ -22,7 +22,7 @@ use crate::synth_file::FileView;
 use core::ffi::c_void;
 use std::sync::OnceLock;
 use vfs_ntlayout::spoofed_object_name;
-use vfs_ntlayout::SYNTH_FILETIME;
+use vfs_ntlayout::{filetime_of, SYNTH_FILETIME};
 use windows_sys::Win32::Foundation::{HANDLE, NTSTATUS};
 
 /// The volume every synthetic handle says it is on, where a volume serial
@@ -129,6 +129,20 @@ pub(super) fn host_name_convention() -> &'static str {
     })
 }
 
+/// The time a served handle's file reports, as a `FILETIME`: the provider's, asked by the
+/// handle's path exactly as the by-name queries ask (`file_attr`), so the two always agree; the
+/// synthetic time when the provider has none or the handle has no recorded path.
+fn handle_time(handle: HANDLE) -> i64 {
+    let mtime = (|| {
+        let path = crate::synth_file::abs_path(handle as isize)?;
+        let client = crate::director::global()?;
+        let (root, vp) = client.route(&path)?;
+        let attr = client.getattr(root, &vp).ok()?;
+        attr.found.then_some(attr.mtime)
+    })();
+    mtime.map_or(SYNTH_FILETIME, filetime_of)
+}
+
 /// Answer handle-based information queries for director FUSE synth handles.
 unsafe fn fuse_query_information(
     handle: HANDLE,
@@ -157,7 +171,7 @@ unsafe fn fuse_query_information(
             // SAFETY: `info` is non-null and `length` covers the structure (checked above).
             let buf = unsafe { caller_buf(info, BASIC_LEN) };
             buf.fill(0);
-            put_basic(buf, SYNTH_FILETIME, attributes(is_dir));
+            put_basic(buf, handle_time(handle), attributes(is_dir));
             // SAFETY: same NT-pointer contract as this fn (hook/mod.rs).
             unsafe {
                 crate::ntbuf::iosb_set(
@@ -226,7 +240,7 @@ unsafe fn fuse_query_information(
             }
             // SAFETY: `info` is non-null and `length` covers the structure (checked above).
             let buf = unsafe { caller_buf(info, NETWORK_OPEN_LEN) };
-            put_network_open(buf, SYNTH_FILETIME, size, attributes(is_dir));
+            put_network_open(buf, handle_time(handle), size, attributes(is_dir));
             // SAFETY: same NT-pointer contract as this fn (hook/mod.rs).
             unsafe {
                 crate::ntbuf::iosb_set(
@@ -251,7 +265,7 @@ unsafe fn fuse_query_information(
             let buf = unsafe { caller_buf(info, ALL_PREFIX_LEN) };
             put_all_prefix(
                 buf,
-                SYNTH_FILETIME,
+                handle_time(handle),
                 is_dir,
                 size,
                 synth_file_id(handle),
@@ -334,7 +348,7 @@ unsafe fn fuse_query_information(
             put_stat(
                 buf,
                 synth_file_id(handle),
-                SYNTH_FILETIME,
+                handle_time(handle),
                 size,
                 attributes(is_dir),
                 0x0012_0089,

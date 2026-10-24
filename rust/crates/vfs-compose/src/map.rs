@@ -80,7 +80,9 @@ impl MapProvider {
         for (vpath, host) in entries {
             let vpath = vpath.as_ref();
             let parts = split(vpath).ok_or_else(|| MapError::BadPath(vpath.to_owned()))?;
-            let (name, parents) = parts.split_last().expect("split never returns an empty list");
+            let (name, parents) = parts
+                .split_last()
+                .expect("split never returns an empty list");
             let mut dir = &mut root;
             for part in parents {
                 let slot = dir
@@ -130,7 +132,9 @@ impl MapProvider {
         }
         let parts = split(rel).ok_or_else(vfs_provider::bad_request)?;
         let mut dir = &self.root;
-        let (name, parents) = parts.split_last().expect("split never returns an empty list");
+        let (name, parents) = parts
+            .split_last()
+            .expect("split never returns an empty list");
         for part in parents {
             match dir.children.get(&vfs_core::fold(part)) {
                 Some((_, Node::Dir(d))) => dir = d,
@@ -185,7 +189,9 @@ fn file_stat(host: &Path) -> Result<Option<Stat>, i32> {
         Ok(m) if m.is_file() => Ok(Some(Stat {
             kind: KIND_FILE,
             size: m.len(),
-            mtime: 0,
+            // The host file's own time, as a hard link to it would show: games that order
+            // plugins by file time (Oblivion, Fallout 3 and New Vegas) need it.
+            mtime: crate::disk::mtime_secs(&m),
         })),
         Ok(_) => Ok(None),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -307,7 +313,9 @@ mod tests {
         std::fs::create_dir_all(dir.join("mod-b")).unwrap();
         let mut entries = Vec::new();
         for (i, (rel, body)) in vfs_provider::FIXTURE_FILES.iter().enumerate() {
-            let host = dir.join(if i % 2 == 0 { "mod-a" } else { "mod-b" }).join(format!("f{i}"));
+            let host = dir
+                .join(if i % 2 == 0 { "mod-a" } else { "mod-b" })
+                .join(format!("f{i}"));
             std::fs::write(&host, body).unwrap();
             entries.push((rel.to_string(), host));
         }

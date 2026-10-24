@@ -111,6 +111,8 @@ pub(crate) enum ReadStyle {
 struct Entry {
     bytes: Vec<u8>,
     style: ReadStyle,
+    /// Seconds since the Unix epoch, as a provider reports it; 0 for none.
+    mtime: i64,
 }
 
 /// Per-vpath request tallies. Keyed by vpath rather than kept as a single
@@ -314,10 +316,28 @@ impl Fake {
     /// Add a file to the provider graph. `vpath` is the folded, `/`-joined
     /// remainder the shim builds from the path (`Data\A.esp` -> `data/a.esp`).
     pub(crate) fn with(mut self, vpath: &str, bytes: Vec<u8>, style: ReadStyle) -> Fake {
-        self.files
+        self.files.get_mut().unwrap().insert(
+            vpath.to_ascii_lowercase(),
+            Entry {
+                bytes,
+                style,
+                mtime: 0,
+            },
+        );
+        self
+    }
+
+    /// Give a file a modification time (seconds since the Unix epoch), as a provider whose host
+    /// file has one reports it.
+    pub(crate) fn with_mtime(mut self, vpath: &str, mtime: i64) -> Fake {
+        if let Some(e) = self
+            .files
             .get_mut()
             .unwrap()
-            .insert(vpath.to_ascii_lowercase(), Entry { bytes, style });
+            .get_mut(&vpath.to_ascii_lowercase())
+        {
+            e.mtime = mtime;
+        }
         self
     }
 
@@ -368,7 +388,7 @@ impl Fake {
                         found: found.is_some(),
                         is_dir: false,
                         size: found.map(|e| e.bytes.len() as u64).unwrap_or(0),
-                        mtime: 0,
+                        mtime: found.map_or(0, |e| e.mtime),
                     }),
                 )
             }
@@ -401,22 +421,23 @@ impl Fake {
                 };
                 let mut out: Vec<P::DirEntryWire> = Vec::new();
                 let mut seen: Vec<String> = Vec::new();
-                let push = |name: &str, is_dir: bool, size: u64, seen: &mut Vec<String>| {
-                    if seen.iter().any(|s| s == name) {
-                        return None;
-                    }
-                    seen.push(name.to_string());
-                    Some(P::DirEntryWire {
-                        name: name.to_string(),
-                        is_dir,
-                        size,
-                        mtime: 0,
-                    })
-                };
+                let push =
+                    |name: &str, is_dir: bool, size: u64, mtime: i64, seen: &mut Vec<String>| {
+                        if seen.iter().any(|s| s == name) {
+                            return None;
+                        }
+                        seen.push(name.to_string());
+                        Some(P::DirEntryWire {
+                            name: name.to_string(),
+                            is_dir,
+                            size,
+                            mtime,
+                        })
+                    };
                 for d in &self.dirs {
                     if let Some(rest) = d.strip_prefix(&prefix) {
                         if !rest.is_empty() && !rest.contains('/') {
-                            if let Some(e) = push(rest, true, 0, &mut seen) {
+                            if let Some(e) = push(rest, true, 0, 0, &mut seen) {
                                 out.push(e);
                             }
                         }
@@ -427,7 +448,8 @@ impl Fake {
                         if rest.is_empty() || rest.contains('/') {
                             continue;
                         }
-                        if let Some(w) = push(rest, false, e.bytes.len() as u64, &mut seen) {
+                        if let Some(w) = push(rest, false, e.bytes.len() as u64, e.mtime, &mut seen)
+                        {
                             out.push(w);
                         }
                     }
@@ -511,6 +533,7 @@ impl Fake {
                             Entry {
                                 bytes: Vec::new(),
                                 style: ReadStyle::Whole,
+                                mtime: 0,
                             },
                         );
                     } else if flags & P::OPEN_TRUNC != 0 {

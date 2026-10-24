@@ -28,10 +28,9 @@ pub struct DirItem {
 /// one that refuses to boot.
 ///
 /// Not every provider has times: a Steam depot manifest has none, so ocm's
-/// depot provider supplies `mtime: 0` honestly. A directory listing reports a
-/// provider's own time where it has one and this where it has none
-/// ([`write_dir_info`]); a stat, whose reply carries no time, always reports
-/// this.
+/// depot provider supplies `mtime: 0` honestly. A listing and a stat (by path
+/// or by handle) report a provider's own time where it has one, as a hard link
+/// to the file would ([`filetime_of`]), and this where it has none.
 ///
 /// 2024-01-01T00:00:00Z, in 100 ns ticks since 1601.
 pub const SYNTH_FILETIME: i64 = 133_485_408_000_000_000;
