@@ -51,7 +51,8 @@ fn hook_names_cover_every_variant() {
     assert_eq!(NAMES.len(), N);
     // The last variant must index the last name, or a hook silently
     // reports under a neighbour's label.
-    assert_eq!(Hook::CopyChunk as usize, N - 1);
+    assert_eq!(Hook::FlushVirtual as usize, N - 1);
+    assert_eq!(NAMES[Hook::FlushVirtual as usize], "NtFlushVirtualMemory");
     assert_eq!(NAMES[Hook::CopyChunk as usize], "NtCopyFileChunk");
     assert_eq!(NAMES[Hook::FsControl as usize], "NtFsControlFile");
     assert_eq!(NAMES[Hook::QueryEa as usize], "NtQueryEaFile");

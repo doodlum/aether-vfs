@@ -436,6 +436,14 @@ pub(crate) type NtCopyFileChunkFn = unsafe extern "system" fn(
     u32,         // Flags
 ) -> NTSTATUS;
 
+/// `ntdll!NtFlushVirtualMemory` (what `FlushViewOfFile` calls).
+pub(crate) type NtFlushVirtualMemoryFn = unsafe extern "system" fn(
+    HANDLE,           // ProcessHandle
+    *mut *mut c_void, // BaseAddress (in/out)
+    *mut usize,       // RegionSize (in/out)
+    *mut c_void,      // IoStatus
+) -> NTSTATUS;
+
 /// `ntdll!NtQueryEaFile`.
 pub(crate) type NtQueryEaFileFn = unsafe extern "system" fn(
     HANDLE,        // FileHandle

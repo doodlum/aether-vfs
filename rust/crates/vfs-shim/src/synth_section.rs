@@ -134,6 +134,18 @@ pub(crate) fn has_view_in(base: usize, len: usize) -> bool {
     }
 }
 
+/// Whether `addr` lies inside a synthetic mapped view (anywhere in it, not only at its base).
+pub(crate) fn in_synth_view(addr: usize) -> bool {
+    SYNTH_VIEWS
+        .lock()
+        .map(|v| {
+            v.range(..=addr)
+                .next_back()
+                .is_some_and(|(base, view)| addr < base.saturating_add(view.length as usize))
+        })
+        .unwrap_or(false)
+}
+
 /// Whether `base` is a synthetic mapped view (should no-op on UnmapView).
 pub(crate) fn is_synth_view(base: usize) -> bool {
     SYNTH_VIEWS
@@ -158,5 +170,25 @@ pub(crate) fn unmap_view(base: usize) -> bool {
             true
         }
         None => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_address_anywhere_in_a_view_is_in_it_and_one_past_it_is_not() {
+        let base = 0x7fff_0001_0000usize;
+        let handle = register_mapped_image(base, 0x3000).expect("section");
+        let (view, size) = map_view(handle, 0x1000, 0).expect("view");
+        assert_eq!((view, size), (base + 0x1000, 0x2000));
+        assert!(in_synth_view(view));
+        assert!(in_synth_view(view + 0x1fff));
+        assert!(!in_synth_view(view + 0x2000));
+        assert!(!in_synth_view(view - 1));
+        assert!(unmap_view(view));
+        assert!(!in_synth_view(view));
+        close_section(handle);
     }
 }

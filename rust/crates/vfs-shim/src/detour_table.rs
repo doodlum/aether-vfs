@@ -399,6 +399,20 @@ macro_rules! detour_table {
                 ) -> NTSTATUS,
                 on_panic: STATUS_HOOK_PANICKED,
             }
+            // `FlushViewOfFile` of a synthetic view, which is private memory the kernel will not flush.
+            {
+                export: "NtFlushVirtualMemory",
+                stat: [FlushVirtual = 62],
+                tramp: TRAMP_FLUSH_VIRTUAL: NtFlushVirtualMemoryFn,
+                install: Optional, group: File, flags: [],
+                hook: flush_virtual_hook = flush_virtual_hook_body(
+                    process: HANDLE,
+                    base: *mut *mut c_void,
+                    size: *mut usize,
+                    iosb: *mut c_void,
+                ) -> NTSTATUS,
+                on_panic: STATUS_HOOK_PANICKED,
+            }
             {
                 export: "NtQueryEaFile",
                 stat: [QueryEa = 60],

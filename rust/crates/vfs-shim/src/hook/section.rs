@@ -1,7 +1,9 @@
 //! Sections and views: `NtCreateSection`, `NtMapViewOfSection`, `NtUnmapViewOfSection`.
 #![deny(unsafe_op_in_unsafe_fn)]
 
-use super::{ShimIoGuard, TRAMP_CREATE_SECTION, TRAMP_MAP_VIEW, TRAMP_UNMAP_VIEW};
+use super::{
+    ShimIoGuard, TRAMP_CREATE_SECTION, TRAMP_FLUSH_VIRTUAL, TRAMP_MAP_VIEW, TRAMP_UNMAP_VIEW,
+};
 use crate::ntdef::{
     NtCreateSectionFn, ObjectAttributes, SEC_IMAGE, STATUS_INVALID_FILE_FOR_SECTION,
     STATUS_INVALID_HANDLE, STATUS_SECTION_TOO_BIG, STATUS_SUCCESS, STATUS_UNSUCCESSFUL,
@@ -453,6 +455,37 @@ pub(super) unsafe fn unmap_view_hook_body(process: HANDLE, base: *mut c_void) ->
     }
     // SAFETY: the original NT function, called with valid NT arguments.
     unsafe { tramp(process, base) }
+}
+
+/// `NtFlushVirtualMemory` hook (`FlushViewOfFile`). A synthetic view is the shim's own private
+/// memory, not a file mapping, so the kernel refuses to flush it (`STATUS_NOT_MAPPED_DATA`,
+/// "Attempt to access invalid address"): .NET's `MemoryMappedViewAccessor.Dispose` flushes and
+/// throws with it (SpaceCore reading its own DLL with `PEReader`). There is no file to write
+/// back, so a flush inside one succeeds having flushed nothing.
+pub(super) unsafe fn flush_virtual_hook_body(
+    process: HANDLE,
+    base: *mut *mut c_void,
+    size: *mut usize,
+    iosb: *mut c_void,
+) -> NTSTATUS {
+    let _hs = crate::hookstats::Timed::new(crate::hookstats::Hook::FlushVirtual);
+    let Some(tramp) = TRAMP_FLUSH_VIRTUAL.get() else {
+        return STATUS_UNSUCCESSFUL;
+    };
+    let ours = process as isize == -1 && !base.is_null() && {
+        // SAFETY: the caller's in/out base pointer, checked non-null.
+        let addr = unsafe { core::ptr::read_unaligned(base) } as usize;
+        crate::synth_section::in_synth_view(addr)
+    };
+    if !ours {
+        // SAFETY: the original NT function, called with the caller's NT arguments.
+        return unsafe { tramp(process, base, size, iosb) };
+    }
+    if !iosb.is_null() {
+        // SAFETY: the caller's IO_STATUS_BLOCK.
+        unsafe { crate::ntbuf::iosb_set(iosb, STATUS_SUCCESS, 0) };
+    }
+    STATUS_SUCCESS
 }
 
 /// Where images served from the VFS are written for the loader to map: beside
