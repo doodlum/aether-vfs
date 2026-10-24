@@ -17,6 +17,9 @@
 //! No existing section byte moves. The one risk is a wrapper that also hashes
 //! its headers; the caller gates on that and falls back to injection.
 //!
+//! PE32+ (x64) and PE32 (x86, a WOW64 guest) images are both patched: they
+//! differ only in where the data directories sit and in the thunk width.
+//!
 //! This module is pure: it parses header bytes and builds the region and the
 //! header edits. Reading the mapped image, allocating and writing it back is
 //! the caller's (`vfs-inject`, Windows only), because in a mapped image an
@@ -45,6 +48,9 @@ pub struct MemPatchPlan {
     /// Header offset of the bound-import directory entry, if the image has that
     /// slot; cleared so the loader does not use a now-wrong bound table.
     pub bound_dir_off: Option<u32>,
+    /// Bytes in one import thunk: 8 for a PE32+ (x64) image, 4 for a PE32
+    /// (x86) one.
+    pub thunk: u32,
 }
 
 /// The region to write and the header bytes to change, both ready to apply.
@@ -67,18 +73,21 @@ pub fn plan_mem_patch(headers: &[u8]) -> Result<MemPatchPlan, &'static str> {
     if headers.get(e_lfanew..e_lfanew + 4) != Some(&b"PE\0\0"[..]) {
         return Err("bad PE signature");
     }
-    if headers.len() < e_lfanew + 24 + 240 {
+    if headers.len() < e_lfanew + 24 + 2 {
         return Err("headers shorter than the PE and optional headers");
     }
     let n_sections = rd_u16(headers, e_lfanew + 6) as usize;
     let size_opt = rd_u16(headers, e_lfanew + 20) as usize;
     let opt = e_lfanew + 24;
-    if rd_u16(headers, opt) != 0x20B {
-        return Err("only PE32+ (x64) is patched in memory");
-    }
+    // A PE32 (x86) image differs only in where the data directories start (it
+    // has `BaseOfData` and 4-byte stack and heap sizes) and in its thunk size.
+    let (n_dirs_off, dd, thunk) = match rd_u16(headers, opt) {
+        0x20B => (opt + 108, opt + 112, 8),
+        0x10B => (opt + 92, opt + 96, 4),
+        _ => return Err("unknown optional header magic"),
+    };
     let section_alignment = rd_u32(headers, opt + 32);
     let size_of_image = rd_u32(headers, opt + 56);
-    let (n_dirs_off, dd) = (opt + 108, opt + 112);
     if headers.len() < dd + 16 * 8 {
         return Err("headers shorter than the data directories");
     }
@@ -103,6 +112,7 @@ pub fn plan_mem_patch(headers: &[u8]) -> Result<MemPatchPlan, &'static str> {
         has_bind_section,
         import_dir_off: (dd + IMPORT * 8) as u32,
         bound_dir_off: (n_dirs > BOUND).then_some((dd + BOUND * 8) as u32),
+        thunk,
     })
 }
 
@@ -110,8 +120,6 @@ const IMPORT: usize = 1;
 const BOUND: usize = 11;
 /// One `IMAGE_IMPORT_DESCRIPTOR`.
 const DESC: usize = 20;
-/// A PE32+ thunk.
-const THUNK: usize = 8;
 
 /// The first RVA the caller should try to place the region at: just past the
 /// image, section-aligned, so it is close enough that `base + rva` still fits
@@ -138,10 +146,11 @@ pub fn build_mem_patch(
     let func = SHIM_IMPORT_SYMBOL;
     let n_old = old_descriptors.len() / DESC;
 
+    let thunk = plan.thunk as usize;
     let desc_len = (n_old + 2) * DESC;
     let ilt_off = align_up(desc_len as u32, 8) as usize;
-    let iat_off = ilt_off + 2 * THUNK;
-    let hint_off = iat_off + 2 * THUNK;
+    let iat_off = ilt_off + 2 * thunk;
+    let hint_off = iat_off + 2 * thunk;
     let name_off = align_up((hint_off + 2 + func.len() + 1) as u32, 2) as usize;
     let body_len = name_off + dll.len() + 1;
     let r = region_rva as usize;
@@ -190,9 +199,21 @@ mod tests {
     /// A minimal PE32+ header with one section and `n_dirs` data directories,
     /// the import directory pointing at `imp_rva`.
     fn headers(imp_rva: u32, n_dirs: u32, bind: bool, size_of_image: u32) -> Vec<u8> {
+        headers_of(true, imp_rva, n_dirs, bind, size_of_image)
+    }
+
+    /// [`headers`], PE32+ or PE32 (whose data directories start 16 bytes
+    /// earlier, in a 224-byte optional header).
+    fn headers_of(
+        plus: bool,
+        imp_rva: u32,
+        n_dirs: u32,
+        bind: bool,
+        size_of_image: u32,
+    ) -> Vec<u8> {
         let e_lfanew = 0x80usize;
         let opt = e_lfanew + 24;
-        let size_opt = 240usize;
+        let size_opt = if plus { 240usize } else { 224 };
         let sect = opt + size_opt;
         let mut h = vec![0u8; sect + 40];
         h[..2].copy_from_slice(b"MZ");
@@ -200,11 +221,16 @@ mod tests {
         h[e_lfanew..e_lfanew + 4].copy_from_slice(b"PE\0\0");
         h[e_lfanew + 6..e_lfanew + 8].copy_from_slice(&1u16.to_le_bytes()); // sections
         h[e_lfanew + 20..e_lfanew + 22].copy_from_slice(&(size_opt as u16).to_le_bytes());
-        h[opt..opt + 2].copy_from_slice(&0x20Bu16.to_le_bytes()); // PE32+
+        let magic: u16 = if plus { 0x20B } else { 0x10B };
+        h[opt..opt + 2].copy_from_slice(&magic.to_le_bytes());
         wr_u32(&mut h, opt + 32, 0x1000); // section alignment
         wr_u32(&mut h, opt + 56, size_of_image); // SizeOfImage
-        wr_u32(&mut h, opt + 108, n_dirs);
-        let dd = opt + 112;
+        let (n_dirs_off, dd) = if plus {
+            (opt + 108, opt + 112)
+        } else {
+            (opt + 92, opt + 96)
+        };
+        wr_u32(&mut h, n_dirs_off, n_dirs);
         wr_u32(&mut h, dd + IMPORT * 8, imp_rva);
         wr_u32(&mut h, dd + IMPORT * 8 + 4, 40);
         if bind {
@@ -223,6 +249,45 @@ mod tests {
         assert_eq!(p.section_alignment, 0x1000);
         assert!(p.has_bind_section);
         assert_eq!(p.bound_dir_off, Some((0x80 + 24 + 112 + BOUND * 8) as u32));
+    }
+
+    /// A PE32 (32-bit) image reads its directories 16 bytes earlier and gets
+    /// 4-byte thunks: the lookup table, the address table and the hint/name
+    /// follow each other at that width.
+    #[test]
+    fn a_pe32_image_is_planned_and_built_with_4_byte_thunks() {
+        let p = plan_mem_patch(&headers_of(false, 0x2000, 16, false, 0x9000)).unwrap();
+        assert_eq!(p.thunk, 4);
+        assert_eq!(p.import_rva, 0x2000);
+        assert_eq!(p.import_dir_off, (0x80 + 24 + 96 + IMPORT * 8) as u32);
+        assert_eq!(p.bound_dir_off, Some((0x80 + 24 + 96 + BOUND * 8) as u32));
+        assert_eq!(
+            plan_mem_patch(&headers(0x2000, 16, false, 0x9000))
+                .unwrap()
+                .thunk,
+            8
+        );
+
+        let rva = first_region_rva(&p);
+        let patch = build_mem_patch(&p, &[0u8; DESC], rva).unwrap();
+        let ilt = u32::from_le_bytes(patch.region[0..4].try_into().unwrap()) - rva;
+        let iat = u32::from_le_bytes(patch.region[16..20].try_into().unwrap()) - rva;
+        assert_eq!(iat - ilt, 2 * 4, "two 4-byte thunks between ILT and IAT");
+        let hint = u32::from_le_bytes(
+            patch.region[ilt as usize..ilt as usize + 4]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(hint - rva, iat + 2 * 4, "the hint/name follows the IAT");
+        let name = &patch.region[(hint - rva) as usize + 2..];
+        assert!(name.starts_with(SHIM_IMPORT_SYMBOL.as_bytes()));
+    }
+
+    #[test]
+    fn an_unknown_magic_is_refused() {
+        let mut h = headers(0x2000, 16, false, 0x9000);
+        h[0x80 + 24..0x80 + 26].copy_from_slice(&0x107u16.to_le_bytes());
+        assert!(plan_mem_patch(&h).is_err());
     }
 
     #[test]

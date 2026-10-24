@@ -17,6 +17,71 @@ fn rd_u64(b: &[u8], o: usize) -> u64 {
     u64::from_le_bytes(b[o..o + 8].try_into().unwrap())
 }
 
+/// `IMAGE_FILE_MACHINE_I386`.
+pub const MACHINE_I386: u16 = 0x014C;
+/// `IMAGE_FILE_MACHINE_AMD64`.
+pub const MACHINE_AMD64: u16 = 0x8664;
+
+/// The COFF header's `Machine` of the PE in `raw` (its first bytes are
+/// enough), or `None` if it is not a PE.
+pub fn pe_machine(raw: &[u8]) -> Option<u16> {
+    let e_lfanew = u32::from_le_bytes(raw.get(0x3C..0x40)?.try_into().ok()?) as usize;
+    if raw.get(..2)? != b"MZ" || raw.get(e_lfanew..e_lfanew.checked_add(4)?)? != b"PE\0\0" {
+        return None;
+    }
+    let m = raw.get(e_lfanew + 4..e_lfanew + 6)?;
+    Some(u16::from_le_bytes([m[0], m[1]]))
+}
+
+/// Whether the program in `raw` (its headers are enough) runs as a 32-bit
+/// process on 64-bit Windows: a WOW64 guest, which needs the 32-bit shim.
+///
+/// An x86 image does, unless it is a .NET image the runtime starts 64-bit: an
+/// IL-only assembly marked neither `32BITREQUIRED` nor `32BITPREFERRED`
+/// (AnyCPU) carries an x86 header but runs as a 64-bit process. `None` if
+/// `raw` is not a PE, or the CLR header lies past the bytes given.
+pub fn runs_as_32bit(raw: &[u8]) -> Option<bool> {
+    const COMIMAGE_FLAGS_ILONLY: u32 = 0x1;
+    const COMIMAGE_FLAGS_32BITREQUIRED: u32 = 0x2;
+    const COMIMAGE_FLAGS_32BITPREFERRED: u32 = 0x2_0000;
+    if pe_machine(raw)? != MACHINE_I386 {
+        return Some(false);
+    }
+    let e_lfanew = rd_u32(raw, 0x3C) as usize;
+    if raw.len() < e_lfanew + 24 + 2 {
+        return None;
+    }
+    let dd = dd_base(raw, e_lfanew);
+    let n_dirs = raw
+        .get(dd - 4..dd)
+        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))?;
+    let clr_rva = if n_dirs > 14 {
+        raw.get(dd + 14 * 8..dd + 14 * 8 + 4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))?
+    } else {
+        0
+    };
+    if clr_rva == 0 {
+        return Some(true);
+    }
+    // The CLR header's `Flags` (at 16), found through the section table.
+    let n_sections = rd_u16(raw, e_lfanew + 6) as usize;
+    let sect = e_lfanew + 24 + rd_u16(raw, e_lfanew + 20) as usize;
+    let off = (0..n_sections).find_map(|i| {
+        let s = raw.get(sect + i * 40..sect + i * 40 + 40)?;
+        let (va, vsize) = (rd_u32(s, 12) as usize, rd_u32(s, 8) as usize);
+        let (raw_size, raw_ptr) = (rd_u32(s, 16) as usize, rd_u32(s, 20) as usize);
+        let rva = clr_rva as usize;
+        (rva >= va && rva < va + vsize.max(raw_size)).then(|| rva - va + raw_ptr)
+    })?;
+    let flags = raw
+        .get(off + 16..off + 20)
+        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))?;
+    let any_cpu = flags & COMIMAGE_FLAGS_ILONLY != 0
+        && flags & (COMIMAGE_FLAGS_32BITREQUIRED | COMIMAGE_FLAGS_32BITPREFERRED) == 0;
+    Some(!any_cpu)
+}
+
 /// True for a PE32+ (64-bit) optional header, false for PE32 (32-bit).
 ///
 /// Both appear in a .NET application. Native and ReadyToRun images are PE32+,
@@ -53,7 +118,11 @@ pub fn build_image(raw: &[u8]) -> Result<(Vec<u8>, u64, usize), &'static str> {
     let e_lfanew = rd_u32(raw, 0x3C) as usize;
     // 96, not 112: a PE32 optional header is shorter, and demanding the PE32+
     // length here rejected small IL assemblies before the magic was even read.
-    if e_lfanew + 24 + 96 > raw.len() {
+    // Checked: a hostile `e_lfanew` near `u32::MAX` overflows a 32-bit `usize`.
+    if e_lfanew
+        .checked_add(24 + 96)
+        .is_none_or(|end| end > raw.len())
+    {
         return Err("bad e_lfanew");
     }
     if &raw[e_lfanew..e_lfanew + 4] != b"PE\0\0" {
@@ -417,6 +486,52 @@ mod tests {
         // e_lfanew points past the end of the buffer.
         buf[0x3C..0x40].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
         assert!(build_image(&buf).is_err());
+    }
+
+    /// A PE32 header with one section at RVA 0x1000 (file offset 0x200), and a
+    /// CLR header there with `clr_flags` when given.
+    fn pe32(machine: u16, clr_flags: Option<u32>) -> Vec<u8> {
+        let mut b = vec![0u8; 0x400];
+        b[..2].copy_from_slice(b"MZ");
+        b[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        b[0x80..0x84].copy_from_slice(b"PE\0\0");
+        b[0x84..0x86].copy_from_slice(&machine.to_le_bytes());
+        b[0x86..0x88].copy_from_slice(&1u16.to_le_bytes());
+        b[0x94..0x96].copy_from_slice(&224u16.to_le_bytes());
+        let opt = 0x98;
+        b[opt..opt + 2].copy_from_slice(&0x10Bu16.to_le_bytes());
+        b[opt + 92..opt + 96].copy_from_slice(&16u32.to_le_bytes());
+        let sect = opt + 224;
+        b[sect + 8..sect + 12].copy_from_slice(&0x100u32.to_le_bytes()); // VirtualSize
+        b[sect + 12..sect + 16].copy_from_slice(&0x1000u32.to_le_bytes()); // VirtualAddress
+        b[sect + 16..sect + 20].copy_from_slice(&0x100u32.to_le_bytes()); // SizeOfRawData
+        b[sect + 20..sect + 24].copy_from_slice(&0x200u32.to_le_bytes()); // PointerToRawData
+        if let Some(flags) = clr_flags {
+            let clr = opt + 96 + 14 * 8;
+            b[clr..clr + 4].copy_from_slice(&0x1000u32.to_le_bytes());
+            b[0x200 + 16..0x200 + 20].copy_from_slice(&flags.to_le_bytes());
+        }
+        b
+    }
+
+    #[test]
+    fn the_machine_and_the_process_width_come_from_the_headers() {
+        assert_eq!(pe_machine(&pe32(MACHINE_I386, None)), Some(MACHINE_I386));
+        assert_eq!(pe_machine(b"MZ"), None);
+        assert_eq!(runs_as_32bit(&pe32(MACHINE_I386, None)), Some(true));
+        assert_eq!(runs_as_32bit(&pe32(MACHINE_AMD64, None)), Some(false));
+        assert_eq!(runs_as_32bit(b"not a pe"), None);
+        // .NET: AnyCPU runs 64-bit; 32BITREQUIRED and 32BITPREFERRED run 32-bit.
+        assert_eq!(runs_as_32bit(&pe32(MACHINE_I386, Some(0x1))), Some(false));
+        assert_eq!(runs_as_32bit(&pe32(MACHINE_I386, Some(0x3))), Some(true));
+        assert_eq!(
+            runs_as_32bit(&pe32(MACHINE_I386, Some(0x2_0003))),
+            Some(true)
+        );
+        // Mixed-mode (not IL-only) x86 is 32-bit.
+        assert_eq!(runs_as_32bit(&pe32(MACHINE_I386, Some(0x0))), Some(true));
+        // Headers cut short before the optional header: unknown, not a panic.
+        assert_eq!(runs_as_32bit(&pe32(MACHINE_I386, None)[..0xA0]), None);
     }
 
     /// An import directory of zero yields no names rather than an error.
