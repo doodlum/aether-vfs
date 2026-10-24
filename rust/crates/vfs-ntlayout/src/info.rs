@@ -119,7 +119,15 @@ pub fn put_stat(
 ///
 /// Only the classes that are pure metadata are filled. Anything else under the root falls
 /// through, which is no worse than before the hook existed.
-pub fn by_name_info(class_raw: u32, buf: &mut [u8], is_dir: bool, size: u64) -> Option<usize> {
+///
+/// `time` is the file's time as a `FILETIME`, the one its handle queries report.
+pub fn by_name_info(
+    class_raw: u32,
+    buf: &mut [u8],
+    is_dir: bool,
+    size: u64,
+    time: i64,
+) -> Option<usize> {
     let need = match class_raw {
         CLASS_BASIC => BASIC_LEN,
         CLASS_STANDARD => STANDARD_LEN,
@@ -132,10 +140,10 @@ pub fn by_name_info(class_raw: u32, buf: &mut [u8], is_dir: bool, size: u64) -> 
     buf.fill(0);
     let attrs = attributes(is_dir);
     match class_raw {
-        CLASS_BASIC => put_basic(buf, 0, attrs),
+        CLASS_BASIC => put_basic(buf, time, attrs),
         CLASS_STANDARD => put_standard(buf, size, is_dir),
-        CLASS_NETWORK_OPEN => put_network_open(buf, 0, size, attrs),
-        _ => put_stat(buf, 0, 0, size, attrs, 0),
+        CLASS_NETWORK_OPEN => put_network_open(buf, time, size, attrs),
+        _ => put_stat(buf, 0, time, size, attrs, 0),
     }
     Some(need)
 }
@@ -236,7 +244,7 @@ mod tests {
         ] {
             let mut buf = vec![0u8; want];
             assert_eq!(
-                by_name_info(class, &mut buf, false, 1),
+                by_name_info(class, &mut buf, false, 1, 0),
                 Some(want),
                 "class {class}"
             );
@@ -256,7 +264,7 @@ mod tests {
         ] {
             let mut buf = vec![0xAAu8; need - 1];
             assert_eq!(
-                by_name_info(class, &mut buf, false, 1),
+                by_name_info(class, &mut buf, false, 1, 0),
                 None,
                 "class {class}"
             );
@@ -270,7 +278,7 @@ mod tests {
     #[test]
     fn an_unknown_class_is_declined_so_the_caller_falls_through() {
         let mut buf = vec![0u8; 512];
-        assert_eq!(by_name_info(9999, &mut buf, false, 1), None);
+        assert_eq!(by_name_info(9999, &mut buf, false, 1, 0), None);
     }
 
     /// The size a stat reports is the whole reason these classes are answered: a caller that
@@ -281,18 +289,18 @@ mod tests {
         const SIZE: u64 = 249_753_412; // Skyrim.esm, i.e. well past 32 bits.
         let mut buf = vec![0u8; 104];
 
-        by_name_info(CLASS_STANDARD, &mut buf, false, SIZE).unwrap();
+        by_name_info(CLASS_STANDARD, &mut buf, false, SIZE, 0).unwrap();
         assert_eq!(i64_at(&buf, 0), SIZE as i64, "standard AllocationSize");
         assert_eq!(i64_at(&buf, 8), SIZE as i64, "standard EndOfFile");
 
         buf.fill(0);
-        by_name_info(CLASS_NETWORK_OPEN, &mut buf, false, SIZE).unwrap();
+        by_name_info(CLASS_NETWORK_OPEN, &mut buf, false, SIZE, 0).unwrap();
         assert_eq!(i64_at(&buf, 32), SIZE as i64, "network-open AllocationSize");
         assert_eq!(i64_at(&buf, 40), SIZE as i64, "network-open EndOfFile");
 
         for class in [CLASS_STAT, CLASS_STAT_BASIC] {
             buf.fill(0);
-            by_name_info(class, &mut buf, false, SIZE).unwrap();
+            by_name_info(class, &mut buf, false, SIZE, 0).unwrap();
             assert_eq!(
                 i64_at(&buf, 40),
                 SIZE as i64,
@@ -312,14 +320,14 @@ mod tests {
             (CLASS_STAT_BASIC, 56),
         ] {
             buf.fill(0);
-            by_name_info(class, &mut buf, true, 0).unwrap();
+            by_name_info(class, &mut buf, true, 0, 0).unwrap();
             assert_eq!(
                 u32_at(&buf, attr_off),
                 FILE_ATTRIBUTE_DIRECTORY,
                 "class {class}"
             );
             buf.fill(0);
-            by_name_info(class, &mut buf, false, 1).unwrap();
+            by_name_info(class, &mut buf, false, 1, 0).unwrap();
             assert_eq!(
                 u32_at(&buf, attr_off),
                 FILE_ATTRIBUTE_NORMAL,
@@ -328,11 +336,31 @@ mod tests {
         }
         // FileStandardInformation carries a boolean rather than an attribute.
         buf.fill(0);
-        by_name_info(CLASS_STANDARD, &mut buf, true, 0).unwrap();
+        by_name_info(CLASS_STANDARD, &mut buf, true, 0, 0).unwrap();
         assert_eq!(buf[21], 1, "standard Directory flag");
         buf.fill(0);
-        by_name_info(CLASS_STANDARD, &mut buf, false, 1).unwrap();
+        by_name_info(CLASS_STANDARD, &mut buf, false, 1, 0).unwrap();
         assert_eq!(buf[21], 0, "standard Directory flag set for a file");
+    }
+
+    /// By name a file reports the time its handle queries report, at every offset each class
+    /// keeps one: a caller that compares the two (the .NET binder does) must see one file.
+    #[test]
+    fn the_given_time_lands_in_every_time_field() {
+        const TIME: i64 = 133_000_000_000_000_000;
+        let mut buf = vec![0u8; 104];
+        for (class, offsets) in [
+            (CLASS_BASIC, &[0usize, 8, 16, 24][..]),
+            (CLASS_NETWORK_OPEN, &[0, 8, 16, 24][..]),
+            (CLASS_STAT, &[8, 16, 24, 32][..]),
+            (CLASS_STAT_BASIC, &[8, 16, 24, 32][..]),
+        ] {
+            buf.fill(0);
+            by_name_info(class, &mut buf, false, 1, TIME).unwrap();
+            for &off in offsets {
+                assert_eq!(i64_at(&buf, off), TIME, "class {class} time at {off}");
+            }
+        }
     }
 
     #[test]

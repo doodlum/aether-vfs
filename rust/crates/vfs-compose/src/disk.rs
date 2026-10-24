@@ -13,6 +13,15 @@ use vfs_provider::{
     OPEN_TRUNC, OPEN_WRITE,
 };
 
+/// A host file's modification time as seconds since the Unix epoch, the unit of
+/// [`Stat::mtime`]; 0 ("no time") when the platform cannot say.
+pub(crate) fn mtime_secs(meta: &std::fs::Metadata) -> i64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0))
+}
+
 pub struct DiskProvider {
     root: PathBuf,
     next: AtomicU64,
@@ -256,13 +265,13 @@ impl Provider for DiskProvider {
             Ok(Some(Stat {
                 kind: KIND_DIR,
                 size: 0,
-                mtime: 0,
+                mtime: mtime_secs(&meta),
             }))
         } else if meta.is_file() {
             Ok(Some(Stat {
                 kind: KIND_FILE,
                 size: meta.len(),
-                mtime: 0,
+                mtime: mtime_secs(&meta),
             }))
         } else {
             Ok(None)
@@ -296,18 +305,14 @@ impl Provider for DiskProvider {
         for ent in rd.flatten() {
             let name = ent.file_name().to_string_lossy().into_owned();
             let meta = ent.metadata().ok();
-            let (kind, size) = match meta {
-                Some(m) if m.is_dir() => (KIND_DIR, 0),
-                Some(m) => (KIND_FILE, m.len()),
+            let (kind, size, mtime) = match meta {
+                Some(m) if m.is_dir() => (KIND_DIR, 0, mtime_secs(&m)),
+                Some(m) => (KIND_FILE, m.len(), mtime_secs(&m)),
                 None => continue,
             };
             out.push(DirEntry {
                 name,
-                stat: Stat {
-                    kind,
-                    size,
-                    mtime: 0,
-                },
+                stat: Stat { kind, size, mtime },
             });
         }
         // Folded, not ASCII-lowercased: every other listing in this stack

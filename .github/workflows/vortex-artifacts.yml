@@ -1,0 +1,63 @@
+name: vortex-artifacts
+# What Vortex ships of aether-vfs: the Node binding and the shim, built in release mode and
+# published as the assets of one release per commit (`vortex-<sha>`). Vortex pins a release by
+# its file names and SHA-256 sums (src/main/copy-assets.mjs in doodlum/Vortex), so a published
+# release is never replaced: a new commit publishes a new one.
+on:
+  push:
+    branches: ["vortex-*"]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  windows-x64:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            rust
+            bindings/node
+      - name: Build the shim
+        run: cargo build --release -p vfs-shim-dll
+        working-directory: rust
+      - name: Build the Node binding
+        run: cargo build --release
+        working-directory: bindings/node
+      - name: Collect the artifacts
+        shell: pwsh
+        run: |
+          $out = New-Item -ItemType Directory -Force -Path dist
+          Copy-Item bindings/node/target/release/aether_vfs_node.dll "$out/aether_vfs_node-win32-x64.node"
+          Copy-Item rust/target/release/vfs_shim_dll.dll "$out/vfs_shim_dll-win32-x64.dll"
+          Get-ChildItem $out | ForEach-Object {
+            "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
+          } | Set-Content -Encoding ascii "$out/SHA256SUMS-win32-x64.txt"
+          Get-Content "$out/SHA256SUMS-win32-x64.txt"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: dist/*
+
+  publish:
+    needs: [windows-x64]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="vortex-${GITHUB_SHA::12}"
+          if gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "$tag already published; a release is never replaced"
+            exit 0
+          fi
+          gh release create "$tag" dist/* -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --prerelease --title "Vortex artifacts ${GITHUB_SHA::12}" \
+            --notes "aether-vfs for Vortex, built from ${GITHUB_REF_NAME} at ${GITHUB_SHA}."

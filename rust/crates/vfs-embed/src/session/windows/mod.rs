@@ -759,7 +759,10 @@ mod shim_path_tests {
 
     #[test]
     fn a_shim_directory_already_on_the_path_is_not_added_twice() {
-        let mut env = vec![("PATH".to_string(), r"c:\vortex\AETHER-VFS\;C:\Windows".to_string())];
+        let mut env = vec![(
+            "PATH".to_string(),
+            r"c:\vortex\AETHER-VFS\;C:\Windows".to_string(),
+        )];
         put_shim_on_path(&mut env, r"C:\Vortex\aether-vfs");
         assert_eq!(path_of(&env), [r"c:\vortex\AETHER-VFS\;C:\Windows"]);
     }

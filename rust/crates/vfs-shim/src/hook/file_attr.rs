@@ -11,7 +11,7 @@ use crate::ntdef::{
     STATUS_SUCCESS, STATUS_UNSUCCESSFUL,
 };
 use core::ffi::c_void;
-use vfs_ntlayout::SYNTH_FILETIME;
+use vfs_ntlayout::filetime_of;
 use windows_sys::Win32::Foundation::NTSTATUS;
 
 /// Path-based getattr via director OP_GETATTR when FUSE client is live.
@@ -31,6 +31,8 @@ unsafe fn fuse_path_attr(path: &str) -> Option<Result<(bool, u64, i64), i32>> {
 struct PathStat {
     is_dir: bool,
     size: u64,
+    /// Its time as a `FILETIME`: the provider's, or the synthetic one when it has none.
+    time: i64,
 }
 
 /// What a stat-by-path call saw, for the hook's `note_stat` label.
@@ -75,9 +77,10 @@ fn stat_by_path(
     // SAFETY: `fuse_path_attr` takes no pointer; it asks the director about a path.
     match unsafe { fuse_path_attr(path) } {
         None => note(StatEvent::Outside),
-        Some(Ok((is_dir, size, _mtime))) => {
+        Some(Ok((is_dir, size, mtime))) => {
             note(StatEvent::Found);
-            if fill(&PathStat { is_dir, size }) {
+            let time = filetime_of(mtime);
+            if fill(&PathStat { is_dir, size, time }) {
                 return Some(STATUS_SUCCESS);
             }
         }
@@ -137,12 +140,16 @@ pub(super) unsafe fn qibn_hook_body(
             |st| {
                 // SAFETY: same NT-pointer contract as this fn (hook/mod.rs).
                 let buf = unsafe { caller_buf(info, length as usize) };
-                let Some(n) = vfs_ntlayout::by_name_info(class_raw, buf, st.is_dir, st.size) else {
+                let Some(n) =
+                    vfs_ntlayout::by_name_info(class_raw, buf, st.is_dir, st.size, st.time)
+                else {
                     crate::hookstats::note_stat(&path, &format!("byname{class_raw}-UNSUP"));
                     let mut probe = [0u8; 512];
                     refusal = Some(
-                        if vfs_ntlayout::by_name_info(class_raw, &mut probe, st.is_dir, st.size)
-                            .is_some()
+                        if vfs_ntlayout::by_name_info(
+                            class_raw, &mut probe, st.is_dir, st.size, st.time,
+                        )
+                        .is_some()
                         {
                             STATUS_INFO_LENGTH_MISMATCH
                         } else {
@@ -200,7 +207,7 @@ pub(super) unsafe fn qattr_hook_body(
                 if !info.is_null() {
                     // SAFETY: same NT-pointer contract as this fn (hook/mod.rs).
                     let buf = unsafe { caller_buf(info.cast(), BASIC_LEN) };
-                    put_basic(buf, SYNTH_FILETIME, attributes(st.is_dir));
+                    put_basic(buf, st.time, attributes(st.is_dir));
                 }
                 true
             },
@@ -238,7 +245,7 @@ pub(super) unsafe fn qfull_hook_body(
                 if !info.is_null() {
                     // SAFETY: same NT-pointer contract as this fn (hook/mod.rs).
                     let buf = unsafe { caller_buf(info.cast(), NETWORK_OPEN_LEN) };
-                    put_network_open(buf, SYNTH_FILETIME, st.size, attributes(st.is_dir));
+                    put_network_open(buf, st.time, st.size, attributes(st.is_dir));
                 }
                 true
             },
