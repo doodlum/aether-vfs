@@ -865,9 +865,11 @@ whatever the step, ends in `refuse_child`:
   the injector and inherited), which `vfs-embed` reports in the launch notes
   (Proton) or the launch error (Windows).
 
-The failures: the child is a 32-bit image (`child-32bit`, checked first with
-`IsWow64Process2`; the 64-bit shim cannot load into it, so it fails at once and
-is named, not exempted), no `SELF_DLL` (the shim does not know its own DLL path,
+The failures: the child is of the other width than the shim (checked first,
+by comparing the child's `IsWow64Process2` with the shim's own process: a 64-bit
+shim refuses a 32-bit child as `child-32bit`, a 32-bit shim a 64-bit child as
+`child-64bit`; a shim cannot load into a process of the other width, so it fails
+at once and is named, not exempted), no `SELF_DLL` (the shim does not know its own DLL path,
 so it cannot inject), the child exiting early, `LoadLibrary` not starting or not
 finishing within the timeout, the child's shim reporting a bootstrap failure,
 and no ready signal once `LoadLibrary` has returned.
@@ -899,7 +901,7 @@ helpers or anything else; `VFS_INJECT_*` switches (`INJECT_CWD`,
 `INJECT_STEAM_HELPER`) belong to the top-level injector, which starts the Steam
 helper itself, outside the shim. The only knob is `VFS_CHILD_CWD_ROOT`, which
 changes the child's working directory, not whether it is injected. A child that
-cannot be injected (a 32-bit image, for instance) therefore fails to start; if a case like that needs to run, it needs
+cannot be injected (one of the other width, for instance) therefore fails to start; if a case like that needs to run, it needs
 an explicit, named exemption, not a silent resume.
 
 **Children stay in the launch's job.** The hook creates every child with

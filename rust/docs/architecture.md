@@ -911,9 +911,16 @@ OS, and the zip provider never learns about the host.
 
 ## 9. Known limitations
 
-- **Windows x64 guests only.** The game and the shim are Windows x64 code. A
-  Linux host runs them under GE-Proton's Wine (§3.10); there is no native Linux
-  game support, and no macOS host.
+- **Windows x64 and x86 guests; 32-bit on Windows only.** The game and the shim
+  are Windows code. A 32-bit game (a WOW64 guest) gets the 32-bit shim from the
+  `x86` folder beside the 64-bit one, served by the same 64-bit director over the
+  same ring, whose layout is fixed-width and pinned at compile time on both
+  targets (`vfs_ipc::layout`). The launch reads and writes a WOW64 guest's PEB32,
+  process parameters and TEB32 (`vfs_inject::Guest`), patches its PE32 imports in
+  memory, and injects it, when it must, through the 32-bit `vfs-injector.exe`
+  (`--load-library`). A shim injects only children of its own width. A Linux host
+  runs 64-bit games under GE-Proton's Wine (§3.10); a 32-bit game under Proton is
+  not supported yet. There is no native Linux game support, and no macOS host.
 - **Stored zip entries only.** Deflate would defeat random access. Archives are
   expected to be repacked Stored.
 - **Router `readdir` is single-dispatch**, not the cross-route union the

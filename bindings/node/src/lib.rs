@@ -64,7 +64,9 @@ pub struct RootSpec {
 pub struct SessionOptions {
     /// The session's own directory (ring, staging, backing directories). Created if missing.
     pub state_dir: String,
-    /// The directory holding `vfs_shim_dll.dll` (and, under Proton, `vfs-injector.exe`).
+    /// The directory holding `vfs_shim_dll.dll` (and, under Proton, `vfs-injector.exe`). For
+    /// 32-bit games its `x86` folder holds the 32-bit `vfs_shim_dll.dll` and `vfs-injector.exe`
+    /// (`vfs_embed::X86_ARTIFACTS_DIR`; see the top-level README's "32-bit games").
     pub artifacts_dir: String,
     pub roots: Vec<RootSpec>,
 }
