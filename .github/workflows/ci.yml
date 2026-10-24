@@ -111,7 +111,7 @@ jobs:
         -p vfs-ipc -p vfs-protocol -p vfs-provider -p vfs-compose -p vfs-pe
         -p vfs-zip -p vfs-core -p vfs-env -p vfs-unix -p vfs-proton
         -p vfs-embed -p vfs-director -p vfs-registry -p vfs-testkit -p vfs-bench
-        -p vfs-ntlayout -p vfs-redirect
+        -p vfs-ntlayout -p vfs-redirect -p vfs-fuse
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

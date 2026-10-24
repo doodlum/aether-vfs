@@ -1,0 +1,33 @@
+[package]
+name = "vfs-fuse"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Linux delivery: a director root served through FUSE at its real location"
+
+[lib]
+name = "vfs_fuse"
+path = "src/lib.rs"
+
+# Everything is Linux-only and gated in the manifest, so the crate builds empty
+# on Windows and the Windows graph gains nothing. Same shape as `vfs-unix`.
+[target.'cfg(target_os = "linux")'.dependencies]
+vfs-core.workspace = true
+vfs-director.workspace = true
+vfs-provider.workspace = true
+# `fuser` without its default features mounts through `fusermount3` in pure
+# Rust: no libfuse development headers, and the mount works for an
+# unprivileged user.
+fuser = { version = "0.18", default-features = false }
+# `openat2`/`statat`/`Dir` relative to a directory opened before the mount, so
+# the real folder underneath stays readable. Safe wrappers: no `unsafe` here.
+rustix = { version = "1", features = ["fs", "process"] }
+tracing.workspace = true
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+vfs-compose.workspace = true
+
+[lints]
+workspace = true

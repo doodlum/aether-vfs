@@ -30,6 +30,10 @@ members = [
   # The Unix mirror of vfs-win: one crate per OS, each owning that OS's handles,
   # with the portable ring above both. Builds to an empty crate on Windows.
   "crates/vfs-unix",
+  # The Linux delivery: a director root served through FUSE at its real
+  # location, so every process sees the composed folder with nothing injected.
+  # Builds to an empty crate on Windows.
+  "crates/vfs-fuse",
   # GE-Proton acquisition. Portable on purpose: extracting a Linux tarball on
   # Windows is useless but harmless, and keeping it portable means the URL,
   # digest, version-ordering and layout logic are covered by the Windows job,
@@ -83,6 +87,7 @@ vfs-core = { path = "crates/vfs-core" }
 vfs-director = { path = "crates/vfs-director" }
 vfs-embed = { path = "crates/vfs-embed" }
 vfs-env = { path = "crates/vfs-env" }
+vfs-fuse = { path = "crates/vfs-fuse" }
 vfs-inject = { path = "crates/vfs-inject" }
 vfs-ipc = { path = "crates/vfs-ipc" }
 vfs-ntlayout = { path = "crates/vfs-ntlayout" }

@@ -66,6 +66,11 @@ vfs-proton = { path = "../vfs-proton", default-features = false }
 # `DEFAULT_PAYLOAD_CAP`, the one ring payload capacity both transports use.
 vfs-ipc.workspace = true
 
+# The FUSE delivery: a root mounted at its real location, re-exported as
+# `vfs_embed::fuse` so a host names only this crate.
+[target.'cfg(target_os = "linux")'.dependencies]
+vfs-fuse.workspace = true
+
 [dev-dependencies]
 vfs-testkit.workspace = true
 # Spike: import-table activation patches the fixture.

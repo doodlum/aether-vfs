@@ -477,6 +477,50 @@ it is a Job Object per launch (`vfs_inject::spawn_target_with_shim`,
 `ProcessTree`) that no process can leave (§4.3). `LaunchHandle::pid` is the launched program's pid on Windows and
 the `wine` process's on Proton; the Steam helper accessors are Proton-only.
 
+### 3.12 The FUSE host path — `vfs-fuse`
+
+The second Linux delivery, and the one Vortex uses: no launch, no Wine of our
+own, no injection. Each root is a FUSE mount **at its real location** (the game
+folder), serving whatever the director composes for it, so every process sees
+the composed folder: a native Linux game, a Windows game under Steam's own stock
+Proton in its own Steam prefix, Steam's Play button, and the host's own reads.
+The director's API was already the FUSE operation set and already spoke errno
+(`docs/superpowers/specs/2026-08-31-linux-fuse-proton-portability-design.md`),
+so `vfs-fuse` is a translation layer, the sibling of `ring_dispatch`.
+
+- **Inodes.** FUSE speaks inodes, the director paths: one inode per *folded*
+  path (`vfs_core::fold`), so every spelling a case-insensitive lookup accepts
+  names one file, as on Windows. Numbers are never reused.
+- **The folder underneath.** A mount hides its folder from every path lookup,
+  the daemon's own included, so the base layer is a `BaseDirProvider` over a
+  directory descriptor opened *before* the mount (`openat2` with
+  `RESOLVE_BENEATH`; a symlink out of the folder is absent). It reports real
+  sizes and modification times; nothing is ever written there.
+- **Writes** go to the root's write layer through the same `OverlayProvider`
+  copy-up as on Windows. POSIX checks the director leaves to its caller
+  (`rmdir` of a non-empty directory, `rename` type mismatches,
+  `RENAME_NOREPLACE`) are made before the call.
+- **Remount.** A `Director::mount` that replaces a root's provider is followed
+  by `FuseMount::invalidate`: every dentry and inode the kernel caches is
+  invalidated and every path renumbered, so the next lookup and open see the new
+  content. A handle already open keeps reading what it opened, and `fstat` on it
+  answers from the handle's own record when the path no longer leads to it.
+- **Lifecycle.** Mounting is unprivileged (`fuser` without libfuse, through the
+  setuid `fusermount3`). Unmount retries briefly (a fork anywhere in the host
+  holds descriptors until it execs) and then detaches lazily if a program still
+  holds files open. A mount left by a host that died fails with `ENOTCONN`;
+  `mount_state` sees it (with `statfs`, which the kernel never answers from
+  cache) and the next mount recovers it with `fusermount3 -uz`.
+- **What a mount must never read through itself.** A mapped file's source or a
+  write folder inside the mounted location would make the daemon wait on its
+  own mount; the Node binding refuses both, and refuses nested locations.
+- **Not yet:** attributes carry no mode, so every file is reported `0755`
+  (a native game's binary stays runnable); no `allow_other`, so only the
+  mounting user sees the mount (Steam and Vortex run as that user).
+
+The Node binding mounts on `start()` on Linux and unmounts on `close()`;
+`launch()` there is refused (`E_PLATFORM`).
+
 ---
 
 ## 4. The hard parts, and how they are solved
@@ -893,6 +937,7 @@ observer before concluding the process is idle.
 | `vfs-director` | the kernel: root to provider table, handle namespace, ring server, staging, registry host |
 | `vfs-embed` | **the embeddable API**: `Session`, roots, composition, serve, launch (Windows and Proton) |
 | `vfs-proton` | GE-Proton install, prefix, Wine launch, Steam and NVAPI probes; the Windows artefact list |
+| `vfs-fuse` | Linux: a director root served through FUSE at its real location; the folder underneath read by descriptor (§3.12) |
 | `vfs-registry` | registry overlay tree, its file format, the merge with a real key, NT query layouts |
 | `vfs-env` | every `VFS_*` switch, defined once, with a drift test |
 | `vfs-redirect` | pure path core: root map and canonicalisation |
@@ -911,9 +956,10 @@ OS, and the zip provider never learns about the host.
 
 ## 9. Known limitations
 
-- **Windows x64 guests only.** The game and the shim are Windows x64 code. A
-  Linux host runs them under GE-Proton's Wine (§3.10); there is no native Linux
-  game support, and no macOS host.
+- **Windows x64 guests only, for the injected paths.** The game and the shim
+  are Windows x64 code; a Linux host runs them under GE-Proton's Wine (§3.10).
+  The FUSE path (§3.12) has no such limit — it serves native Linux games and
+  stock Proton alike — but is Linux-only. No macOS host.
 - **Stored zip entries only.** Deflate would defeat random access. Archives are
   expected to be repacked Stored.
 - **Router `readdir` is single-dispatch**, not the cross-route union the
