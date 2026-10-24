@@ -158,32 +158,50 @@ fn compose(session: &vfs_embed::Session, id: u32, spec: &RootSpec) -> Result<usi
     let mut sources = RootSources::new();
     if let Some(base) = &spec.base {
         if !Path::new(base).is_dir() {
-            return Err(error(E_CONFIG, format!("base folder {base:?} does not exist")));
+            return Err(error(
+                E_CONFIG,
+                format!("base folder {base:?} does not exist"),
+            ));
         }
         let disk: Arc<dyn Provider> = Arc::new(DiskProvider::new(base));
         sources.add("", 0, Arc::new(ReadOnlyProvider::new(disk)));
     }
-    let map = MapProvider::new(spec.files.iter().map(|f| (f.path.as_str(), PathBuf::from(&f.source))))
-        .map_err(|e| error(E_CONFIG, e))?;
+    let map = MapProvider::new(
+        spec.files
+            .iter()
+            .map(|f| (f.path.as_str(), PathBuf::from(&f.source))),
+    )
+    .map_err(|e| error(E_CONFIG, e))?;
     let count = map.file_count();
     sources.add("", 1, Arc::new(map));
     let mounts = sources.mounts().map_err(|e| error(E_CONFIG, e))?;
-    session
-        .set_root_mounts(RootId(id), mounts)
-        .map_err(|st| error(E_CONFIG, format!("root {id} could not be composed (status {st})")))?;
+    session.set_root_mounts(RootId(id), mounts).map_err(|st| {
+        error(
+            E_CONFIG,
+            format!("root {id} could not be composed (status {st})"),
+        )
+    })?;
     if let Some(dir) = &spec.write_to {
         std::fs::create_dir_all(dir)
             .map_err(|e| error(E_CONFIG, format!("write folder {dir:?}: {e}")))?;
         session
             .set_write_layer_at(RootId(id), Arc::new(DiskProvider::new(dir)))
-            .map_err(|st| error(E_CONFIG, format!("write folder for root {id} (status {st})")))?;
+            .map_err(|st| {
+                error(
+                    E_CONFIG,
+                    format!("write folder for root {id} (status {st})"),
+                )
+            })?;
     }
     Ok(count)
 }
 
 fn check_location(location: &str) -> Result<()> {
     if !Path::new(location).is_absolute() {
-        return Err(error(E_CONFIG, format!("root location {location:?} is not absolute")));
+        return Err(error(
+            E_CONFIG,
+            format!("root location {location:?} is not absolute"),
+        ));
     }
     Ok(())
 }
@@ -257,10 +275,12 @@ impl Session {
             .collect())
     }
 
-    /// Replace one root's content (its location stays). Only between launches.
+    /// Replace one root's content (its location stays), also while a launch runs: the director
+    /// swaps the root's provider and moves its mount generation, so a running program's next
+    /// open sees the new content and its read cache drops the old bytes. Handles already open
+    /// keep reading what they opened.
     #[napi]
     pub fn set_root(&self, id: u32, spec: RootSpec) -> Result<()> {
-        self.refuse_while_running()?;
         let mut inner = lock(&self.inner)?;
         if inner.closed {
             return Err(error(E_STATE, "the session is closed"));
@@ -269,7 +289,10 @@ impl Session {
             return Err(error(E_CONFIG, format!("no root {id}")));
         };
         if !existing.location.eq_ignore_ascii_case(&spec.location) {
-            return Err(error(E_CONFIG, "a root's location cannot change; make a new session"));
+            return Err(error(
+                E_CONFIG,
+                "a root's location cannot change; make a new session",
+            ));
         }
         let count = compose(&inner.session, id, &spec)?;
         inner.file_counts[id as usize] = count;
@@ -353,7 +376,10 @@ impl Task for LaunchTask {
     type JsValue = Launch;
 
     fn compute(&mut self) -> Result<Self::Output> {
-        let opts = self.opts.take().ok_or_else(|| error(E_INTERNAL, "launch reused"))?;
+        let opts = self
+            .opts
+            .take()
+            .ok_or_else(|| error(E_INTERNAL, "launch reused"))?;
         let inner = lock(&self.inner)?;
         if inner.closed {
             return Err(error(E_STATE, "the session is closed"));

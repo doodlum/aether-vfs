@@ -18,7 +18,10 @@
 //! | `rename\tFROM\tTO`      | `rename`                               | `ok`              |
 //! | `stat\tPATH`            | `metadata`                             | `ok dir` / `ok file <len>` |
 //! | `delete\tPATH`          | `remove_file`, or `remove_dir` for a directory | `ok`      |
+//! | `waitfor\tPATH`         | polls until PATH exists (60 s at most) | `ok` / `err timeout` |
 //!
+//! `waitfor` lets a host change what the session serves between two steps of
+//! one running program: it creates PATH (outside any root) once it has.
 //! A failure is `err <ErrorKind> <raw os error>`. Each result line is the
 //! operation's line, a tab, and the result.
 
@@ -97,6 +100,16 @@ fn one(f: &[&str]) -> String {
                 _ => std::fs::remove_file(p),
             };
             r.map_or_else(err, |()| "ok".into())
+        }
+        "waitfor" => {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while std::fs::metadata(arg(1)).is_err() {
+                if std::time::Instant::now() > deadline {
+                    return "err timeout".into();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            "ok".into()
         }
         other => format!("err unknown-op {other}"),
     }

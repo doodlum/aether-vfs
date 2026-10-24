@@ -109,6 +109,70 @@ test('a mapped mod file, the real game file under it and copy-on-write writes', 
   }
 });
 
+test('a root changed while its program runs is what the program sees next', { skip: process.platform !== 'win32' }, async () => {
+  const root = scratch('live');
+  const game = path.join(root, 'Game');
+  const mods = path.join(root, 'staging');
+  fs.mkdirSync(game, { recursive: true });
+  fs.mkdirSync(mods, { recursive: true });
+  fs.writeFileSync(path.join(mods, 'plugin.bin'), 'mmmmmmm');
+  fs.writeFileSync(path.join(mods, 'late.txt'), 'deployed later');
+  const ready = path.join(root, 'ready');
+  const go = path.join(root, 'go');
+  const out = path.join(root, 'ops.out');
+  const script = path.join(root, 'ops.txt');
+  const data = path.join(game, 'Data');
+  fs.writeFileSync(
+    script,
+    [
+      `read\t${path.join(data, 'plugin.bin')}`,
+      `write\t${ready}\tx`,
+      `waitfor\t${go}`,
+      `read\t${path.join(data, 'late.txt')}`,
+      `stat\t${path.join(data, 'plugin.bin')}`,
+      `list\t${data}`,
+    ].join('\n'),
+  );
+  const spec = (files) => ({ location: game, base: game, files });
+  const session = new Session({
+    stateDir: path.join(root, 'state'),
+    artifactsDir: artifacts,
+    roots: [spec([{ path: 'Data/plugin.bin', source: path.join(mods, 'plugin.bin') }])],
+  });
+  try {
+    session.start();
+    const launch = await session.launch({
+      image: fixture,
+      env: { VFS_FIXTURE_OPS: script, VFS_FIXTURE_OPS_OUT: out },
+    });
+    const deadline = Date.now() + 60_000;
+    while (!fs.existsSync(ready)) {
+      assert.ok(Date.now() < deadline, 'the program never got past its first read');
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    // A deployment changes while the program runs: one file purged, another added.
+    session.setRoot(0, spec([{ path: 'Data/late.txt', source: path.join(mods, 'late.txt') }]));
+    assert.deepEqual(session.roots(), [{ id: 0, location: game, files: 1 }]);
+    fs.writeFileSync(go, '');
+    assert.deepEqual(await launch.wait(), { kind: 'exited', code: 0 });
+    const results = fs
+      .readFileSync(out, 'utf8')
+      .trim()
+      .split('\n')
+      .map((line) => line.split('\t').at(-1));
+    assert.deepEqual(results, [
+      'ok mmmmmmm',
+      'ok',
+      'ok',
+      'ok deployed later',
+      'err NotFound 2',
+      'ok late.txt',
+    ]);
+  } finally {
+    session.close();
+  }
+});
+
 test('configuration errors carry their code', () => {
   const root = scratch('config');
   assert.throws(
